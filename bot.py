@@ -1,6 +1,7 @@
 import os
 import io
-import datetime
+import asyncio
+import logging
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update
@@ -12,47 +13,58 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-# ==================== MINI SERVIDOR WEB PARA RENDER ====================
+# ==================== LOGS ====================
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# ==================== SERVIDOR WEB PARA RENDER ====================
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-type", "text/plain")
         self.end_headers()
-        self.wfile.write(b"Bot activo y funcionando.")
+        self.wfile.write(b"Bot activo")
+    def log_message(self, format, *args):
+        pass
 
 def run_web_server():
     port = int(os.environ.get("PORT", 10000))
     server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
     server.serve_forever()
 
-# Iniciar servidor web en segundo plano
 threading.Thread(target=run_web_server, daemon=True).start()
 
-# ==================== VARIABLES DE ENTORNO ====================
+# ==================== CONFIGURACIÓN ====================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# ==================== BASE DE DATOS (POSTGRESQL) ====================
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL)
 
 def init_db():
-    with get_db_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS movimientos (
-                    id SERIAL PRIMARY KEY,
-                    fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    tipo VARCHAR(20),
-                    monto NUMERIC,
-                    categoria VARCHAR(50),
-                    descripcion TEXT
-                );
-            """)
-            conn.commit()
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS movimientos (
+                        id SERIAL PRIMARY KEY,
+                        fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        tipo VARCHAR(20),
+                        monto NUMERIC,
+                        categoria VARCHAR(50),
+                        descripcion TEXT
+                    );
+                """)
+                conn.commit()
+        logger.info("Base de datos conectada e inicializada con éxito.")
+    except Exception as e:
+        logger.error(f"Error al conectar con la base de datos: {e}")
 
 init_db()
 
@@ -72,16 +84,19 @@ def obtener_dataframe():
         return df
 
 def obtener_historial_texto(limite=40):
-    with get_db_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT fecha, tipo, monto, categoria, descripcion FROM movimientos ORDER BY id DESC LIMIT %s;", (limite,))
-            filas = cursor.fetchall()
-            if not filas:
-                return "No hay transacciones registradas todavía."
-            lineas = [f"- [{f[0].strftime('%Y-%m-%d %H:%M')}] {f[1]}: ${f[2]:,.2f} | {f[3]} | {f[4]}" for f in filas]
-            return "\n".join(lineas)
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT fecha, tipo, monto, categoria, descripcion FROM movimientos ORDER BY id DESC LIMIT %s;", (limite,))
+                filas = cursor.fetchall()
+                if not filas:
+                    return "No hay transacciones registradas todavía."
+                lineas = [f"- [{f[0].strftime('%Y-%m-%d %H:%M')}] {f[1]}: ${f[2]:,.2f} | {f[3]} | {f[4]}" for f in filas]
+                return "\n".join(lineas)
+    except Exception as e:
+        logger.error(f"Error al obtener historial: {e}")
+        return "Sin historial disponible."
 
-# ==================== PROMPT ====================
 SYSTEM_INSTRUCTION = """
 Eres un asesor financiero personal analítico, práctico y ágil.
 El usuario te hablará de sus gastos, ingresos o inversiones, o te pedirá análisis, comparaciones y consejos.
@@ -96,12 +111,12 @@ Si el mensaje del usuario indica un gasto, ingreso o inversión (incluso en mens
 REGISTRO: [TIPO]|[MONTO]|[CATEGORIA]|[DESCRIPCION]
 
 REGLAS PARA GRÁFICOS Y EXCEL:
-- Si el usuario te pide un gráfico (de torta, de barras, etc.), confirma y añade al final:
+- Si el usuario te pide un gráfico, confirma y añade al final:
 ACCION: GRAFICO
-- Si el usuario te pide una planilla o un archivo Excel, confirma y añade al final:
+- Si el usuario te pide un archivo Excel, confirma y añade al final:
 ACCION: EXCEL
 
-Para balances, consultas y consejos, responde claro usando el historial provisto.
+Para balances y consultas, responde claro usando el historial provisto.
 """
 
 def generar_grafico_gastos():
@@ -141,8 +156,9 @@ def generar_excel():
     return buf
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info("Comando /start recibido.")
     await update.message.reply_text(
-        "👋 ¡Hola! Soy tu asistente financiero personal con memoria permanente.\n\n"
+        "👋 ¡Hola! Soy tu asistente financiero personal.\n\n"
         "Puedes decirme cosas como:\n"
         "• 'uber 8k'\n"
         "• 'anota un sueldo de 850 lucas'\n"
@@ -153,6 +169,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_msg = update.message.text
+    logger.info(f"Mensaje recibido: {user_msg}")
     historial = obtener_historial_texto()
     prompt = f"Historial registrado en la base de datos:\n{historial}\n\nMensaje del usuario: {user_msg}"
 
@@ -163,6 +180,8 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             config={"system_instruction": SYSTEM_INSTRUCTION}
         )
         reply = response.text
+        logger.info("Respuesta de Gemini procesada.")
+        
         necesita_grafico = "ACCION: GRAFICO" in reply
         necesita_excel = "ACCION: EXCEL" in reply
         registro_detectado = "REGISTRO:" in reply
@@ -176,13 +195,14 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if len(datos) == 4:
                 guardar_movimiento(datos[0], datos[1], datos[2], datos[3])
                 texto_limpio = f"{texto_usuario}\n\n✅ *(Guardado: {datos[0]} de ${float(datos[1]):,.2f} en {datos[2]})*"
+                logger.info(f"Movimiento persistido: {datos}")
         
         await update.message.reply_text(texto_limpio, parse_mode="Markdown")
         
         if necesita_grafico:
             grafico_buf = generar_grafico_gastos()
             if grafico_buf:
-                await update.message.reply_photo(photo=grafico_buf, caption="📊 Aquí tienes el gráfico de tus gastos.")
+                await update.message.reply_photo(photo=grafico_buf, caption="📊 Gráfico de distribución de gastos.")
             else:
                 await update.message.reply_text("Aún no tienes gastos registrados para armar un gráfico.")
                 
@@ -192,16 +212,29 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_document(
                     document=excel_buf, 
                     filename="Reporte_Finanzas.xlsx", 
-                    caption="📁 Aquí tienes la planilla Excel completa con todos tus movimientos."
+                    caption="📁 Reporte financiero en Excel."
                 )
             else:
-                await update.message.reply_text("Aún no hay transacciones para generar la planilla.")
+                await update.message.reply_text("Aún no hay transacciones registradas.")
                 
     except Exception as e:
+        logger.error(f"Error procesando mensaje: {e}", exc_info=True)
         await update.message.reply_text(f"Hubo un error: {e}")
 
-if __name__ == "__main__":
+async def main():
+    logger.info("Iniciando bot...")
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, responder))
-    app.run_polling()
+    
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(drop_pending_updates=True)
+    logger.info("Bot listo y escuchando en Telegram.")
+    
+    # Mantener el proceso corriendo
+    while True:
+        await asyncio.sleep(3600)
+
+if __name__ == "__main__":
+    asyncio.run(main())
