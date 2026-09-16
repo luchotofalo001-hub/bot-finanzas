@@ -1,6 +1,8 @@
 import os
 import io
 import datetime
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 from google import genai
@@ -10,12 +12,30 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
+# ==================== MINI SERVIDOR WEB PARA RENDER ====================
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Bot activo y funcionando.")
+
+def run_web_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    server.serve_forever()
+
+# Iniciar servidor web en segundo plano
+threading.Thread(target=run_web_server, daemon=True).start()
+
+# ==================== VARIABLES DE ENTORNO ====================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
+# ==================== BASE DE DATOS (POSTGRESQL) ====================
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL)
 
@@ -61,6 +81,7 @@ def obtener_historial_texto(limite=40):
             lineas = [f"- [{f[0].strftime('%Y-%m-%d %H:%M')}] {f[1]}: ${f[2]:,.2f} | {f[3]} | {f[4]}" for f in filas]
             return "\n".join(lineas)
 
+# ==================== PROMPT ====================
 SYSTEM_INSTRUCTION = """
 Eres un asesor financiero personal analítico, práctico y ágil.
 El usuario te hablará de sus gastos, ingresos o inversiones, o te pedirá análisis, comparaciones y consejos.
