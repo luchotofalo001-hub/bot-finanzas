@@ -21,7 +21,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ==================== MINI SERVIDOR WEB PARA RENDER ====================
+# ==================== SERVIDOR WEB PARA RENDER ====================
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -52,7 +52,6 @@ def init_db():
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cursor:
-                # Flujo diario (ARS)
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS movimientos (
                         id SERIAL PRIMARY KEY,
@@ -63,7 +62,6 @@ def init_db():
                         descripcion TEXT
                     );
                 """)
-                # Inversiones (USD)
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS portafolio_inversiones (
                         id SERIAL PRIMARY KEY,
@@ -75,14 +73,14 @@ def init_db():
                     );
                 """)
                 conn.commit()
-        logger.info("Tablas de base de datos listas.")
+        logger.info("Tablas inicializadas.")
     except Exception as e:
         logger.error(f"Error en init_db: {e}")
 
 init_db()
 
-# ==================== PRECIOS DE MERCADO EN VIVO ====================
-def obtener_precio_actual(ticker: str):
+# ==================== CONSULTAS DE MERCADO EN VIVO ====================
+def consultar_datos_mercado(ticker: str):
     ticker = ticker.strip().upper()
     simbolos_a_probar = [ticker]
     
@@ -94,11 +92,33 @@ def obtener_precio_actual(ticker: str):
     for sym in simbolos_a_probar:
         try:
             t = yf.Ticker(sym)
-            p = t.fast_info.get("last_price")
-            if p is not None and p > 0:
-                return float(p), sym
+            fi = t.fast_info
+            last_price = fi.get("last_price")
+            prev_close = fi.get("previous_close")
+            day_high = fi.get("day_high")
+            day_low = fi.get("day_low")
+
+            if last_price is not None and last_price > 0:
+                var_usd = (last_price - prev_close) if prev_close else 0.0
+                var_pct = (var_usd / prev_close * 100) if prev_close else 0.0
+                
+                return {
+                    "ticker": sym,
+                    "precio": float(last_price),
+                    "prev_close": float(prev_close) if prev_close else None,
+                    "var_usd": float(var_usd),
+                    "var_pct": float(var_pct),
+                    "day_high": float(day_high) if day_high else None,
+                    "day_low": float(day_low) if day_low else None
+                }
         except Exception:
             pass
+    return None
+
+def obtener_precio_actual(ticker: str):
+    datos = consultar_datos_mercado(ticker)
+    if datos:
+        return datos["precio"], datos["ticker"]
     return None, ticker
 
 # ==================== INVERSIONES (USD) ====================
@@ -200,20 +220,19 @@ def generar_grafico_distribucion_inversiones():
     plt.close()
     return buf
 
-# ==================== ANÁLISIS ESTADÍSTICO DE GASTOS (ARS) ====================
+# ==================== GASTOS / INGRESOS (ARS) ====================
 def obtener_metricas_analisis_gastos():
     with get_db_connection() as conn:
         df = pd.read_sql("SELECT fecha, monto, categoria, descripcion FROM movimientos WHERE tipo = 'GASTO' ORDER BY fecha ASC;", conn)
     
     if df.empty:
-        return "No hay suficientes gastos registrados en ARS para analizar."
+        return "No hay suficientes gastos registrados en ARS."
     
     df['fecha'] = pd.to_datetime(df['fecha'])
     df['mes_ano'] = df['fecha'].dt.to_period('M').astype(str)
     
     por_mes = df.groupby('mes_ano')['monto'].sum()
     promedio_mensual = por_mes.mean()
-    
     cat_mes = df.groupby(['mes_ano', 'categoria'])['monto'].sum().unstack(fill_value=0)
     cat_total = df.groupby('categoria')['monto'].sum().sort_values(ascending=False)
     
@@ -221,16 +240,15 @@ def obtener_metricas_analisis_gastos():
     top_gastos_txt = "\n".join([f"- [{r['fecha'].strftime('%Y-%m-%d')}] ${r['monto']:,.2f} ARS en {r['categoria']} ({r['descripcion']})" for _, r in top_gastos.iterrows()])
     
     return (
-        f"MÉTRICAS ESTADÍSTICAS REALES CALCULADAS:\n"
+        f"MÉTRICAS ESTADÍSTICAS REALES:\n"
         f"- Gasto total histórico: ${df['monto'].sum():,.2f} ARS\n"
-        f"- Promedio mensual global: ${promedio_mensual:,.2f} ARS\n"
-        f"- Totales gastados por mes:\n{por_mes.to_string()}\n\n"
+        f"- Promedio mensual: ${promedio_mensual:,.2f} ARS\n"
+        f"- Totales por mes:\n{por_mes.to_string()}\n\n"
         f"- Gastos por categoría y mes:\n{cat_mes.to_string()}\n\n"
-        f"- Ranking categorías que más consumen:\n{cat_total.to_string()}\n\n"
-        f"- Gastos individuales más altos (picos/anomalías):\n{top_gastos_txt}"
+        f"- Ranking categorías:\n{cat_total.to_string()}\n\n"
+        f"- Picos / Anomalías individuales:\n{top_gastos_txt}"
     )
 
-# ==================== GASTOS / INGRESOS DIARIOS (ARS) ====================
 def guardar_movimiento(tipo, monto, categoria, descripcion):
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
@@ -276,7 +294,7 @@ def obtener_historial_texto(limite=40):
                 cursor.execute("SELECT id, fecha, tipo, monto, categoria, descripcion FROM movimientos ORDER BY id DESC LIMIT %s;", (limite,))
                 filas = cursor.fetchall()
                 if not filas:
-                    return "Sin transacciones en ARS registradas."
+                    return "Sin transacciones en ARS."
                 lineas = [f"- ID {f[0]} | [{f[1].strftime('%Y-%m-%d %H:%M')}] {f[2]}: ${f[3]:,.2f} ARS | {f[4]} | {f[5]}" for f in filas]
                 return "\n".join(lineas)
     except Exception as e:
@@ -325,56 +343,50 @@ def generar_excel_completo():
 
 # ==================== SYSTEM INSTRUCTION ====================
 SYSTEM_INSTRUCTION = """
-Eres un asesor financiero personal analítico de alto nivel.
+Eres un analista y asesor financiero personal de alto nivel.
 Distingues estrictamente dos mundos:
-1. FLUJO DIARIO: Gastos e Ingresos siempre en Pesos Argentinos (ARS $).
-2. CARTERA DE INVERSIONES: Activos financieros siempre en Dólares (USD $), identificados por TICKERS (acciones, CEDEARs, ETFs, Cripto).
+1. GASTOS E INGRESOS: Flujo cotidiano en Pesos Argentinos (ARS $).
+2. MERCADO E INVERSIONES: Activos financieros en Dólares (USD $), identificados por TICKERS (acciones, CEDEARs, ETFs, Cripto).
 
-REGLAS DE INVERSIONES:
-- Si el usuario indica compra de inversiones (ej: "compre 1000 usd de MELI", "compre 0.05 BTC a 60000", "compre 500 usd de SPY"):
-  Identifica TICKER, MONTO_USD, y opcionalmente PRECIO_COMPRA o CANTIDAD.
-  Al final de tu respuesta agrega:
+REGLAS DE PRECIO Y MERCADO:
+- Si el usuario te pregunta por la cotización, precio o variación de un activo o acción (ej: "¿a cuánto está MELI?", "precio de BTC", "cómo viene AAPL hoy"):
+  Identifica el ticker y responde OBLIGATORIAMENTE agregando al final una única línea:
+  ACCION: CONSULTA_PRECIO|[TICKER]
+  (No inventes números; el sistema consultará el precio exacto y la variación del día).
+
+REGLAS DE COMPRA / APORTE A CARTERA:
+- Si el usuario indica compra de activos (ej: "compre 1000 usd de MELI", "compre 0.5 BTC a 62000"):
+  Agrega al final:
   REGISTRO_INV: [TICKER]|[MONTO_USD]|[PRECIO_COMPRA]|[CANTIDAD]
-  (Usa 0 si PRECIO_COMPRA o CANTIDAD no fueron indicados).
 
-- Si el usuario pregunta por la EVOLUCIÓN, ESTADO O RENDIMIENTO DE SU CARTERA:
-  Agrega al final:
+REGLAS DE SEGUIMIENTO DE CARTERA:
+- Si pregunta por el rendimiento o evolución de su cartera propia:
   ACCION: VER_CARTERA
-
-- Si el usuario pide un GRÁFICO DE DISTRIBUCIÓN de sus inversiones:
-  Agrega al final:
+- Si pide gráfico de cartera de inversión:
   ACCION: GRAFICO_INVERSIONES
 
-REGLAS DE GASTOS/INGRESOS (ARS):
-- Si registra un gasto o ingreso habitual en pesos:
-  REGISTRO: [TIPO]|[MONTO]|[CATEGORIA]|[DESCRIPCION]
-
-- Si pide gráfico de gastos:
-  ACCION: GRAFICO_GASTOS
-
-REGLAS DE BORRADO Y REPORTES:
-- Borrar por ID: ACCION: BORRAR_ID|[ID]
-- Borrar último: ACCION: BORRAR_ULTIMO
-- Borrar todo: ACCION: BORRAR_TODO
-- Pedir Excel: ACCION: EXCEL
-
-ANÁLISIS DE GASTOS:
-Cuando se te provean métricas estadísticas de gastos, responde con análisis cuantitativo riguroso: menciona promedios exactos, qué categoría tuvo mayores desvíos y qué gastos puntuales explican los picos.
+REGLAS DE GASTOS ARS:
+- Registro diario: REGISTRO: [TIPO]|[MONTO]|[CATEGORIA]|[DESCRIPCION]
+- Gráfico de gastos: ACCION: GRAFICO_GASTOS
+- Borrados: ACCION: BORRAR_ID|[ID] / ACCION: BORRAR_ULTIMO / ACCION: BORRAR_TODO
+- Excel: ACCION: EXCEL
 """
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 ¡Hola! Soy tu asistente financiero personal.\n\n"
-        "📈 **Inversiones (USD)**:\n"
+        "👋 ¡Hola! Soy tu asistente financiero y de mercado en vivo.\n\n"
+        "📊 **Mercado en vivo (Precios y Variación)**:\n"
+        "• '¿a cuánto está MELI?'\n"
+        "• '¿cómo viene AAPL hoy?'\n"
+        "• 'precio de BTC / SPY / TSLA'\n\n"
+        "📈 **Cartera (USD)**:\n"
         "• 'compré 1000 usd de MELI'\n"
-        "• 'compré 500 usd de SPY a 560'\n"
         "• '¿cómo viene evolucionando mi cartera?'\n"
         "• 'mostrame la distribución de mis activos'\n\n"
         "💸 **Gastos y Análisis (ARS)**:\n"
         "• 'uber 8.5k' / 'sueldo 950 lucas'\n"
-        "• '¿cuál es mi gasto promedio y por qué subió?'\n"
-        "• 'analizá mis gastos de este mes'\n"
-        "• 'mandame un gráfico de gastos' / 'mandame un excel'"
+        "• '¿cuál es mi gasto promedio?'\n"
+        "• 'mandame un excel'"
     )
 
 async def cmd_borrar_todo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -385,7 +397,6 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_msg = update.message.text
     historial_ars = obtener_historial_texto()
     
-    # Inyectar métricas estadísticas si la pregunta requiere análisis
     msg_lower = user_msg.lower()
     es_pregunta_analisis = any(w in msg_lower for w in ["promedio", "analisis", "analizá", "analiza", "aumento", "subió", "subio", "por qué", "por que", "desvío", "desvio", "en qué gasté"])
     
@@ -410,6 +421,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
         necesita_borrar_todo = "ACCION: BORRAR_TODO" in reply
         necesita_borrar_ultimo = "ACCION: BORRAR_ULTIMO" in reply
         necesita_borrar_id = "ACCION: BORRAR_ID|" in reply
+        necesita_precio = "ACCION: CONSULTA_PRECIO|" in reply
         registro_inv = "REGISTRO_INV:" in reply
         registro_ars = "REGISTRO:" in reply
         
@@ -418,6 +430,8 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             texto_limpio = texto_limpio.replace(tag, "")
             
         id_a_borrar = None
+        ticker_a_cotizar = None
+
         if necesita_borrar_id:
             for linea in texto_limpio.splitlines():
                 if "ACCION: BORRAR_ID|" in linea:
@@ -425,6 +439,12 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         id_a_borrar = int(linea.split("ACCION: BORRAR_ID|")[1].strip())
                     except:
                         pass
+                    texto_limpio = texto_limpio.replace(linea, "")
+
+        if necesita_precio:
+            for linea in texto_limpio.splitlines():
+                if "ACCION: CONSULTA_PRECIO|" in linea:
+                    ticker_a_cotizar = linea.split("ACCION: CONSULTA_PRECIO|")[1].strip()
                     texto_limpio = texto_limpio.replace(linea, "")
 
         texto_limpio = texto_limpio.strip()
@@ -443,7 +463,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             texto_limpio = f"{texto_usuario}\n\n💼 *(Guardado en Cartera: {c:,.4f} {t} a PPC ${p:,.2f} USD | Total: ${m:,.2f} USD)*"
 
         # Registro Gasto/Ingreso ARS
-        if registro_ars and not registro_inv:
+        if registro_ars and not registro_inv and not necesita_precio:
             partes = texto_limpio.split("REGISTRO:")
             texto_usuario = partes[0].strip()
             datos = [d.strip() for d in partes[1].strip().split("|")]
@@ -453,7 +473,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if necesita_borrar_todo:
             borrar_todos_los_movimientos()
-            texto_limpio += "\n\n🗑️ *(Base de datos y portafolio reiniciados)*"
+            texto_limpio += "\n\n🗑️ *(Base de datos y cartera reseteadas)*"
 
         if necesita_borrar_ultimo:
             eliminado = borrar_ultimo_movimiento()
@@ -465,9 +485,28 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if eliminado:
                 texto_limpio += f"\n\n🗑️ *(Eliminado ID {eliminado[0]})*"
 
+        # Si consultó precio en vivo de una acción / cripto
+        if ticker_a_cotizar:
+            datos_mkt = consultar_datos_mercado(ticker_a_cotizar)
+            if datos_mkt:
+                signo = "+" if datos_mkt["var_pct"] >= 0 else ""
+                emoji = "🟢" if datos_mkt["var_pct"] >= 0 else "🔴"
+                rango_txt = f"\n• *Rango del día:* ${datos_mkt['day_low']:,.2f} - ${datos_mkt['day_high']:,.2f} USD" if datos_mkt["day_high"] else ""
+                
+                msg_mkt = (
+                    f"📈 *{datos_mkt['ticker']} en vivo:*\n\n"
+                    f"• *Precio actual:* ${datos_mkt['precio']:,.2f} USD\n"
+                    f"• *Variación del día:* {emoji} {signo}${datos_mkt['var_usd']:,.2f} USD ({signo}{datos_mkt['var_pct']:.2f}%)\n"
+                    f"• *Cierre anterior:* ${datos_mkt['prev_close']:,.2f} USD"
+                    f"{rango_txt}"
+                )
+                texto_limpio = f"{texto_limpio}\n\n{msg_mkt}".strip()
+            else:
+                texto_limpio += f"\n\n⚠️ No pude obtener la cotización de `{ticker_a_cotizar}` en este momento."
+
         await update.message.reply_text(texto_limpio, parse_mode="Markdown")
 
-        # Reporte de cartera con precios en vivo
+        # Reporte de cartera
         if necesita_cartera:
             resumen = obtener_resumen_portafolio()
             if not resumen:
