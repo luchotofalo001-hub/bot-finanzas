@@ -1,0 +1,6 @@
+python-telegram-bot==21.10
+google-genai
+psycopg2-binary
+pandas
+matplotlib
+openpyxl
