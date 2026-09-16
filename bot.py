@@ -175,7 +175,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         response = ai_client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-3.6-flash",
             contents=prompt,
             config={"system_instruction": SYSTEM_INSTRUCTION}
         )
