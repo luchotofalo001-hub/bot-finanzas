@@ -1,5 +1,6 @@
 import os
 import io
+import re
 import asyncio
 import logging
 import threading
@@ -267,13 +268,20 @@ def registrar_operacion_inversion(ticker: str, monto_usd: float, precio_compra: 
     elif monto_usd is None or monto_usd <= 0:
         monto_usd = cantidad * precio_compra
 
+    # Limpiar y validar fecha
+    fecha_limpia = None
+    if fecha_compra:
+        f_cand = fecha_compra.strip().split()[0]
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", f_cand):
+            fecha_limpia = f_cand
+
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
-            if fecha_compra and fecha_compra.strip():
+            if fecha_limpia:
                 cursor.execute(
                     """INSERT INTO portafolio_inversiones (fecha, ticker, cantidad, precio_compra, monto_total_usd)
                        VALUES (%s, %s, %s, %s, %s);""",
-                    (fecha_compra.strip(), ticker, float(cantidad), float(precio_compra), float(monto_usd))
+                    (fecha_limpia, ticker, float(cantidad), float(precio_compra), float(monto_usd))
                 )
             else:
                 cursor.execute(
@@ -282,7 +290,7 @@ def registrar_operacion_inversion(ticker: str, monto_usd: float, precio_compra: 
                     (ticker, float(cantidad), float(precio_compra), float(monto_usd))
                 )
             conn.commit()
-    return ticker, cantidad, precio_compra, monto_usd, fecha_compra
+    return ticker, cantidad, precio_compra, monto_usd, fecha_limpia
 
 def obtener_resumen_portafolio():
     with get_db_connection() as conn:
@@ -483,12 +491,18 @@ def obtener_metricas_analisis_gastos():
     )
 
 def guardar_movimiento(tipo, monto, categoria, descripcion, fecha_str=None):
+    fecha_limpia = None
+    if fecha_str:
+        f_cand = fecha_str.strip().split()[0]
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", f_cand):
+            fecha_limpia = f_cand
+
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
-            if fecha_str and fecha_str.strip():
+            if fecha_limpia:
                 cursor.execute(
                     "INSERT INTO movimientos (fecha, tipo, monto, categoria, descripcion) VALUES (%s, %s, %s, %s, %s)",
-                    (fecha_str.strip(), tipo.upper(), float(monto), categoria.capitalize(), descripcion)
+                    (fecha_limpia, tipo.upper(), float(monto), categoria.capitalize(), descripcion)
                 )
             else:
                 cursor.execute(
@@ -524,7 +538,7 @@ def generar_grafico_gastos():
 def generar_excel_completo():
     with get_db_connection() as conn:
         df_mov = pd.read_sql("SELECT * FROM movimientos ORDER BY fecha ASC;", conn)
-        df_inv = pd.read_sql("SELECT * FROM portafolio_inversIONES ORDER BY fecha ASC;", conn)
+        df_inv = pd.read_sql("SELECT * FROM portafolio_inversiones ORDER BY fecha ASC;", conn)
     
     if df_mov.empty and df_inv.empty:
         return None
@@ -545,7 +559,7 @@ Tienes acceso al historial unificado con IDs y fechas exactas de GASTOS, INGRESO
 
 REGLAS DE CONSULTA DE FECHAS / HISTORIAL:
 - Si el usuario pregunta cuándo compró o registró algo (ej: "¿cuándo compré BTC?", "¿qué compré el mes pasado?", "¿en qué fecha registré el gasto de farmacia?", "mostrame las fechas de mis compras"):
-  Responde con precisión humana usando los datos exactos del historial proporcionado. No necesitas ninguna etiqueta especial a menos que pida un gráfico o excel.
+  Responde con precisión humana usando los datos exactos del historial proporcionado. No agregues etiquetas REGISTRO a consultas pasadas.
 
 REGLAS DE BORRADO:
 - Borrar por ticker de inversión (ej: "borrá NVDA", "eliminá las compras de BTC", "borrá nvda de mi cartera"):
@@ -559,12 +573,14 @@ REGLAS DE BORRADO:
 - Borrar todo el historial y resetear:
   ACCION: BORRAR_TODO
 
-REGLAS DE COMPRA / APORTE A CARTERA (USD):
-- Registro de inversiones con o sin fecha (ej: "el 27/6 compré 100 usd de BTC a 60k", "compré 1000 usd de MELI"):
+REGLAS DE REGISTRO DE COMPRA / APORTE (USD):
+- Si el usuario indica compra de activos (ej: "el 29 de mayo compre 288 usd de nvda a 208.0079 de ppc", "compré 1000 usd de MELI"):
+  Escribe obligatoriamente en UNA SOLA LÍNEA SEPARADA:
   REGISTRO_INV: [TICKER]|[MONTO_USD]|[PRECIO_COMPRA]|[CANTIDAD]|[FECHA_YYYY-MM-DD]
+  (Si no dice fecha, deja el último campo vacío. Ejemplo: REGISTRO_INV: NVDA|288.0|208.01|1.3845|2026-05-29)
 
 REGLAS DE GASTOS / INGRESOS (ARS):
-- Registro de gasto o ingreso con o sin fecha (ej: "ayer gasté 15k en comida", "el 12/08 cobré 800k", "uber 8k"):
+- Registro de gasto o ingreso:
   REGISTRO_ARS: [TIPO]|[MONTO]|[CATEGORIA]|[DESCRIPCION]|[FECHA_YYYY-MM-DD]
 
 REGLAS DE MERCADO Y GRÁFICOS:
@@ -582,13 +598,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 ¡Hola! Soy tu asistente financiero integral.\n\n"
         "📅 Consultas y Fechas:\n"
         "• '¿Cuándo compré BTC y a qué precio?'\n"
-        "• 'Mostrame las fechas de mis últimos gastos'\n\n"
+        "• 'Mostrame las fechas de mis compras de NVDA'\n\n"
         "🗑️ Borrado Universal:\n"
         "• 'Borrá NVDA de mi cartera'\n"
         "• 'Borrá el gasto ID 4' / 'Borrá la inversión ID 2'\n"
         "• 'Borrá lo último que cargué'\n\n"
         "📈 Inversiones y Mercado:\n"
-        "• 'El 27/6 compré 100 usd de BTC a 60k'\n"
+        "• 'El 29 de mayo compré 288 usd de NVDA a 208 de ppc'\n"
         "• 'Evolución de mi cartera' / 'Precio de MELI'\n\n"
         "💸 Gastos (ARS):\n"
         "• 'Almuerzo 12k' / 'Mandame un excel'"
@@ -633,9 +649,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
         necesita_borrar_inv_id = "ACCION: BORRAR_INVERSION_ID|" in reply
         necesita_borrar_mov_id = "ACCION: BORRAR_MOVIMIENTO_ID|" in reply
         
-        registro_inv = "REGISTRO_INV:" in reply
-        registro_ars = "REGISTRO_ARS:" in reply
-        
+        # Extracción segura de tags
         texto_limpio = reply
         for tag in ["ACCION: VER_CARTERA", "ACCION: GRAFICO_INVERSIONES", "ACCION: GRAFICO_EVOLUCION_CARTERA", "ACCION: GRAFICO_GASTOS", "ACCION: EXCEL", "ACCION: BORRAR_TODO", "ACCION: BORRAR_ULTIMO"]:
             texto_limpio = texto_limpio.replace(tag, "")
@@ -647,72 +661,74 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mov_id_a_borrar = None
 
         if necesita_precio:
-            for linea in texto_limpio.splitlines():
-                if "ACCION: CONSULTA_PRECIO|" in linea:
-                    ticker_a_cotizar = linea.split("ACCION: CONSULTA_PRECIO|")[1].strip()
-                    texto_limpio = texto_limpio.replace(linea, "")
+            m = re.search(r"ACCION: CONSULTA_PRECIO\|([^\n\r]+)", texto_limpio)
+            if m:
+                ticker_a_cotizar = m.group(1).strip()
+                texto_limpio = texto_limpio.replace(m.group(0), "")
 
         if necesita_grafico_evol_activo:
-            for linea in texto_limpio.splitlines():
-                if "ACCION: GRAFICO_EVOLUCION_ACTIVO|" in linea:
-                    ticker_grafico_evol = linea.split("ACCION: GRAFICO_EVOLUCION_ACTIVO|")[1].strip()
-                    texto_limpio = texto_limpio.replace(linea, "")
+            m = re.search(r"ACCION: GRAFICO_EVOLUCION_ACTIVO\|([^\n\r]+)", texto_limpio)
+            if m:
+                ticker_grafico_evol = m.group(1).strip()
+                texto_limpio = texto_limpio.replace(m.group(0), "")
 
         if necesita_borrar_inv_tk:
-            for linea in texto_limpio.splitlines():
-                if "ACCION: BORRAR_INVERSION_TICKER|" in linea:
-                    ticker_a_borrar = linea.split("ACCION: BORRAR_INVERSION_TICKER|")[1].strip()
-                    texto_limpio = texto_limpio.replace(linea, "")
+            m = re.search(r"ACCION: BORRAR_INVERSION_TICKER\|([^\n\r]+)", texto_limpio)
+            if m:
+                ticker_a_borrar = m.group(1).strip()
+                texto_limpio = texto_limpio.replace(m.group(0), "")
 
         if necesita_borrar_inv_id:
-            for linea in texto_limpio.splitlines():
-                if "ACCION: BORRAR_INVERSION_ID|" in linea:
-                    try:
-                        inv_id_a_borrar = int(linea.split("ACCION: BORRAR_INVERSION_ID|")[1].strip())
-                    except Exception:
-                        pass
-                    texto_limpio = texto_limpio.replace(linea, "")
+            m = re.search(r"ACCION: BORRAR_INVERSION_ID\|([^\n\r]+)", texto_limpio)
+            if m:
+                try:
+                    inv_id_a_borrar = int(m.group(1).strip())
+                except Exception:
+                    pass
+                texto_limpio = texto_limpio.replace(m.group(0), "")
 
         if necesita_borrar_mov_id:
-            for linea in texto_limpio.splitlines():
-                if "ACCION: BORRAR_MOVIMIENTO_ID|" in linea:
-                    try:
-                        mov_id_a_borrar = int(linea.split("ACCION: BORRAR_MOVIMIENTO_ID|")[1].strip())
-                    except Exception:
-                        pass
-                    texto_limpio = texto_limpio.replace(linea, "")
+            m = re.search(r"ACCION: BORRAR_MOVIMIENTO_ID\|([^\n\r]+)", texto_limpio)
+            if m:
+                try:
+                    mov_id_a_borrar = int(m.group(1).strip())
+                except Exception:
+                    pass
+                texto_limpio = texto_limpio.replace(m.group(0), "")
 
-        texto_limpio = texto_limpio.strip()
-
-        # Registro Inversión USD
-        if registro_inv:
-            partes = texto_limpio.split("REGISTRO_INV:")
-            texto_usuario = partes[0].strip()
-            datos = [d.strip() for d in partes[1].strip().split("|")]
-            ticker = datos[0].upper()
-            monto = float(datos[1]) if len(datos) > 1 and datos[1] not in ["0", ""] else None
-            p_compra = float(datos[2]) if len(datos) > 2 and datos[2] not in ["0", ""] else None
-            cant = float(datos[3]) if len(datos) > 3 and datos[3] not in ["0", ""] else None
-            f_compra = datos[4] if len(datos) > 4 and datos[4] not in ["0", ""] else None
+        # Parseo exacto de REGISTRO_INV con regex de una sola línea
+        match_inv = re.search(r"REGISTRO_INV:\s*([^\n\r]+)", texto_limpio)
+        if match_inv:
+            linea_inv = match_inv.group(1).strip()
+            texto_limpio = texto_limpio.replace(match_inv.group(0), "").strip()
+            partes = [p.strip() for p in linea_inv.split("|")]
+            ticker = partes[0].upper()
+            monto = float(partes[1]) if len(partes) > 1 and partes[1] not in ["0", "", "None"] else None
+            p_compra = float(partes[2]) if len(partes) > 2 and partes[2] not in ["0", "", "None"] else None
+            cant = float(partes[3]) if len(partes) > 3 and partes[3] not in ["0", "", "None"] else None
+            f_compra = partes[4].split()[0] if len(partes) > 4 and partes[4] not in ["0", "", "None"] else None
             
             t, c, p, m, f_reg = registrar_operacion_inversion(ticker, monto, p_compra, cant, f_compra)
             fecha_str = f" - Fecha: {f_reg}" if f_reg else ""
-            texto_limpio = f"{texto_usuario}\n\n💼 *(Guardado en Cartera: {c:,.4f} {t} a PPC ${p:,.2f} USD - Total: ${m:,.2f} USD{fecha_str})*"
+            texto_limpio = f"{texto_limpio}\n\n💼 *(Guardado en Cartera: {c:,.4f} {t} a PPC ${p:,.2f} USD - Total: ${m:,.2f} USD{fecha_str})*".strip()
 
-        # Registro Gasto/Ingreso ARS
-        if registro_ars:
-            partes = texto_limpio.split("REGISTRO_ARS:")
-            texto_usuario = partes[0].strip()
-            datos = [d.strip() for d in partes[1].strip().split("|")]
-            tipo = datos[0]
-            monto = float(datos[1])
-            categoria = datos[2]
-            descripcion = datos[3]
-            f_gasto = datos[4] if len(datos) > 4 and datos[4] not in ["0", ""] else None
+        # Parseo exacto de REGISTRO_ARS con regex
+        match_ars = re.search(r"REGISTRO_ARS:\s*([^\n\r]+)", texto_limpio)
+        if match_ars:
+            linea_ars = match_ars.group(1).strip()
+            texto_limpio = texto_limpio.replace(match_ars.group(0), "").strip()
+            partes = [p.strip() for p in linea_ars.split("|")]
+            tipo = partes[0]
+            monto = float(partes[1])
+            categoria = partes[2]
+            descripcion = partes[3]
+            f_gasto = partes[4].split()[0] if len(partes) > 4 and partes[4] not in ["0", "", "None"] else None
             
             guardar_movimiento(tipo, monto, categoria, descripcion, f_gasto)
             fecha_str = f" - Fecha: {f_gasto}" if f_gasto else ""
-            texto_limpio = f"{texto_usuario}\n\n✅ *(Guardado: {tipo} de ${monto:,.2f} ARS en {categoria}{fecha_str})*"
+            texto_limpio = f"{texto_limpio}\n\n✅ *(Guardado: {tipo} de ${monto:,.2f} ARS en {categoria}{fecha_str})*".strip()
+
+        texto_limpio = texto_limpio.strip()
 
         # Borrados
         if necesita_borrar_todo:
