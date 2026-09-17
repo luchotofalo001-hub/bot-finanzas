@@ -92,34 +92,53 @@ def consultar_datos_mercado(ticker: str):
     for sym in simbolos_a_probar:
         try:
             t = yf.Ticker(sym)
-            fi = t.fast_info
-            last_price = fi.get("last_price")
-            prev_close = fi.get("previous_close")
-            day_high = fi.get("day_high")
-            day_low = fi.get("day_low")
-
-            if last_price is not None and last_price > 0:
-                var_usd = (last_price - prev_close) if prev_close else 0.0
+            # 1. Intento por histórico reciente (el más confiable siempre, incluso fuera de hora)
+            df_hist = t.history(period="5d")
+            if not df_hist.empty:
+                last_price = float(df_hist['Close'].iloc[-1])
+                day_high = float(df_hist['High'].iloc[-1])
+                day_low = float(df_hist['Low'].iloc[-1])
+                
+                if len(df_hist) > 1:
+                    prev_close = float(df_hist['Close'].iloc[-2])
+                else:
+                    prev_close = float(df_hist['Open'].iloc[-1])
+                    
+                var_usd = last_price - prev_close
                 var_pct = (var_usd / prev_close * 100) if prev_close else 0.0
                 
+                return {
+                    "ticker": sym,
+                    "precio": last_price,
+                    "prev_close": prev_close,
+                    "var_usd": var_usd,
+                    "var_pct": var_pct,
+                    "day_high": day_high,
+                    "day_low": day_low
+                }
+            
+            # 2. Intento de respaldo por fast_info
+            fi = t.fast_info
+            last_price = getattr(fi, "last_price", None) or fi.get("last_price", None)
+            if last_price:
+                prev_close = getattr(fi, "previous_close", None) or fi.get("previous_close", last_price)
+                var_usd = (last_price - prev_close) if prev_close else 0.0
+                var_pct = (var_usd / prev_close * 100) if prev_close else 0.0
                 return {
                     "ticker": sym,
                     "precio": float(last_price),
                     "prev_close": float(prev_close) if prev_close else None,
                     "var_usd": float(var_usd),
                     "var_pct": float(var_pct),
-                    "day_high": float(day_high) if day_high else None,
-                    "day_low": float(day_low) if day_low else None
+                    "day_high": getattr(fi, "day_high", None),
+                    "day_low": getattr(fi, "day_low", None)
                 }
-        except Exception:
+        except Exception as e:
+            logger.error(f"Error consultando ticker {sym}: {e}")
             pass
+            
     return None
 
-def obtener_precio_actual(ticker: str):
-    datos = consultar_datos_mercado(ticker)
-    if datos:
-        return datos["precio"], datos["ticker"]
-    return None, ticker
 
 # ==================== INVERSIONES (USD) ====================
 def registrar_operacion_inversion(ticker: str, monto_usd: float, precio_compra: float = None, cantidad: float = None):
