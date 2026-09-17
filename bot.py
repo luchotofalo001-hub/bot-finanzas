@@ -15,6 +15,7 @@ import yfinance as yf
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 
 # ==================== LOGS ====================
 logging.basicConfig(
@@ -82,13 +83,16 @@ def init_db():
 init_db()
 
 # ==================== CONSULTAS DE MERCADO EN VIVO ====================
+def normalizar_ticker_yf(ticker: str):
+    ticker = ticker.strip().upper()
+    if ticker in ["BTC", "ETH", "SOL", "BNB", "ADA", "XRP"]:
+        return f"{ticker}-USD"
+    return ticker
+
 def consultar_datos_mercado(ticker: str):
     ticker = ticker.strip().upper()
-    simbolos_a_probar = [ticker]
-    
-    if ticker in ["BTC", "ETH", "SOL", "BNB", "ADA", "XRP"]:
-        simbolos_a_probar = [f"{ticker}-USD"]
-    elif not ticker.endswith("-USD"):
+    simbolos_a_probar = [normalizar_ticker_yf(ticker)]
+    if not ticker.endswith("-USD") and ticker not in ["BTC", "ETH", "SOL", "BNB", "ADA", "XRP"]:
         simbolos_a_probar.append(f"{ticker}-USD")
 
     for sym in simbolos_a_probar:
@@ -99,12 +103,7 @@ def consultar_datos_mercado(ticker: str):
                 last_price = float(df_hist['Close'].iloc[-1])
                 day_high = float(df_hist['High'].iloc[-1])
                 day_low = float(df_hist['Low'].iloc[-1])
-                
-                if len(df_hist) > 1:
-                    prev_close = float(df_hist['Close'].iloc[-2])
-                else:
-                    prev_close = float(df_hist['Open'].iloc[-1])
-                    
+                prev_close = float(df_hist['Close'].iloc[-2]) if len(df_hist) > 1 else float(df_hist['Open'].iloc[-1])
                 var_usd = last_price - prev_close
                 var_pct = (var_usd / prev_close * 100) if prev_close else 0.0
                 
@@ -136,7 +135,6 @@ def consultar_datos_mercado(ticker: str):
         except Exception as e:
             logger.error(f"Error consultando ticker {sym}: {e}")
             pass
-            
     return None
 
 def obtener_precio_actual(ticker: str):
@@ -145,10 +143,10 @@ def obtener_precio_actual(ticker: str):
         return datos["precio"], datos["ticker"]
     return None, ticker
 
-# ==================== GRÁFICOS DE EVOLUCIÓN ====================
+# ==================== GRÁFICOS DE EVOLUCIÓN CON ALINEACIÓN PERFECTA ====================
 def generar_grafico_evolucion_activo(ticker: str, periodo_default: str = "6mo"):
     ticker = ticker.strip().upper()
-    simbolo = f"{ticker}-USD" if ticker in ["BTC", "ETH", "SOL", "BNB", "ADA", "XRP"] else ticker
+    simbolo = normalizar_ticker_yf(ticker)
     
     fecha_inicio = None
     ppc_referencia = None
@@ -163,42 +161,40 @@ def generar_grafico_evolucion_activo(ticker: str, periodo_default: str = "6mo"):
                 fecha_inicio = df_inv['fecha'].iloc[0].strftime('%Y-%m-%d')
                 ppc_referencia = df_inv['monto_total_usd'].sum() / df_inv['cantidad'].sum()
     except Exception as e:
-        logger.error(f"Error consultando fecha de compra para {ticker}: {e}")
+        logger.error(f"Error consultando fecha para {ticker}: {e}")
 
     try:
         t = yf.Ticker(simbolo)
-        if fecha_inicio:
-            df_hist = t.history(start=fecha_inicio)
-        else:
-            df_hist = t.history(period=periodo_default)
-
+        df_hist = t.history(start=fecha_inicio) if fecha_inicio else t.history(period=periodo_default)
         if df_hist.empty and not simbolo.endswith("-USD"):
             simbolo = f"{simbolo}-USD"
             t = yf.Ticker(simbolo)
-            if fecha_inicio:
-                df_hist = t.history(start=fecha_inicio)
-            else:
-                df_hist = t.history(period=periodo_default)
+            df_hist = t.history(start=fecha_inicio) if fecha_inicio else t.history(period=periodo_default)
 
         if df_hist.empty:
             return None
 
-        plt.figure(figsize=(9, 5))
-        color_linea = "#2b5c8f"
-        plt.plot(df_hist.index, df_hist['Close'], label=f"{ticker} (USD)", color=color_linea, linewidth=2.2)
-        plt.fill_between(df_hist.index, df_hist['Close'], alpha=0.15, color=color_linea)
+        # Descartar zona horaria y rellenar días no bursátiles para línea continua
+        df_hist.index = pd.to_datetime(df_hist.index).tz_localize(None)
+        serie = df_hist['Close'].ffill().bfill()
+
+        plt.figure(figsize=(9.5, 5))
+        color_linea = "#1f77b4"
+        plt.plot(serie.index, serie, label=f"Precio {ticker} (USD)", color=color_linea, linewidth=2.2)
+        plt.fill_between(serie.index, serie, alpha=0.12, color=color_linea)
         
         if ppc_referencia:
-            plt.axhline(y=ppc_referencia, color="#d62728", linestyle="--", linewidth=1.5, label=f"Tu PPC (${ppc_referencia:,.2f})")
+            plt.axhline(y=ppc_referencia, color="#d62728", linestyle="--", linewidth=1.6, label=f"Tu PPC (${ppc_referencia:,.2f})")
             subtitulo = f"Desde tu primera compra ({fecha_inicio})"
         else:
             subtitulo = "Últimos 6 meses"
 
         plt.title(f"Evolución Histórica: {ticker}\n{subtitulo}", fontsize=12, fontweight='bold', pad=12)
         plt.xlabel("Fecha")
-        plt.ylabel("Precio USD")
-        plt.grid(True, linestyle="--", alpha=0.4)
-        plt.legend(loc="upper left")
+        plt.ylabel("Precio en USD")
+        plt.grid(True, linestyle="--", alpha=0.35)
+        plt.legend(loc="upper left", frameon=True)
+        plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
         plt.tight_layout()
 
         buf = io.BytesIO()
@@ -207,54 +203,176 @@ def generar_grafico_evolucion_activo(ticker: str, periodo_default: str = "6mo"):
         plt.close()
         return buf
     except Exception as e:
-        logger.error(f"Error generando evolución para {ticker}: {e}")
+        logger.error(f"Error graficando evolución activo {ticker}: {e}")
         return None
 
 def generar_grafico_evolucion_cartera():
     try:
         with get_db_connection() as conn:
-            df = pd.read_sql("SELECT ticker, MIN(fecha) as primera_compra FROM portafolio_inversiones GROUP BY ticker;", conn)
+            df = pd.read_sql("SELECT ticker, MIN(fecha) as primera_compra, SUM(cantidad) as cantidad, SUM(monto_total_usd) as costo_total FROM portafolio_inversiones GROUP BY ticker;", conn)
         
         if df.empty:
             return None
         
         primera_fecha_global = df['primera_compra'].min().strftime('%Y-%m-%d')
-        
-        datos_cierre = {}
+        series_dict = {}
+
         for _, row in df.iterrows():
             tk = row['ticker']
-            sym = f"{tk}-USD" if tk in ["BTC", "ETH", "SOL", "BNB", "ADA", "XRP"] else tk
+            sym = normalizar_ticker_yf(tk)
             try:
                 h = yf.Ticker(sym).history(start=primera_fecha_global)
-                if not h.empty and h['Close'].iloc[0] > 0:
-                    datos_cierre[tk] = (h['Close'] / h['Close'].iloc[0]) * 100
+                if not h.empty:
+                    s = h['Close']
+                    s.index = pd.to_datetime(s.index).tz_localize(None)
+                    series_dict[tk] = s
             except Exception:
                 pass
-                
-        if not datos_cierre:
+
+        if not series_dict:
             return None
 
-        df_comp = pd.DataFrame(datos_cierre)
-        plt.figure(figsize=(9, 5))
-        for col in df_comp.columns:
-            plt.plot(df_comp.index, df_comp[col], label=col, linewidth=2)
-            
-        plt.axhline(y=100, color="gray", linestyle=":", alpha=0.7)
-        plt.title(f"Rendimiento de Cartera (Base 100)\nDesde tu primera inversión ({primera_fecha_global})", fontsize=12, fontweight='bold', pad=12)
-        plt.xlabel("Fecha")
-        plt.ylabel("Rendimiento Relativo (%)")
-        plt.grid(True, linestyle="--", alpha=0.4)
-        plt.legend(loc="upper left")
-        plt.tight_layout()
+        # Alineación temporal completa (resample diario continuo + ffill para unir cripto y acciones)
+        df_precios = pd.DataFrame(series_dict)
+        df_precios = df_precios.resample('D').last().ffill().bfill()
         
+        # Normalizar cada activo a Base 100 desde el inicio de la cartera
+        df_norm = pd.DataFrame()
+        for col in df_precios.columns:
+            primer_val = df_precios[col].iloc[0]
+            if primer_val > 0:
+                df_norm[col] = (df_precios[col] / primer_val) * 100
+
+        fig, ax = plt.subplots(figsize=(10, 5.2))
+        colores = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2']
+        
+        for idx, col in enumerate(df_norm.columns):
+            c = colores[idx % len(colores)]
+            ax.plot(df_norm.index, df_norm[col], label=f"{col} ({df_norm[col].iloc[-1]:.1f}%)", linewidth=2.2, color=c)
+
+        ax.axhline(y=100, color="gray", linestyle=":", linewidth=1.3, alpha=0.75, label="Punto de partida (100)")
+        ax.set_title(f"Rendimiento Relativo de tu Cartera (Base 100)\nDesde tu primera inversión ({primera_fecha_global})", fontsize=12, fontweight='bold', pad=12)
+        ax.set_xlabel("Fecha")
+        ax.set_ylabel("Rendimiento Relativo (%)")
+        ax.grid(True, linestyle="--", alpha=0.35)
+        ax.legend(loc="upper left", frameon=True)
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+        plt.tight_layout()
+
         buf = io.BytesIO()
         plt.savefig(buf, format='png', dpi=200)
         buf.seek(0)
         plt.close()
         return buf
     except Exception as e:
-        logger.error(f"Error generando evolución de cartera: {e}")
+        logger.error(f"Error generando evolución cartera: {e}")
         return None
+
+# ==================== MOTOR DE MÉTRICAS ANALÍTICAS AVANZADAS ====================
+def calcular_super_metricas_totales():
+    """Genera un reporte analítico de alto nivel con todas las métricas de Inversiones y Gastos/Ingresos"""
+    metricas = []
+    
+    # 1. MÉTRICAS DE INVERSIONES (USD)
+    try:
+        with get_db_connection() as conn:
+            df_inv = pd.read_sql("SELECT id, fecha, ticker, cantidad, precio_compra, monto_total_usd FROM portafolio_inversiones ORDER BY fecha ASC;", conn)
+        
+        if not df_inv.empty:
+            total_invertido = float(df_inv['monto_total_usd'].sum())
+            total_actual = 0.0
+            detalle_activos = []
+            
+            agrupado = df_inv.groupby('ticker').agg({'cantidad': 'sum', 'monto_total_usd': 'sum'}).reset_index()
+            for _, r in agrupado.iterrows():
+                tk = r['ticker']
+                cant = float(r['cantidad'])
+                costo = float(r['monto_total_usd'])
+                ppc = costo / cant if cant > 0 else 0.0
+                spot, _ = obtener_precio_actual(tk)
+                if spot is None:
+                    spot = ppc
+                val_mercado = cant * spot
+                pnl_usd = val_mercado - costo
+                pnl_pct = (pnl_usd / costo * 100) if costo > 0 else 0.0
+                total_actual += val_mercado
+                
+                detalle_activos.append({
+                    "ticker": tk,
+                    "cant": cant,
+                    "ppc": ppc,
+                    "spot": spot,
+                    "costo": costo,
+                    "val_mercado": val_mercado,
+                    "pnl_usd": pnl_usd,
+                    "pnl_pct": pnl_pct
+                })
+            
+            pnl_global_usd = total_actual - total_invertido
+            pnl_global_pct = (pnl_global_usd / total_invertido * 100) if total_invertido > 0 else 0.0
+            
+            # Ordenar por rendimiento
+            detalle_activos.sort(key=lambda x: x['pnl_pct'], reverse=True)
+            top_asset = detalle_activos[0]
+            worst_asset = detalle_activos[-1]
+            
+            metricas.append("=== MÉTRICAS DE CARTERA DE INVERSIÓN (USD) ===")
+            metricas.append(f"• Total Capital Invertido: ${total_invertido:,.2f} USD")
+            metricas.append(f"• Valor Actual de Cartera: ${total_actual:,.2f} USD")
+            metricas.append(f"• Ganancia/Pérdida Neta Total (PnL): ${pnl_global_usd:,.2f} USD ({pnl_global_pct:+.2f}%)")
+            metricas.append(f"• Mejor Activo (Top Gainer): {top_asset['ticker']} ({top_asset['pnl_pct']:+.2f}% / ${top_asset['pnl_usd']:,.2f} USD)")
+            metricas.append(f"• Activo más rezagado: {worst_asset['ticker']} ({worst_asset['pnl_pct']:+.2f}% / ${worst_asset['pnl_usd']:,.2f} USD)")
+            metricas.append(f"• Primera fecha de inversión: {df_inv['fecha'].iloc[0].strftime('%Y-%m-%d')}")
+            metricas.append(f"• Última fecha de inversión: {df_inv['fecha'].iloc[-1].strftime('%Y-%m-%d')}")
+            metricas.append(f"• Cantidad de operaciones de compra registradas: {len(df_inv)}")
+            metricas.append("• Desglose por Activo:")
+            for a in detalle_activos:
+                peso = (a['val_mercado'] / total_actual * 100) if total_actual > 0 else 0
+                metricas.append(f"   - {a['ticker']}: Tenencia {a['cant']:,.4f} | PPC ${a['ppc']:,.2f} | Spot ${a['spot']:,.2f} | PnL ${a['pnl_usd']:,.2f} ({a['pnl_pct']:+.2f}%) | Peso en cartera: {peso:.1f}%")
+        else:
+            metricas.append("=== CARTERA DE INVERSIÓN: Sin compras registradas todavía ===")
+    except Exception as e:
+        logger.error(f"Error métricas inversión: {e}")
+
+    # 2. MÉTRICAS DE GASTOS E INGRESOS (ARS)
+    try:
+        with get_db_connection() as conn:
+            df_mov = pd.read_sql("SELECT id, fecha, tipo, monto, categoria, descripcion FROM movimientos ORDER BY fecha ASC;", conn)
+        
+        if not df_mov.empty:
+            df_mov['fecha'] = pd.to_datetime(df_mov['fecha'])
+            df_gastos = df_mov[df_mov['tipo'] == 'GASTO']
+            df_ingresos = df_mov[df_mov['tipo'] == 'INGRESO']
+            
+            tot_gastos = float(df_gastos['monto'].sum()) if not df_gastos.empty else 0.0
+            tot_ingresos = float(df_ingresos['monto'].sum()) if not df_ingresos.empty else 0.0
+            ahorro_neto = tot_ingresos - tot_gastos
+            tasa_ahorro = (ahorro_neto / tot_ingresos * 100) if tot_ingresos > 0 else 0.0
+            
+            metricas.append("\n=== MÉTRICAS DE FLUJO DE CAJA (ARS) ===")
+            metricas.append(f"• Ingresos Totales Históricos: ${tot_ingresos:,.2f} ARS")
+            metricas.append(f"• Gastos Totales Históricos: ${tot_gastos:,.2f} ARS")
+            metricas.append(f"• Superávit/Déficit Neto (Ahorro): ${ahorro_neto:,.2f} ARS")
+            metricas.append(f"• Tasa de Ahorro Histórica: {tasa_ahorro:.2f}%")
+            
+            if not df_gastos.empty:
+                df_gastos['mes_ano'] = df_gastos['fecha'].dt.to_period('M').astype(str)
+                prom_mes = df_gastos.groupby('mes_ano')['monto'].sum().mean()
+                max_gasto = df_gastos.sort_values(by='monto', ascending=False).iloc[0]
+                top_cat = df_gastos.groupby('categoria')['monto'].sum().sort_values(ascending=False)
+                
+                metricas.append(f"• Promedio mensual de gastos: ${prom_mes:,.2f} ARS")
+                metricas.append(f"• Mayor gasto individual registrado: ${max_gasto['monto']:,.2f} ARS ({max_gasto['categoria']} - {max_gasto['descripcion']} el {max_gasto['fecha'].strftime('%Y-%m-%d')})")
+                metricas.append("• Top categorías de gasto:")
+                for cat, val in top_cat.head(4).items():
+                    pct_cat = (val / tot_gastos * 100) if tot_gastos > 0 else 0
+                    metricas.append(f"   - {cat}: ${val:,.2f} ARS ({pct_cat:.1f}%)")
+        else:
+            metricas.append("\n=== FLUJO DE CAJA (ARS): Sin movimientos registrados ===")
+    except Exception as e:
+        logger.error(f"Error métricas ARS: {e}")
+
+    return "\n".join(metricas)
 
 # ==================== INVERSIONES (USD) ====================
 def registrar_operacion_inversion(ticker: str, monto_usd: float, precio_compra: float = None, cantidad: float = None, fecha_compra: str = None):
@@ -268,7 +386,6 @@ def registrar_operacion_inversion(ticker: str, monto_usd: float, precio_compra: 
     elif monto_usd is None or monto_usd <= 0:
         monto_usd = cantidad * precio_compra
 
-    # Limpiar y validar fecha
     fecha_limpia = None
     if fecha_compra:
         f_cand = fecha_compra.strip().split()[0]
@@ -462,34 +579,6 @@ def borrar_todos_los_movimientos():
             conn.commit()
 
 # ==================== GASTOS / INGRESOS (ARS) ====================
-def obtener_metricas_analisis_gastos():
-    with get_db_connection() as conn:
-        df = pd.read_sql("SELECT fecha, monto, categoria, descripcion FROM movimientos WHERE tipo = 'GASTO' ORDER BY fecha ASC;", conn)
-    
-    if df.empty:
-        return "No hay suficientes gastos registrados en ARS."
-    
-    df['fecha'] = pd.to_datetime(df['fecha'])
-    df['mes_ano'] = df['fecha'].dt.to_period('M').astype(str)
-    
-    por_mes = df.groupby('mes_ano')['monto'].sum()
-    promedio_mensual = por_mes.mean()
-    cat_mes = df.groupby(['mes_ano', 'categoria'])['monto'].sum().unstack(fill_value=0)
-    cat_total = df.groupby('categoria')['monto'].sum().sort_values(ascending=False)
-    
-    top_gastos = df.sort_values(by='monto', ascending=False).head(5)[['fecha', 'monto', 'categoria', 'descripcion']]
-    top_gastos_txt = "\n".join([f"- [{r['fecha'].strftime('%Y-%m-%d')}] ${r['monto']:,.2f} ARS en {r['categoria']} ({r['descripcion']})" for _, r in top_gastos.iterrows()])
-    
-    return (
-        f"MÉTRICAS ESTADÍSTICAS REALES:\n"
-        f"- Gasto total histórico: ${df['monto'].sum():,.2f} ARS\n"
-        f"- Promedio mensual: ${promedio_mensual:,.2f} ARS\n"
-        f"- Totales por mes:\n{por_mes.to_string()}\n\n"
-        f"- Gastos por categoría y mes:\n{cat_mes.to_string()}\n\n"
-        f"- Ranking categorías:\n{cat_total.to_string()}\n\n"
-        f"- Picos / Anomalías individuales:\n{top_gastos_txt}"
-    )
-
 def guardar_movimiento(tipo, monto, categoria, descripcion, fecha_str=None):
     fecha_limpia = None
     if fecha_str:
@@ -554,39 +643,28 @@ def generar_excel_completo():
 
 # ==================== SYSTEM INSTRUCTION ====================
 SYSTEM_INSTRUCTION = """
-Eres un analista y asesor financiero personal de alto nivel.
-Tienes acceso al historial unificado con IDs y fechas exactas de GASTOS, INGRESOS e INVERSIONES.
+Eres un analista y asesor financiero cuantitativo de nivel institucional.
+Dispones del MOTOR DE MÉTRICAS ANALÍTICAS EXACTAS de Inversiones (USD) y Flujo de Caja (ARS), además del historial unificado con IDs y fechas.
 
-REGLAS DE CONSULTA DE FECHAS / HISTORIAL:
-- Si el usuario pregunta cuándo compró o registró algo (ej: "¿cuándo compré BTC?", "¿qué compré el mes pasado?", "¿en qué fecha registré el gasto de farmacia?", "mostrame las fechas de mis compras"):
-  Responde con precisión humana usando los datos exactos del historial proporcionado. No agregues etiquetas REGISTRO a consultas pasadas.
+REGLAS DE RESPUESTA A MÉTRICAS Y CONSULTAS:
+- Si el usuario pregunta por cualquier métrica, cálculo o dato de su cartera o gastos (ej: "¿cuál es mi activo más rentable?", "¿cuánto vengo ganando en USD y en %?", "¿cuánto invertí en total?", "¿cuál es mi tasa de ahorro?", "¿en qué mes gasté más?", "¿cuándo compré NVDA?", "haceme un balance"):
+  Utiliza siempre los números exactos calculados del bloque MÉTRICAS CUANTITATIVAS REALES. Da respuestas claras, directas, con números precisos y emojis profesionales. No inventes números.
 
 REGLAS DE BORRADO:
-- Borrar por ticker de inversión (ej: "borrá NVDA", "eliminá las compras de BTC", "borrá nvda de mi cartera"):
-  ACCION: BORRAR_INVERSION_TICKER|[TICKER]
-- Borrar una inversión específica por ID (ej: "borrá la inversión ID 3"):
-  ACCION: BORRAR_INVERSION_ID|[ID]
-- Borrar un gasto o ingreso por ID (ej: "borrá el gasto ID 5", "borrá el movimiento 4"):
-  ACCION: BORRAR_MOVIMIENTO_ID|[ID]
-- Borrar lo último que se registró (sea gasto o inversión):
-  ACCION: BORRAR_ULTIMO
-- Borrar todo el historial y resetear:
-  ACCION: BORRAR_TODO
+- Borrar por ticker de inversión: ACCION: BORRAR_INVERSION_TICKER|[TICKER]
+- Borrar inversión por ID: ACCION: BORRAR_INVERSION_ID|[ID]
+- Borrar movimiento por ID: ACCION: BORRAR_MOVIMIENTO_ID|[ID]
+- Borrar lo último registrado: ACCION: BORRAR_ULTIMO
+- Resetear todo: ACCION: BORRAR_TODO
 
-REGLAS DE REGISTRO DE COMPRA / APORTE (USD):
-- Si el usuario indica compra de activos (ej: "el 29 de mayo compre 288 usd de nvda a 208.0079 de ppc", "compré 1000 usd de MELI"):
-  Escribe obligatoriamente en UNA SOLA LÍNEA SEPARADA:
-  REGISTRO_INV: [TICKER]|[MONTO_USD]|[PRECIO_COMPRA]|[CANTIDAD]|[FECHA_YYYY-MM-DD]
-  (Si no dice fecha, deja el último campo vacío. Ejemplo: REGISTRO_INV: NVDA|288.0|208.01|1.3845|2026-05-29)
+REGLAS DE REGISTRO (EN UNA SOLA LÍNEA):
+- Inversión USD: REGISTRO_INV: [TICKER]|[MONTO_USD]|[PRECIO_COMPRA]|[CANTIDAD]|[FECHA_YYYY-MM-DD]
+- Gasto/Ingreso ARS: REGISTRO_ARS: [TIPO]|[MONTO]|[CATEGORIA]|[DESCRIPCION]|[FECHA_YYYY-MM-DD]
 
-REGLAS DE GASTOS / INGRESOS (ARS):
-- Registro de gasto o ingreso:
-  REGISTRO_ARS: [TIPO]|[MONTO]|[CATEGORIA]|[DESCRIPCION]|[FECHA_YYYY-MM-DD]
-
-REGLAS DE MERCADO Y GRÁFICOS:
-- Consulta precio en vivo: ACCION: CONSULTA_PRECIO|[TICKER]
-- Gráfico evolución activo: ACCION: GRAFICO_EVOLUCION_ACTIVO|[TICKER]
-- Gráfico evolución toda la cartera: ACCION: GRAFICO_EVOLUCION_CARTERA
+REGLAS DE GRÁFICOS Y MERCADO:
+- Cotización en vivo: ACCION: CONSULTA_PRECIO|[TICKER]
+- Gráfico evolución activo puntual: ACCION: GRAFICO_EVOLUCION_ACTIVO|[TICKER]
+- Gráfico evolución comparativa de cartera (Base 100): ACCION: GRAFICO_EVOLUCION_CARTERA
 - Ver estado actual cartera: ACCION: VER_CARTERA
 - Gráfico de torta inversiones: ACCION: GRAFICO_INVERSIONES
 - Gráfico de torta gastos: ACCION: GRAFICO_GASTOS
@@ -595,19 +673,18 @@ REGLAS DE MERCADO Y GRÁFICOS:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 ¡Hola! Soy tu asistente financiero integral.\n\n"
-        "📅 Consultas y Fechas:\n"
-        "• '¿Cuándo compré BTC y a qué precio?'\n"
-        "• 'Mostrame las fechas de mis compras de NVDA'\n\n"
-        "🗑️ Borrado Universal:\n"
-        "• 'Borrá NVDA de mi cartera'\n"
-        "• 'Borrá el gasto ID 4' / 'Borrá la inversión ID 2'\n"
+        "👋 ¡Hola! Soy tu asistente financiero y analista cuantitativo.\n\n"
+        "📊 Métricas y Análisis de Cartera:\n"
+        "• '¿Cuál es mi rendimiento total?'\n"
+        "• '¿Cuál es mi activo más rentable?'\n"
+        "• 'Evolución del rendimiento de mi cartera' (Líneas comparativas)\n\n"
+        "📅 Fechas y Consultas:\n"
+        "• '¿Cuándo compré NVDA?' / 'Detalle de compras de SOL'\n\n"
+        "🗑️ Borrado:\n"
+        "• 'Borrá NVDA' / 'Borrá la inversión ID 2'\n"
         "• 'Borrá lo último que cargué'\n\n"
-        "📈 Inversiones y Mercado:\n"
-        "• 'El 29 de mayo compré 288 usd de NVDA a 208 de ppc'\n"
-        "• 'Evolución de mi cartera' / 'Precio de MELI'\n\n"
         "💸 Gastos (ARS):\n"
-        "• 'Almuerzo 12k' / 'Mandame un excel'"
+        "• '¿Cuál es mi tasa de ahorro?' / 'Mandame un excel'"
     )
 
 async def cmd_borrar_todo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -617,15 +694,13 @@ async def cmd_borrar_todo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_msg = update.message.text
     historial_unificado = obtener_historial_completo_texto()
+    metricas_cuantitativas = calcular_super_metricas_totales()
     
-    msg_lower = user_msg.lower()
-    es_pregunta_analisis = any(w in msg_lower for w in ["promedio", "analisis", "analizá", "analiza", "aumento", "subió", "subio", "por qué", "por que", "desvío", "desvio", "en qué gasté"])
-    
-    if es_pregunta_analisis:
-        metricas = obtener_metricas_analisis_gastos()
-        prompt = f"DATOS ESTADÍSTICOS EXACTOS:\n{metricas}\n\nHISTORIAL UNIFICADO CON FECHAS:\n{historial_unificado}\n\nPREGUNTA DEL USUARIO: {user_msg}"
-    else:
-        prompt = f"HISTORIAL UNIFICADO REGISTRADO (con IDs y Fechas):\n{historial_unificado}\n\nMensaje del usuario: {user_msg}"
+    prompt = (
+        f"MÉTRICAS CUANTITATIVAS REALES CALCULADAS EN VIVO:\n{metricas_cuantitativas}\n\n"
+        f"HISTORIAL DETALLADO REGISTRADO (con IDs y Fechas):\n{historial_unificado}\n\n"
+        f"MENSAJE DEL USUARIO: {user_msg}"
+    )
 
     try:
         response = ai_client.models.generate_content(
@@ -644,12 +719,10 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
         necesita_borrar_ultimo = "ACCION: BORRAR_ULTIMO" in reply
         necesita_precio = "ACCION: CONSULTA_PRECIO|" in reply
         necesita_grafico_evol_activo = "ACCION: GRAFICO_EVOLUCION_ACTIVO|" in reply
-        
         necesita_borrar_inv_tk = "ACCION: BORRAR_INVERSION_TICKER|" in reply
         necesita_borrar_inv_id = "ACCION: BORRAR_INVERSION_ID|" in reply
         necesita_borrar_mov_id = "ACCION: BORRAR_MOVIMIENTO_ID|" in reply
         
-        # Extracción segura de tags
         texto_limpio = reply
         for tag in ["ACCION: VER_CARTERA", "ACCION: GRAFICO_INVERSIONES", "ACCION: GRAFICO_EVOLUCION_CARTERA", "ACCION: GRAFICO_GASTOS", "ACCION: EXCEL", "ACCION: BORRAR_TODO", "ACCION: BORRAR_ULTIMO"]:
             texto_limpio = texto_limpio.replace(tag, "")
@@ -696,7 +769,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     pass
                 texto_limpio = texto_limpio.replace(m.group(0), "")
 
-        # Parseo exacto de REGISTRO_INV con regex de una sola línea
+        # Procesar Registro Inversión
         match_inv = re.search(r"REGISTRO_INV:\s*([^\n\r]+)", texto_limpio)
         if match_inv:
             linea_inv = match_inv.group(1).strip()
@@ -712,7 +785,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             fecha_str = f" - Fecha: {f_reg}" if f_reg else ""
             texto_limpio = f"{texto_limpio}\n\n💼 *(Guardado en Cartera: {c:,.4f} {t} a PPC ${p:,.2f} USD - Total: ${m:,.2f} USD{fecha_str})*".strip()
 
-        # Parseo exacto de REGISTRO_ARS con regex
+        # Procesar Registro Gasto/Ingreso
         match_ars = re.search(r"REGISTRO_ARS:\s*([^\n\r]+)", texto_limpio)
         if match_ars:
             linea_ars = match_ars.group(1).strip()
@@ -730,10 +803,10 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         texto_limpio = texto_limpio.strip()
 
-        # Borrados
+        # Ejecución de Borrados
         if necesita_borrar_todo:
             borrar_todos_los_movimientos()
-            texto_limpio += "\n\n🗑️ *(Base de datos completa reseteada)*"
+            texto_limpio += "\n\n🗑️ *(Base de datos y cartera reseteadas)*"
 
         if necesita_borrar_ultimo:
             res_ultimo = borrar_ultimo_registro_general()
@@ -745,7 +818,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if ticker_a_borrar:
             cant = borrar_inversion_por_ticker(ticker_a_borrar)
             if cant > 0:
-                texto_limpio += f"\n\n🗑️ *(Se eliminaron {cant} compra(s) de {ticker_a_borrar} de tu cartera)*"
+                texto_limpio += f"\n\n🗑️ *(Se eliminaron {cant} compras de {ticker_a_borrar} de tu cartera)*"
             else:
                 texto_limpio += f"\n\n⚠️ No se encontraron compras de `{ticker_a_borrar}`."
 
@@ -770,7 +843,6 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 signo = "+" if datos_mkt["var_pct"] >= 0 else ""
                 emoji = "🟢" if datos_mkt["var_pct"] >= 0 else "🔴"
                 rango_txt = f"\n• Rango del día: ${datos_mkt['day_low']:,.2f} - ${datos_mkt['day_high']:,.2f} USD" if datos_mkt["day_high"] else ""
-                
                 msg_mkt = (
                     f"📈 {datos_mkt['ticker']} en vivo:\n\n"
                     f"• Precio actual: ${datos_mkt['precio']:,.2f} USD\n"
@@ -782,7 +854,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 texto_limpio += f"\n\n⚠️ No pude obtener la cotización de `{ticker_a_cotizar}` en este momento."
 
-        # Envío seguro de texto
+        # Envío de texto seguro
         if texto_limpio:
             try:
                 await update.message.reply_text(texto_limpio, parse_mode="Markdown")
@@ -793,17 +865,17 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if ticker_grafico_evol:
             buf_img = generar_grafico_evolucion_activo(ticker_grafico_evol)
             if buf_img:
-                await update.message.reply_photo(photo=buf_img, caption=f"📈 Evolución de {ticker_grafico_evol} desde tu fecha de compra.")
+                await update.message.reply_photo(photo=buf_img, caption=f"📈 Evolución continua de {ticker_grafico_evol} desde tu fecha de compra.")
             else:
                 await update.message.reply_text(f"⚠️ No pude generar la curva de evolución para {ticker_grafico_evol}.")
 
-        # Gráfico evolución cartera
+        # Gráfico evolución comparativa de cartera
         if necesita_grafico_evol_cartera:
             buf_img = generar_grafico_evolucion_cartera()
             if buf_img:
-                await update.message.reply_photo(photo=buf_img, caption="📈 Evolución de rendimiento de tu cartera desde tu primera inversión (Base 100).")
+                await update.message.reply_photo(photo=buf_img, caption="📈 Evolución relativa de tus activos (Base 100) desde tu primera inversión.")
             else:
-                await update.message.reply_text("No hay suficientes activos registrados en tu cartera para armar el gráfico comparativo.")
+                await update.message.reply_text("No hay suficientes activos registrados para armar el gráfico comparativo.")
 
         # Reporte de cartera
         if necesita_cartera:
@@ -813,7 +885,6 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 signo = "+" if resumen["pnl_total_usd"] >= 0 else ""
                 emoji_rend = "🟢" if resumen["pnl_total_usd"] >= 0 else "🔴"
-                
                 msg_rep = (
                     f"💼 ESTADO DE TU CARTERA EN VIVO\n\n"
                     f"• Capital Invertido: ${resumen['total_invertido']:,.2f} USD\n"
@@ -821,7 +892,6 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"• Resultado Total (PnL): {emoji_rend} {signo}${resumen['pnl_total_usd']:,.2f} USD ({signo}{resumen['pnl_total_pct']:.2f}%)\n\n"
                     f"📊 Detalle por Activo:\n"
                 )
-                
                 for pos in resumen["posiciones"]:
                     pnl_s = "+" if pos["pnl_usd"] >= 0 else ""
                     em = "🟢" if pos["pnl_usd"] >= 0 else "🔴"
