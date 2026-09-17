@@ -590,7 +590,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cant = float(datos[3]) if len(datos) > 3 and datos[3] not in ["0", ""] else None
             
             t, c, p, m = registrar_operacion_inversion(ticker, monto, p_compra, cant)
-            texto_limpio = f"{texto_usuario}\n\n💼 *(Guardado en Cartera: {c:,.4f} {t} a PPC ${p:,.2f} USD \vert{} Total:${m:,.2f} USD)*"
+            texto_limpio = f"{texto_usuario}\n\n💼 *(Guardado en Cartera: {c:,.4f} {t} a PPC ${p:,.2f} USD | Total: ${m:,.2f} USD)*"
 
         # Registro Gasto/Ingreso ARS
         if registro_ars and not registro_inv and not necesita_precio:
