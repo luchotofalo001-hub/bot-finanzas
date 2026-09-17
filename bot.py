@@ -144,7 +144,7 @@ def obtener_precio_actual(ticker: str):
         return datos["precio"], datos["ticker"]
     return None, ticker
 
-# ==================== GRÁFICOS DE EVOLUCIÓN HISTÓRICA CON FECHA ====================
+# ==================== GRÁFICOS DE EVOLUCIÓN ====================
 def generar_grafico_evolucion_activo(ticker: str, periodo_default: str = "6mo"):
     ticker = ticker.strip().upper()
     simbolo = f"{ticker}-USD" if ticker in ["BTC", "ETH", "SOL", "BNB", "ADA", "XRP"] else ticker
@@ -267,28 +267,19 @@ def registrar_operacion_inversion(ticker: str, monto_usd: float, precio_compra: 
     elif monto_usd is None or monto_usd <= 0:
         monto_usd = cantidad * precio_compra
 
-    sql_fecha = "NOW()"
-    params = [ticker, float(cantidad), float(precio_compra), float(monto_usd)]
-    
-    if fecha_compra and fecha_compra.strip() != "":
-        sql_fecha = "%s"
-        params.insert(0, fecha_compra.strip())
-    else:
-        params.insert(0, None)
-
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
-            if params[0] is not None:
+            if fecha_compra and fecha_compra.strip():
                 cursor.execute(
                     """INSERT INTO portafolio_inversiones (fecha, ticker, cantidad, precio_compra, monto_total_usd)
                        VALUES (%s, %s, %s, %s, %s);""",
-                    (params[0], params[1], params[2], params[3], params[4])
+                    (fecha_compra.strip(), ticker, float(cantidad), float(precio_compra), float(monto_usd))
                 )
             else:
                 cursor.execute(
                     """INSERT INTO portafolio_inversiones (fecha, ticker, cantidad, precio_compra, monto_total_usd)
                        VALUES (NOW(), %s, %s, %s, %s);""",
-                    (params[1], params[2], params[3], params[4])
+                    (ticker, float(cantidad), float(precio_compra), float(monto_usd))
                 )
             conn.commit()
     return ticker, cantidad, precio_compra, monto_usd, fecha_compra
@@ -370,6 +361,98 @@ def generar_grafico_distribucion_inversiones():
     plt.close()
     return buf
 
+# ==================== CONSULTAS Y BORRADO UNIVERSAL ====================
+def obtener_historial_completo_texto():
+    lineas = []
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT id, fecha, tipo, monto, categoria, descripcion FROM movimientos ORDER BY fecha DESC LIMIT 50;")
+            movs = cursor.fetchall()
+            if movs:
+                lineas.append("📋 GASTOS E INGRESOS (ARS):")
+                for m in movs:
+                    lineas.append(f"- ID {m[0]} | Fecha: {m[1].strftime('%Y-%m-%d %H:%M')} | {m[2]}: ${m[3]:,.2f} ARS | Cat: {m[4]} | Desc: {m[5]}")
+            else:
+                lineas.append("📋 GASTOS E INGRESOS: Sin registros.")
+
+            cursor.execute("SELECT id, fecha, ticker, cantidad, precio_compra, monto_total_usd FROM portafolio_inversiones ORDER BY fecha DESC LIMIT 50;")
+            invs = cursor.fetchall()
+            lineas.append("\n💼 INVERSIONES (USD):")
+            if invs:
+                for inv in invs:
+                    lineas.append(f"- ID {inv[0]} (INV) | Fecha: {inv[1].strftime('%Y-%m-%d %H:%M')} | Ticker: {inv[2]} | Cant: {inv[3]:,.4f} | PPC: ${inv[4]:,.2f} USD | Total: ${inv[5]:,.2f} USD")
+            else:
+                lineas.append("Sin inversiones registradas.")
+    return "\n".join(lineas)
+
+def borrar_inversion_por_ticker(ticker: str):
+    ticker = ticker.strip().upper()
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("DELETE FROM portafolio_inversiones WHERE UPPER(ticker) = %s RETURNING id;", (ticker,))
+            filas = cursor.fetchall()
+            conn.commit()
+            return len(filas)
+
+def borrar_inversion_por_id(inv_id: int):
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT id, ticker, monto_total_usd FROM portafolio_inversiones WHERE id = %s;", (inv_id,))
+            reg = cursor.fetchone()
+            if reg:
+                cursor.execute("DELETE FROM portafolio_inversiones WHERE id = %s;", (inv_id,))
+                conn.commit()
+                return reg
+            return None
+
+def borrar_movimiento_por_id(mov_id: int):
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT id, tipo, monto, categoria, descripcion FROM movimientos WHERE id = %s;", (mov_id,))
+            reg = cursor.fetchone()
+            if reg:
+                cursor.execute("DELETE FROM movimientos WHERE id = %s;", (mov_id,))
+                conn.commit()
+                return reg
+            return None
+
+def borrar_ultimo_registro_general():
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT 'MOV' as origen, id, fecha, tipo, monto FROM movimientos ORDER BY id DESC LIMIT 1;")
+            ultimo_mov = cursor.fetchone()
+            cursor.execute("SELECT 'INV' as origen, id, fecha, ticker, monto_total_usd FROM portafolio_inversiones ORDER BY id DESC LIMIT 1;")
+            ultimo_inv = cursor.fetchone()
+            
+            if not ultimo_mov and not ultimo_inv:
+                return None
+            
+            if ultimo_mov and not ultimo_inv:
+                cursor.execute("DELETE FROM movimientos WHERE id = %s;", (ultimo_mov[1],))
+                conn.commit()
+                return f"Gasto/Ingreso {ultimo_mov[3]} de ${ultimo_mov[4]:,.2f} ARS (ID {ultimo_mov[1]})"
+            
+            if ultimo_inv and not ultimo_mov:
+                cursor.execute("DELETE FROM portafolio_inversiones WHERE id = %s;", (ultimo_inv[1],))
+                conn.commit()
+                return f"Inversión de {ultimo_inv[3]} de ${ultimo_inv[4]:,.2f} USD (ID {ultimo_inv[1]})"
+            
+            if ultimo_mov[2] >= ultimo_inv[2]:
+                cursor.execute("DELETE FROM movimientos WHERE id = %s;", (ultimo_mov[1],))
+                conn.commit()
+                return f"Gasto/Ingreso {ultimo_mov[3]} de ${ultimo_mov[4]:,.2f} ARS (ID {ultimo_mov[1]})"
+            else:
+                cursor.execute("DELETE FROM portafolio_inversiones WHERE id = %s;", (ultimo_inv[1],))
+                conn.commit()
+                return f"Inversión de {ultimo_inv[3]} de ${ultimo_inv[4]:,.2f} USD (ID {ultimo_inv[1]})"
+
+def borrar_todos_los_movimientos():
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("TRUNCATE TABLE movimientos RESTART IDENTITY;")
+            cursor.execute("TRUNCATE TABLE portafolio_inversiones RESTART IDENTITY;")
+            conn.commit()
+
 # ==================== GASTOS / INGRESOS (ARS) ====================
 def obtener_metricas_analisis_gastos():
     with get_db_connection() as conn:
@@ -399,56 +482,20 @@ def obtener_metricas_analisis_gastos():
         f"- Picos / Anomalías individuales:\n{top_gastos_txt}"
     )
 
-def guardar_movimiento(tipo, monto, categoria, descripcion):
+def guardar_movimiento(tipo, monto, categoria, descripcion, fecha_str=None):
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
-            cursor.execute(
-                "INSERT INTO movimientos (fecha, tipo, monto, categoria, descripcion) VALUES (NOW(), %s, %s, %s, %s)",
-                (tipo.upper(), float(monto), categoria.capitalize(), descripcion)
-            )
+            if fecha_str and fecha_str.strip():
+                cursor.execute(
+                    "INSERT INTO movimientos (fecha, tipo, monto, categoria, descripcion) VALUES (%s, %s, %s, %s, %s)",
+                    (fecha_str.strip(), tipo.upper(), float(monto), categoria.capitalize(), descripcion)
+                )
+            else:
+                cursor.execute(
+                    "INSERT INTO movimientos (fecha, tipo, monto, categoria, descripcion) VALUES (NOW(), %s, %s, %s, %s)",
+                    (tipo.upper(), float(monto), categoria.capitalize(), descripcion)
+                )
             conn.commit()
-
-def borrar_todos_los_movimientos():
-    with get_db_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute("TRUNCATE TABLE movimientos RESTART IDENTITY;")
-            cursor.execute("TRUNCATE TABLE portafolio_inversiones RESTART IDENTITY;")
-            conn.commit()
-
-def borrar_por_id(movimiento_id):
-    with get_db_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT id, tipo, monto, categoria, descripcion FROM movimientos WHERE id = %s;", (int(movimiento_id),))
-            fila = cursor.fetchone()
-            if fila:
-                cursor.execute("DELETE FROM movimientos WHERE id = %s;", (int(movimiento_id),))
-                conn.commit()
-                return fila
-            return None
-
-def borrar_ultimo_movimiento():
-    with get_db_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT id, tipo, monto, categoria, descripcion FROM movimientos ORDER BY id DESC LIMIT 1;")
-            ultimo = cursor.fetchone()
-            if ultimo:
-                cursor.execute("DELETE FROM movimientos WHERE id = %s;", (ultimo[0],))
-                conn.commit()
-                return ultimo
-            return None
-
-def obtener_historial_texto(limite=40):
-    try:
-        with get_db_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("SELECT id, fecha, tipo, monto, categoria, descripcion FROM movimientos ORDER BY id DESC LIMIT %s;", (limite,))
-                filas = cursor.fetchall()
-                if not filas:
-                    return "Sin transacciones en ARS."
-                lineas = [f"- ID {f[0]} | [{f[1].strftime('%Y-%m-%d %H:%M')}] {f[2]}: ${f[3]:,.2f} ARS | {f[4]} | {f[5]}" for f in filas]
-                return "\n".join(lineas)
-    except Exception as e:
-        return "Sin historial ARS."
 
 def generar_grafico_gastos():
     with get_db_connection() as conn:
@@ -477,7 +524,7 @@ def generar_grafico_gastos():
 def generar_excel_completo():
     with get_db_connection() as conn:
         df_mov = pd.read_sql("SELECT * FROM movimientos ORDER BY fecha ASC;", conn)
-        df_inv = pd.read_sql("SELECT * FROM portafolio_inversiones ORDER BY fecha ASC;", conn)
+        df_inv = pd.read_sql("SELECT * FROM portafolio_inversIONES ORDER BY fecha ASC;", conn)
     
     if df_mov.empty and df_inv.empty:
         return None
@@ -494,55 +541,57 @@ def generar_excel_completo():
 # ==================== SYSTEM INSTRUCTION ====================
 SYSTEM_INSTRUCTION = """
 Eres un analista y asesor financiero personal de alto nivel.
-Distingues estrictamente dos mundos:
-1. GASTOS E INGRESOS: Flujo cotidiano en Pesos Argentinos (ARS $).
-2. MERCADO E INVERSIONES: Activos financieros en Dólares (USD $), identificados por TICKERS (acciones, CEDEARs, ETFs, Cripto).
+Tienes acceso al historial unificado con IDs y fechas exactas de GASTOS, INGRESOS e INVERSIONES.
 
-REGLAS DE PRECIO Y MERCADO:
-- Si el usuario te pregunta por la cotización, precio o variación de un activo o acción (ej: "¿a cuánto está MELI?", "precio de BTC", "cómo viene AAPL hoy"):
-  Identifica el ticker y responde OBLIGATORIAMENTE agregando al final una única línea:
-  ACCION: CONSULTA_PRECIO|[TICKER]
+REGLAS DE CONSULTA DE FECHAS / HISTORIAL:
+- Si el usuario pregunta cuándo compró o registró algo (ej: "¿cuándo compré BTC?", "¿qué compré el mes pasado?", "¿en qué fecha registré el gasto de farmacia?", "mostrame las fechas de mis compras"):
+  Responde con precisión humana usando los datos exactos del historial proporcionado. No necesitas ninguna etiqueta especial a menos que pida un gráfico o excel.
 
-REGLAS DE GRÁFICO DE EVOLUCIÓN:
-- Si el usuario pide evolución o histórico de un activo específico (ej: "gráfico de evolución de MELI", "evolución de BTC"):
-  ACCION: GRAFICO_EVOLUCION_ACTIVO|[TICKER]
-- Si pide la evolución, histórico o curva de rendimiento de TODA SU CARTERA o de sus inversiones en general (ej: "evolución de toda mi cartera", "gráfico con la evolución del rendimiento de mi cartera"):
-  ACCION: GRAFICO_EVOLUCION_CARTERA
+REGLAS DE BORRADO:
+- Borrar por ticker de inversión (ej: "borrá NVDA", "eliminá las compras de BTC", "borrá nvda de mi cartera"):
+  ACCION: BORRAR_INVERSION_TICKER|[TICKER]
+- Borrar una inversión específica por ID (ej: "borrá la inversión ID 3"):
+  ACCION: BORRAR_INVERSION_ID|[ID]
+- Borrar un gasto o ingreso por ID (ej: "borrá el gasto ID 5", "borrá el movimiento 4"):
+  ACCION: BORRAR_MOVIMIENTO_ID|[ID]
+- Borrar lo último que se registró (sea gasto o inversión):
+  ACCION: BORRAR_ULTIMO
+- Borrar todo el historial y resetear:
+  ACCION: BORRAR_TODO
 
-REGLAS DE COMPRA / APORTE A CARTERA:
-- Si el usuario indica compra de activos (ej: "compre 1000 usd de MELI", "el 27/6 compre 100 usd de btc a ppc de 60k", "compre 0.5 BTC a 62000"):
-  Identifica TICKER, MONTO_USD, PRECIO_COMPRA, CANTIDAD y FECHA (si la menciona, formateala a YYYY-MM-DD. Asume el año corriente si no lo dice. Si no dice fecha, pon VACÍO).
-  Agrega al final:
+REGLAS DE COMPRA / APORTE A CARTERA (USD):
+- Registro de inversiones con o sin fecha (ej: "el 27/6 compré 100 usd de BTC a 60k", "compré 1000 usd de MELI"):
   REGISTRO_INV: [TICKER]|[MONTO_USD]|[PRECIO_COMPRA]|[CANTIDAD]|[FECHA_YYYY-MM-DD]
 
-REGLAS DE SEGUIMIENTO DE CARTERA:
-- Si pregunta por el resumen, estado actual o balance de su cartera propia:
-  ACCION: VER_CARTERA
-- Si pide gráfico de distribución (torta) de cartera de inversión:
-  ACCION: GRAFICO_INVERSIONES
+REGLAS DE GASTOS / INGRESOS (ARS):
+- Registro de gasto o ingreso con o sin fecha (ej: "ayer gasté 15k en comida", "el 12/08 cobré 800k", "uber 8k"):
+  REGISTRO_ARS: [TIPO]|[MONTO]|[CATEGORIA]|[DESCRIPCION]|[FECHA_YYYY-MM-DD]
 
-REGLAS DE GASTOS ARS:
-- Registro diario: REGISTRO: [TIPO]|[MONTO]|[CATEGORIA]|[DESCRIPCION]
-- Gráfico de gastos: ACCION: GRAFICO_GASTOS
-- Borrados: ACCION: BORRAR_ID|[ID] / ACCION: BORRAR_ULTIMO / ACCION: BORRAR_TODO
+REGLAS DE MERCADO Y GRÁFICOS:
+- Consulta precio en vivo: ACCION: CONSULTA_PRECIO|[TICKER]
+- Gráfico evolución activo: ACCION: GRAFICO_EVOLUCION_ACTIVO|[TICKER]
+- Gráfico evolución toda la cartera: ACCION: GRAFICO_EVOLUCION_CARTERA
+- Ver estado actual cartera: ACCION: VER_CARTERA
+- Gráfico de torta inversiones: ACCION: GRAFICO_INVERSIONES
+- Gráfico de torta gastos: ACCION: GRAFICO_GASTOS
 - Excel: ACCION: EXCEL
 """
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 ¡Hola! Soy tu asistente financiero y de mercado en vivo.\n\n"
-        "📊 Mercado en vivo y Gráficos:\n"
-        "• '¿a cuánto está MELI?' / 'precio de BTC'\n"
-        "• 'gráfico de evolución de MELI' (Línea histórica 📈)\n"
-        "• 'evolución del rendimiento de mi cartera' (Líneas comparativas)\n\n"
-        "📈 Cartera (USD):\n"
-        "• 'el 27/6 compré 100 usd de BTC a ppc de 60k'\n"
-        "• '¿cómo viene mi cartera?'\n"
-        "• 'distribución de mis activos' (Torta)\n\n"
-        "💸 Gastos y Análisis (ARS):\n"
-        "• 'uber 8.5k' / 'sueldo 950 lucas'\n"
-        "• '¿cuál es mi gasto promedio?'\n"
-        "• 'mandame un excel'"
+        "👋 ¡Hola! Soy tu asistente financiero integral.\n\n"
+        "📅 Consultas y Fechas:\n"
+        "• '¿Cuándo compré BTC y a qué precio?'\n"
+        "• 'Mostrame las fechas de mis últimos gastos'\n\n"
+        "🗑️ Borrado Universal:\n"
+        "• 'Borrá NVDA de mi cartera'\n"
+        "• 'Borrá el gasto ID 4' / 'Borrá la inversión ID 2'\n"
+        "• 'Borrá lo último que cargué'\n\n"
+        "📈 Inversiones y Mercado:\n"
+        "• 'El 27/6 compré 100 usd de BTC a 60k'\n"
+        "• 'Evolución de mi cartera' / 'Precio de MELI'\n\n"
+        "💸 Gastos (ARS):\n"
+        "• 'Almuerzo 12k' / 'Mandame un excel'"
     )
 
 async def cmd_borrar_todo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -551,16 +600,16 @@ async def cmd_borrar_todo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_msg = update.message.text
-    historial_ars = obtener_historial_texto()
+    historial_unificado = obtener_historial_completo_texto()
     
     msg_lower = user_msg.lower()
     es_pregunta_analisis = any(w in msg_lower for w in ["promedio", "analisis", "analizá", "analiza", "aumento", "subió", "subio", "por qué", "por que", "desvío", "desvio", "en qué gasté"])
     
     if es_pregunta_analisis:
         metricas = obtener_metricas_analisis_gastos()
-        prompt = f"DATOS ESTADÍSTICOS EXACTOS:\n{metricas}\n\nHISTORIAL DETALLADO:\n{historial_ars}\n\nPREGUNTA DEL USUARIO: {user_msg}"
+        prompt = f"DATOS ESTADÍSTICOS EXACTOS:\n{metricas}\n\nHISTORIAL UNIFICADO CON FECHAS:\n{historial_unificado}\n\nPREGUNTA DEL USUARIO: {user_msg}"
     else:
-        prompt = f"Movimientos ARS:\n{historial_ars}\n\nMensaje del usuario: {user_msg}"
+        prompt = f"HISTORIAL UNIFICADO REGISTRADO (con IDs y Fechas):\n{historial_unificado}\n\nMensaje del usuario: {user_msg}"
 
     try:
         response = ai_client.models.generate_content(
@@ -577,28 +626,25 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
         necesita_excel = "ACCION: EXCEL" in reply
         necesita_borrar_todo = "ACCION: BORRAR_TODO" in reply
         necesita_borrar_ultimo = "ACCION: BORRAR_ULTIMO" in reply
-        necesita_borrar_id = "ACCION: BORRAR_ID|" in reply
         necesita_precio = "ACCION: CONSULTA_PRECIO|" in reply
         necesita_grafico_evol_activo = "ACCION: GRAFICO_EVOLUCION_ACTIVO|" in reply
+        
+        necesita_borrar_inv_tk = "ACCION: BORRAR_INVERSION_TICKER|" in reply
+        necesita_borrar_inv_id = "ACCION: BORRAR_INVERSION_ID|" in reply
+        necesita_borrar_mov_id = "ACCION: BORRAR_MOVIMIENTO_ID|" in reply
+        
         registro_inv = "REGISTRO_INV:" in reply
-        registro_ars = "REGISTRO:" in reply
+        registro_ars = "REGISTRO_ARS:" in reply
         
         texto_limpio = reply
         for tag in ["ACCION: VER_CARTERA", "ACCION: GRAFICO_INVERSIONES", "ACCION: GRAFICO_EVOLUCION_CARTERA", "ACCION: GRAFICO_GASTOS", "ACCION: EXCEL", "ACCION: BORRAR_TODO", "ACCION: BORRAR_ULTIMO"]:
             texto_limpio = texto_limpio.replace(tag, "")
             
-        id_a_borrar = None
         ticker_a_cotizar = None
         ticker_grafico_evol = None
-
-        if necesita_borrar_id:
-            for linea in texto_limpio.splitlines():
-                if "ACCION: BORRAR_ID|" in linea:
-                    try:
-                        id_a_borrar = int(linea.split("ACCION: BORRAR_ID|")[1].strip())
-                    except Exception:
-                        pass
-                    texto_limpio = texto_limpio.replace(linea, "")
+        ticker_a_borrar = None
+        inv_id_a_borrar = None
+        mov_id_a_borrar = None
 
         if necesita_precio:
             for linea in texto_limpio.splitlines():
@@ -612,9 +658,33 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     ticker_grafico_evol = linea.split("ACCION: GRAFICO_EVOLUCION_ACTIVO|")[1].strip()
                     texto_limpio = texto_limpio.replace(linea, "")
 
+        if necesita_borrar_inv_tk:
+            for linea in texto_limpio.splitlines():
+                if "ACCION: BORRAR_INVERSION_TICKER|" in linea:
+                    ticker_a_borrar = linea.split("ACCION: BORRAR_INVERSION_TICKER|")[1].strip()
+                    texto_limpio = texto_limpio.replace(linea, "")
+
+        if necesita_borrar_inv_id:
+            for linea in texto_limpio.splitlines():
+                if "ACCION: BORRAR_INVERSION_ID|" in linea:
+                    try:
+                        inv_id_a_borrar = int(linea.split("ACCION: BORRAR_INVERSION_ID|")[1].strip())
+                    except Exception:
+                        pass
+                    texto_limpio = texto_limpio.replace(linea, "")
+
+        if necesita_borrar_mov_id:
+            for linea in texto_limpio.splitlines():
+                if "ACCION: BORRAR_MOVIMIENTO_ID|" in linea:
+                    try:
+                        mov_id_a_borrar = int(linea.split("ACCION: BORRAR_MOVIMIENTO_ID|")[1].strip())
+                    except Exception:
+                        pass
+                    texto_limpio = texto_limpio.replace(linea, "")
+
         texto_limpio = texto_limpio.strip()
 
-        # Registro Inversión USD (soporta fecha personalizada)
+        # Registro Inversión USD
         if registro_inv:
             partes = texto_limpio.split("REGISTRO_INV:")
             texto_usuario = partes[0].strip()
@@ -626,33 +696,58 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f_compra = datos[4] if len(datos) > 4 and datos[4] not in ["0", ""] else None
             
             t, c, p, m, f_reg = registrar_operacion_inversion(ticker, monto, p_compra, cant, f_compra)
-            fecha_str = f" | Fecha: {f_reg}" if f_reg else ""
+            fecha_str = f" - Fecha: {f_reg}" if f_reg else ""
             texto_limpio = f"{texto_usuario}\n\n💼 *(Guardado en Cartera: {c:,.4f} {t} a PPC ${p:,.2f} USD - Total: ${m:,.2f} USD{fecha_str})*"
 
         # Registro Gasto/Ingreso ARS
-        if registro_ars and not registro_inv and not necesita_precio:
-            partes = texto_limpio.split("REGISTRO:")
+        if registro_ars:
+            partes = texto_limpio.split("REGISTRO_ARS:")
             texto_usuario = partes[0].strip()
             datos = [d.strip() for d in partes[1].strip().split("|")]
-            if len(datos) == 4:
-                guardar_movimiento(datos[0], datos[1], datos[2], datos[3])
-                texto_limpio = f"{texto_usuario}\n\n✅ *(Guardado: {datos[0]} de ${float(datos[1]):,.2f} ARS en {datos[2]})*"
+            tipo = datos[0]
+            monto = float(datos[1])
+            categoria = datos[2]
+            descripcion = datos[3]
+            f_gasto = datos[4] if len(datos) > 4 and datos[4] not in ["0", ""] else None
+            
+            guardar_movimiento(tipo, monto, categoria, descripcion, f_gasto)
+            fecha_str = f" - Fecha: {f_gasto}" if f_gasto else ""
+            texto_limpio = f"{texto_usuario}\n\n✅ *(Guardado: {tipo} de ${monto:,.2f} ARS en {categoria}{fecha_str})*"
 
+        # Borrados
         if necesita_borrar_todo:
             borrar_todos_los_movimientos()
-            texto_limpio += "\n\n🗑️ *(Base de datos y cartera reseteadas)*"
+            texto_limpio += "\n\n🗑️ *(Base de datos completa reseteada)*"
 
         if necesita_borrar_ultimo:
-            eliminado = borrar_ultimo_movimiento()
-            if eliminado:
-                texto_limpio += f"\n\n🗑️ *(Eliminado último ARS: {eliminado[1]} de ${float(eliminado[2]):,.2f})*"
+            res_ultimo = borrar_ultimo_registro_general()
+            if res_ultimo:
+                texto_limpio += f"\n\n🗑️ *(Eliminado: {res_ultimo})*"
+            else:
+                texto_limpio += "\n\n⚠️ No había registros para borrar."
 
-        if id_a_borrar is not None:
-            eliminado = borrar_por_id(id_a_borrar)
-            if eliminado:
-                texto_limpio += f"\n\n🗑️ *(Eliminado ID {eliminado[0]})*"
+        if ticker_a_borrar:
+            cant = borrar_inversion_por_ticker(ticker_a_borrar)
+            if cant > 0:
+                texto_limpio += f"\n\n🗑️ *(Se eliminaron {cant} compra(s) de {ticker_a_borrar} de tu cartera)*"
+            else:
+                texto_limpio += f"\n\n⚠️ No se encontraron compras de `{ticker_a_borrar}`."
 
-        # Si consultó precio en vivo de una acción / cripto
+        if inv_id_a_borrar:
+            reg = borrar_inversion_por_id(inv_id_a_borrar)
+            if reg:
+                texto_limpio += f"\n\n🗑️ *(Eliminada inversión ID {reg[0]}: {reg[1]} por ${reg[2]:,.2f} USD)*"
+            else:
+                texto_limpio += f"\n\n⚠️ No se encontró la inversión con ID {inv_id_a_borrar}."
+
+        if mov_id_a_borrar:
+            reg = borrar_movimiento_por_id(mov_id_a_borrar)
+            if reg:
+                texto_limpio += f"\n\n🗑️ *(Eliminado {reg[1]} de ${float(reg[2]):,.2f} ARS en {reg[3]} - ID {reg[0]})*"
+            else:
+                texto_limpio += f"\n\n⚠️ No se encontró el movimiento con ID {mov_id_a_borrar}."
+
+        # Cotización puntual
         if ticker_a_cotizar:
             datos_mkt = consultar_datos_mercado(ticker_a_cotizar)
             if datos_mkt:
@@ -678,7 +773,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 await update.message.reply_text(texto_limpio)
 
-        # Gráfico de evolución de activo puntual (Línea 📈)
+        # Gráfico evolución activo puntual
         if ticker_grafico_evol:
             buf_img = generar_grafico_evolucion_activo(ticker_grafico_evol)
             if buf_img:
@@ -686,7 +781,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await update.message.reply_text(f"⚠️ No pude generar la curva de evolución para {ticker_grafico_evol}.")
 
-        # Gráfico de evolución comparativa de toda la cartera (Líneas 📈📉)
+        # Gráfico evolución cartera
         if necesita_grafico_evol_cartera:
             buf_img = generar_grafico_evolucion_cartera()
             if buf_img:
