@@ -224,7 +224,6 @@ def generar_grafico_evolucion_cartera_consolidada(user_id: int, periodo_solicita
         if df_inv.empty and df_tc.empty:
             return None
 
-        # Determinar fecha de inicio
         fechas_candidatas = []
         if not df_inv.empty:
             fechas_candidatas.append(df_inv['fecha'].min())
@@ -234,7 +233,6 @@ def generar_grafico_evolucion_cartera_consolidada(user_id: int, periodo_solicita
         primera_fecha_global = min(fechas_candidatas).strftime('%Y-%m-%d')
         fecha_start, desc_periodo = resolver_fecha_inicio(periodo_solicitado, primera_fecha_global)
 
-        # Descargar datos históricos para los tickers que cotizan
         tickers_unicos = df_inv['ticker'].unique() if not df_inv.empty else []
         precios_hist = {}
         for tk in tickers_unicos:
@@ -250,25 +248,21 @@ def generar_grafico_evolucion_cartera_consolidada(user_id: int, periodo_solicita
             except Exception:
                 pass
 
-        # Crear rango de fechas diario continuo hasta hoy
         fechas_rango = pd.date_range(start=fecha_start, end=datetime.now().strftime('%Y-%m-%d'), freq='D')
         df_precios = pd.DataFrame(index=fechas_rango)
         for tk, s in precios_hist.items():
             df_precios[tk] = s
         df_precios = df_precios.ffill().bfill()
 
-        # Construir la serie de Patrimonio Total / Rendimiento diario
         serie_capital_invertido = pd.Series(0.0, index=fechas_rango)
         serie_valor_mercado = pd.Series(0.0, index=fechas_rango)
         serie_pnl_cerrado_acum = pd.Series(0.0, index=fechas_rango)
 
-        # Acumular PnL de trades cerrados en el tiempo
         if not df_tc.empty:
             df_tc['fecha_d'] = pd.to_datetime(df_tc['fecha']).dt.tz_localize(None).dt.floor('D')
             pnl_por_dia = df_tc.groupby('fecha_d')['pnl_usd'].sum()
             serie_pnl_cerrado_acum = pnl_por_dia.reindex(fechas_rango, fill_value=0.0).cumsum()
 
-        # Calcular valor diario de posiciones abiertas
         for _, pos in df_inv.iterrows():
             pos_fecha = pd.to_datetime(pos['fecha']).tz_localize(None).floor('D')
             tk = pos['ticker']
@@ -289,19 +283,14 @@ def generar_grafico_evolucion_cartera_consolidada(user_id: int, periodo_solicita
                     val_t = np.maximum(0.0, margen + margen * ((ppc - spot_t) / ppc) * lev)
                 elif tipo == "LONG":
                     val_t = np.maximum(0.0, margen + margen * ((spot_t - ppc) / ppc) * lev)
-                else: # SPOT
+                else:
                     val_t = cant * spot_t
                 serie_valor_mercado[mascara] += val_t
 
-        # Serie neta de PnL total consolidado en USD y en %
         serie_pnl_flotante = serie_valor_mercado - serie_capital_invertido
         serie_pnl_total_usd = serie_pnl_flotante + serie_pnl_cerrado_acum
 
-        # Curva de Patrimonio Neto Total (Capital Inicialmente invertido + Beneficio Neto Acumulado)
-        # O Rendimiento Consolidado en % sobre el capital
-        capital_activo_final = serie_capital_invertido.iloc[-1]
         pnl_final_usd = serie_pnl_total_usd.iloc[-1]
-        rend_pct_serie = (serie_pnl_total_usd / np.maximum(1.0, serie_capital_invertido)) * 100
 
         fig, ax = plt.subplots(figsize=(10, 5.2))
         color_linea = "#00b06f" if pnl_final_usd >= 0 else "#e04050"
@@ -348,19 +337,16 @@ def generar_grafico_evolucion_por_activos(user_id: int, periodo_solicitado: str 
             if df.empty:
                 return None
         
-        if df.empty:
-            return None
-        
         primera_fecha_db = df['primera_compra'].min().strftime('%Y-%m-%d')
         fecha_start, desc_periodo = resolver_fecha_inicio(periodo_solicitado, primera_fecha_db)
         
         fechas_rango = pd.date_range(start=fecha_start, end=datetime.now().strftime('%Y-%m-%d'), freq='D')
-        df_norm = pd.DataFrame(index=fechas_rango)
         
         colores = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#17becf', '#bcbd22']
         idx_color = 0
         
         fig, ax = plt.subplots(figsize=(10.5, 5.5))
+        hay_series = False
 
         for _, row in df.iterrows():
             tk = row['ticker']
@@ -380,7 +366,6 @@ def generar_grafico_evolucion_por_activos(user_id: int, periodo_solicitado: str 
                     s.index = pd.to_datetime(s.index).tz_localize(None)
                     s = s.reindex(fechas_rango).ffill().bfill()
                     
-                    # Calcular curva Base 100 según SPOT o FUTUROS
                     if tipo_pos == "SHORT":
                         serie_rend = 100.0 + ((ppc - s) / ppc) * lev * 100.0
                     elif tipo_pos == "LONG":
@@ -388,7 +373,6 @@ def generar_grafico_evolucion_por_activos(user_id: int, periodo_solicitado: str 
                     else: # SPOT
                         serie_rend = (s / ppc) * 100.0
                     
-                    # Cortar antes de la fecha de compra para que la línea empiece cuando realmente compraste
                     serie_rend[fechas_rango < f_compra] = np.nan
                     
                     ultimo_val = serie_rend.dropna().iloc[-1] if not serie_rend.dropna().empty else 100.0
@@ -397,13 +381,18 @@ def generar_grafico_evolucion_por_activos(user_id: int, periodo_solicitado: str 
                     tag_lev = f" [{lev:.0f}x]" if lev > 1 else ""
                     
                     c = colores[idx_color % len(colores)]
-                    ax.plot(fechas_rango, serie_rend, label=f"{tk}{tag_lev} ({signo}{pnl_pct:.1f}%)", linewidth=2.1, color=c)
+                    ax.plot(fechas_rango, serie_rend, label=f"{tk}{tag_lev} ({signo}{pnl_pct:.1f}%)", linewidth=2.2, color=c)
                     idx_color += 1
+                    hay_series = True
             except Exception as e:
                 logger.error(f"Error procesando serie de {tk}: {e}")
 
+        if not hay_series:
+            return None
+
         ax.axhline(y=100, color="gray", linestyle=":", linewidth=1.4, alpha=0.8, label="Tu PPC / Entrada (Base 100)")
-        ax.set_title(f"Rendimiento Real de tus Activos vs PPC (Base 100 = Costo)\n{desc_periodo}", fontsize=12, fontweight='bold', pad=12)
+        filtro_sub = f" ({', '.join(df['ticker'].tolist())})" if tickers_filtro else ""
+        ax.set_title(f"Rendimiento Real de tus Activos vs PPC (Base 100 = Costo){filtro_sub}\n{desc_periodo}", fontsize=12, fontweight='bold', pad=12)
         ax.set_xlabel("Fecha")
         ax.set_ylabel("Rendimiento vs PPC (%)")
         ax.grid(True, linestyle="--", alpha=0.35)
@@ -421,6 +410,8 @@ def generar_grafico_evolucion_por_activos(user_id: int, periodo_solicitado: str 
         return None
 
 generar_grafico_por_activos = generar_grafico_evolucion_por_activos
+
+# ==================== EVOLUCIÓN ACTIVO INDIVIDUAL ====================
 def generar_grafico_evolucion_activo(user_id: int, ticker: str, periodo_solicitado: str = ""):
     ticker = ticker.strip().upper()
     simbolo = normalizar_ticker_yf(ticker)
@@ -1061,17 +1052,26 @@ Eres un analista y asesor financiero cuantitativo institucional. Manejas tres mu
 
 TODOS LOS REGISTROS QUE APARECEN EN "POSICIONES / TRADES ABIERTOS" REPRESENTAN OPERACIONES QUE EL USUARIO TIENE ABIERTAS HOY EN DÍA.
 
-REGLAS DE GRÁFICOS (MUY IMPORTANTE):
-1. Si el usuario pide la evolución general de su cartera (ej: "evolución de mi cartera", "rendimiento de mi cartera", "gráfico de mi cartera", "cómo creció mi cartera"):
-   DEBES EJECUTAR: ACCION: GRAFICO_EVOLUCION_CARTERA_CONSOLIDADA|[PERIODO_DETECTADO]
-   Esto devuelve UNA SOLA LÍNEA consolidada con la subida y bajada real de todo su patrimonio combinado (trades cerrados + posiciones abiertas).
+REGLAS DE GRÁFICOS (MUY ESTRICTAS Y OBLIGATORIAS):
+1. COMPARATIVA DE DOS O MÁS ACTIVOS:
+   Si el usuario pide ver el gráfico o la evolución de DOS O MÁS ACTIVOS (ej: "Haceme la evolucion de Meli y Nu", "Comparame MELI y NU", "gráfico de BTC y SOL", "comparativa de MELI, GGAL y SUPV"):
+   DEBES EMITIR OBLIGATORIAMENTE AL FINAL DE TU MENSAJE:
+   ACCION: GRAFICO_EVOLUCION_POR_ACTIVOS|[PERIODO_DETECTADO]|[TICKERS_SEPARADOS_POR_COMA]
+   Ejemplo: ACCION: GRAFICO_EVOLUCION_POR_ACTIVOS||MELI,NU
+   ¡NUNCA uses GRAFICO_EVOLUCION_ACTIVO cuando el usuario menciona más de un activo!
+   ¡NUNCA emitas más de un tag de gráfico en el mismo mensaje!
 
-2. Si el usuario pide explícitamente ver el gráfico DIVIDIDO POR ACTIVO o COMPARATIVA DE ACTIVOS (ej: "evolución dividida por activo", "gráfico por activo", "comparar el rendimiento de mis acciones", "separado por activo"):
-   DEBES EJECUTAR: ACCION: GRAFICO_EVOLUCION_POR_ACTIVOS|[PERIODO_DETECTADO]
-   Esto devuelve las líneas individuales de cada activo normalizadas exactamente respecto a su PPC real.
+2. TODOS LOS ACTIVOS DE LA CARTERA:
+   Si el usuario pide ver todos los activos juntos (ej: "evolución dividida por activo", "gráfico por activo", "evolucion por activo historica"):
+   ACCION: GRAFICO_EVOLUCION_POR_ACTIVOS|[PERIODO_DETECTADO]
 
-3. Si pide la evolución de UN SOLO ACTIVO PUNTUAL (ej: "evolución de MELI", "gráfico de BTC de los últimos 2 meses"):
-   DEBES EJECUTAR: ACCION: GRAFICO_EVOLUCION_ACTIVO|[TICKER]|[PERIODO_DETECTADO]
+3. EVOLUCIÓN CONSOLIDADA DE CARTERA (UNA SOLA LÍNEA):
+   Si el usuario pide la evolución general de su cartera (ej: "evolución de mi cartera", "rendimiento de mi cartera", "gráfico de mi cartera", "cómo creció mi cartera"):
+   ACCION: GRAFICO_EVOLUCION_CARTERA_CONSOLIDADA|[PERIODO_DETECTADO]
+
+4. UN SOLO ACTIVO INDIVIDUAL:
+   Únicamente si pide UN SOLO activo (ej: "evolución de MELI", "gráfico de BTC"):
+   ACCION: GRAFICO_EVOLUCION_ACTIVO|[TICKER]|[PERIODO_DETECTADO]
 
 REGLAS DE CIERRE DE POSICIÓN ABIERTA:
 - Si el usuario dice que cerró una posición abierta:
@@ -1110,13 +1110,14 @@ REGLAS GENERALES:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 ¡Hola! Soy tu asistente financiero y analista cuantitativo institucional.\n\n"
-        "📈 Gráficos Renovados:\n"
-        "• 'Evolución de mi cartera' -> Una sola línea consolidada con tu PnL total real.\n"
-        "• 'Evolución dividida por activo' -> Múltiples líneas de cada activo vs tu PPC real.\n\n"
-        "🟢 Posiciones Abiertas y Futuros:\n"
-        "• '¿Cómo vienen mis trades abiertos?'\n"
+        "📈 Gráficos Inteligentes:\n"
+        "• 'Evolución de MELI y NU' -> Gráfico comparativo exacto de esos dos activos.\n"
+        "• 'Evolución de mi cartera' -> Una sola línea consolidada con tu patrimonio total.\n"
+        "• 'Evolución dividida por activo' -> Todos los activos de tu cartera juntos.\n\n"
+        "🟢 Trades Abiertos (En Vivo):\n"
+        "• '¿Cómo vienen mis posiciones abiertas?'\n"
         "• 'Cerré la posición ID 2 con 150 usd de ganancia'\n\n"
-        "🏆 Trades Cerrados:\n"
+        "🏆 Trades Cerrados y Ganancias Realizadas:\n"
         "• 'Gané 450 usd en un trade de SOL el mes pasado'\n\n"
         "💼 Balance Consolidado:\n"
         "• '¿Cuál es mi balance total?' / 'Mandame un excel'"
@@ -1166,14 +1167,18 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ticker_a_cotizar = m_precio.group(1).strip()
             texto_limpio = texto_limpio.replace(m_precio.group(0), "")
 
-        # Gráfico Activo Individual
-        ticker_grafico_evol = None
-        periodo_activo = ""
-        m_ga = re.search(r"ACCION: GRAFICO_EVOLUCION_ACTIVO\|([^\n\r|]+)(?:\|([^\n\r]+))?", texto_limpio)
-        if m_ga:
-            ticker_grafico_evol = m_ga.group(1).strip()
-            periodo_activo = m_ga.group(2).strip() if m_ga.group(2) else ""
-            texto_limpio = texto_limpio.replace(m_ga.group(0), "")
+        # Gráfico Dividido Por Activos (MÚLTIPLES LÍNEAS NORMALIZADAS AL PPC REAL - Soporta filtro de activos)
+        necesita_grafico_por_activos = False
+        periodo_por_activos = ""
+        tickers_filtro_activos = []
+        m_gpa = re.search(r"ACCION: GRAFICO_EVOLUCION_POR_ACTIVOS(?:\|([^|\n\r]*))?(?:\|([^\n\r]*))?", texto_limpio)
+        if m_gpa:
+            necesita_grafico_por_activos = True
+            periodo_por_activos = m_gpa.group(1).strip() if m_gpa.group(1) else ""
+            raw_tks = m_gpa.group(2).strip() if m_gpa.group(2) else ""
+            if raw_tks:
+                tickers_filtro_activos = [t.strip().upper() for t in raw_tks.split(",") if t.strip()]
+            texto_limpio = texto_limpio.replace(m_gpa.group(0), "")
 
         # Gráfico Consolidado Cartera (UNA SOLA LÍNEA)
         necesita_grafico_consolidado = False
@@ -1184,7 +1189,6 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             periodo_consolidado = m_gc.group(1).strip() if m_gc.group(1) else ""
             texto_limpio = texto_limpio.replace(m_gc.group(0), "")
 
-        # Fallback de compatibilidad si Gemini pone el tag anterior
         if not necesita_grafico_consolidado:
             m_gc_old = re.search(r"ACCION: GRAFICO_EVOLUCION_CARTERA(?:\|([^\n\r]+))?", texto_limpio)
             if m_gc_old:
@@ -1192,14 +1196,35 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 periodo_consolidado = m_gc_old.group(1).strip() if m_gc_old.group(1) else ""
                 texto_limpio = texto_limpio.replace(m_gc_old.group(0), "")
 
-        # Gráfico Dividido Por Activos (MÚLTIPLES LÍNEAS NORMALIZADAS AL PPC REAL)
-        necesita_grafico_por_activos = False
-        periodo_por_activos = ""
-        m_gpa = re.search(r"ACCION: GRAFICO_EVOLUCION_POR_ACTIVOS(?:\|([^\n\r]+))?", texto_limpio)
-        if m_gpa:
-            necesita_grafico_por_activos = True
-            periodo_por_activos = m_gpa.group(1).strip() if m_gpa.group(1) else ""
-            texto_limpio = texto_limpio.replace(m_gpa.group(0), "")
+        # Gráfico Activo Individual
+        ticker_grafico_evol = None
+        periodo_activo = ""
+        m_ga = re.search(r"ACCION: GRAFICO_EVOLUCION_ACTIVO\|([^\n\r|]+)(?:\|([^\n\r]+))?", texto_limpio)
+        if m_ga:
+            ticker_grafico_evol = m_ga.group(1).strip()
+            periodo_activo = m_ga.group(2).strip() if m_ga.group(2) else ""
+            texto_limpio = texto_limpio.replace(m_ga.group(0), "")
+
+        # =========================================================================
+        # FALLBACK INTELIGENTE EN PYTHON: Si el usuario mencionó 2 o más tickers
+        # junto a palabras de gráfico/comparar, pero el LLM no generó el tag correcto:
+        # =========================================================================
+        es_pedido_grafico_o_comparativa = bool(re.search(r"(?:grafico|grafica|evolucion|compara|comparame|comparar|vs|versus)", user_msg, re.IGNORECASE))
+        if es_pedido_grafico_o_comparativa and not necesita_grafico_consolidado:
+            # Buscar qué tickers conocidos de la cartera aparecen en el mensaje del usuario
+            tickers_posibles = ["MELI", "NU", "GGAL", "SUPV", "NVDA", "BTC", "SOL", "YPF", "VIST", "MSFT", "META", "AMD", "TSLA", "GOOGL", "LOMA"]
+            tickers_mencionados = []
+            for tk in tickers_posibles:
+                if re.search(r'\b' + re.escape(tk) + r'\b', user_msg, re.IGNORECASE):
+                    tickers_mencionados.append(tk)
+            
+            if len(tickers_mencionados) >= 2:
+                # Cancelar gráfico de activo único y forzar comparativa por activos
+                ticker_grafico_evol = None
+                necesita_grafico_por_activos = True
+                tickers_filtro_activos = tickers_mencionados
+                if not periodo_por_activos:
+                    periodo_por_activos = periodo_activo
 
         # Cierre de posición abierta
         m_close_pos = re.search(r"ACCION: CERRAR_POSICION\|(\d+)(?:\|([^|\n\r]*))?(?:\|([^\n\r]*))?", texto_limpio)
@@ -1339,8 +1364,6 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             fecha_str = f" - Fecha: {f_gasto}" if f_gasto else ""
             texto_limpio = f"{texto_limpio}\n\n✅ *(Guardado: {tipo} de ${monto:,.2f} ARS en {categoria}{fecha_str})*".strip()
 
-        texto_limpio = texto_limpio.strip()
-
         if necesita_borrar_todo:
             borrar_todos_los_movimientos(user_id)
             texto_limpio += "\n\n🗑️ *(Tu base de datos, cartera y trades cerrados han sido reseteados)*"
@@ -1351,6 +1374,11 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 texto_limpio += f"\n\n🗑️ *(Eliminado: {res_ultimo})*"
             else:
                 texto_limpio += "\n\n⚠️ No había registros para borrar."
+
+        # Limpiar cualquier tag residual de ACCION: que haya quedado expuesto en el texto
+        texto_limpio = re.sub(r"ACCION:\s*[^\n\r]+", "", texto_limpio)
+        texto_limpio = re.sub(r"REGISTRO_[^\n\r]+", "", texto_limpio)
+        texto_limpio = texto_limpio.strip()
 
         # Cotización puntual
         if ticker_a_cotizar:
@@ -1368,36 +1396,37 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 texto_limpio = f"{texto_limpio}\n\n{msg_mkt}".strip()
 
-        # Envío seguro
+        # Envío seguro del mensaje de texto
         if texto_limpio:
             try:
                 await update.message.reply_text(texto_limpio, parse_mode="Markdown")
             except Exception:
                 await update.message.reply_text(texto_limpio)
 
-        # 1. Gráfico Activo Puntual
-        if ticker_grafico_evol:
-            buf_img = generar_grafico_evolucion_activo(user_id, ticker_grafico_evol, periodo_activo)
+        # 1. Gráfico Por Activos (MÚLTIPLES LÍNEAS NORMALIZADAS AL PPC REAL - Con o sin filtro)
+        if necesita_grafico_por_activos:
+            buf_img = generar_grafico_evolucion_por_activos(user_id, periodo_por_activos, tickers_filtro_activos)
             if buf_img:
-                await update.message.reply_photo(photo=buf_img, caption=f"📈 Evolución de {ticker_grafico_evol}.")
+                filtro_txt = f" ({', '.join(tickers_filtro_activos)})" if tickers_filtro_activos else ""
+                await update.message.reply_photo(photo=buf_img, caption=f"📊 Rendimiento relativo respecto a tu PPC (Base 100){filtro_txt}.")
             else:
-                await update.message.reply_text(f"⚠️ No pude generar la curva de evolución para {ticker_grafico_evol}.")
+                await update.message.reply_text("No hay suficientes activos registrados que coincidan con la búsqueda.")
 
         # 2. Gráfico Consolidado Cartera (UNA SOLA LÍNEA REAL)
-        if necesita_grafico_consolidado:
+        elif necesita_grafico_consolidado:
             buf_img = generar_grafico_evolucion_cartera_consolidada(user_id, periodo_consolidado)
             if buf_img:
                 await update.message.reply_photo(photo=buf_img, caption="📈 Evolución Consolidada de Cartera (PnL Total Realizado + Flotante).")
             else:
                 await update.message.reply_text("No hay suficientes datos registrados para trazar la curva consolidada.")
 
-        # 3. Gráfico Por Activos (MÚLTIPLES LÍNEAS NORMALIZADAS AL PPC REAL)
-        if necesita_grafico_por_activos:
-            buf_img = generar_grafico_evolucion_por_activos(user_id, periodo_por_activos)
+        # 3. Gráfico Activo Puntual (UN SOLO ACTIVO)
+        elif ticker_grafico_evol:
+            buf_img = generar_grafico_evolucion_activo(user_id, ticker_grafico_evol, periodo_activo)
             if buf_img:
-                await update.message.reply_photo(photo=buf_img, caption="📊 Rendimiento relativo de cada activo respecto a tu PPC (Base 100).")
+                await update.message.reply_photo(photo=buf_img, caption=f"📈 Evolución de {ticker_grafico_evol}.")
             else:
-                await update.message.reply_text("No hay suficientes activos registrados para armar la comparativa.")
+                await update.message.reply_text(f"⚠️ No pude generar la curva de evolución para {ticker_grafico_evol}.")
 
         # Reporte de cartera
         if necesita_cartera:
