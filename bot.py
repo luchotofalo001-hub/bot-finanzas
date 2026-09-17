@@ -319,7 +319,7 @@ def generar_grafico_evolucion_cartera_consolidada(user_id: int, periodo_solicita
 
 # ==================== GRÁFICO POR ACTIVOS (MÚLTIPLES LÍNEAS NORMALIZADAS AL PPC REAL) ====================
 def generar_grafico_evolucion_por_activos(user_id: int, periodo_solicitado: str = "", tickers_filtro: list = None):
-    """Genera la comparativa multi-línea dividida por activo, indexada al PPC y ROE real (soporta filtro de activos específicos)"""
+    """Genera la comparativa multi-línea dividida por activo, indexada matemáticamente en Base 100 en su inicio"""
     try:
         with get_db_connection() as conn:
             df = pd.read_sql(
@@ -354,7 +354,6 @@ def generar_grafico_evolucion_por_activos(user_id: int, periodo_solicitado: str 
                 continue
             
             f_compra = pd.to_datetime(row['primera_compra']).tz_localize(None).floor('D')
-            ppc = float(row['ppc_real']) if row['ppc_real'] else 1.0
             tipo_pos = str(row['tipo_pos']).upper() if row['tipo_pos'] else "SPOT"
             lev = float(row['lev']) if row['lev'] else 1.0
 
@@ -366,22 +365,31 @@ def generar_grafico_evolucion_por_activos(user_id: int, periodo_solicitado: str 
                     s.index = pd.to_datetime(s.index).tz_localize(None)
                     s = s.reindex(fechas_rango).ffill().bfill()
                     
+                    # Cortar fechas antes de la compra para activos adquiridos después de fecha_start
+                    if f_compra > fechas_rango[0]:
+                        s[fechas_rango < f_compra] = np.nan
+                    
+                    s_valida = s.dropna()
+                    if s_valida.empty:
+                        continue
+                    
+                    # BASE 100 REAL: el primer valor de la serie válida es exactamente 100.0
+                    precio_inicial_serie = s_valida.iloc[0]
+                    
                     if tipo_pos == "SHORT":
-                        serie_rend = 100.0 + ((ppc - s) / ppc) * lev * 100.0
+                        serie_rend = 100.0 + ((precio_inicial_serie - s) / precio_inicial_serie) * lev * 100.0
                     elif tipo_pos == "LONG":
-                        serie_rend = 100.0 + ((s - ppc) / ppc) * lev * 100.0
+                        serie_rend = 100.0 + ((s - precio_inicial_serie) / precio_inicial_serie) * lev * 100.0
                     else: # SPOT
-                        serie_rend = (s / ppc) * 100.0
+                        serie_rend = (s / precio_inicial_serie) * 100.0
                     
-                    serie_rend[fechas_rango < f_compra] = np.nan
-                    
-                    ultimo_val = serie_rend.dropna().iloc[-1] if not serie_rend.dropna().empty else 100.0
-                    pnl_pct = ultimo_val - 100.0
-                    signo = "+" if pnl_pct >= 0 else ""
+                    ultimo_val = serie_rend.dropna().iloc[-1]
+                    rend_pct = ultimo_val - 100.0
+                    signo = "+" if rend_pct >= 0 else ""
                     tag_lev = f" [{lev:.0f}x]" if lev > 1 else ""
                     
                     c = colores[idx_color % len(colores)]
-                    ax.plot(fechas_rango, serie_rend, label=f"{tk}{tag_lev} ({signo}{pnl_pct:.1f}%)", linewidth=2.2, color=c)
+                    ax.plot(fechas_rango, serie_rend, label=f"{tk}{tag_lev} ({signo}{rend_pct:.1f}%)", linewidth=2.2, color=c)
                     idx_color += 1
                     hay_series = True
             except Exception as e:
@@ -390,11 +398,11 @@ def generar_grafico_evolucion_por_activos(user_id: int, periodo_solicitado: str 
         if not hay_series:
             return None
 
-        ax.axhline(y=100, color="gray", linestyle=":", linewidth=1.4, alpha=0.8, label="Tu PPC / Entrada (Base 100)")
+        ax.axhline(y=100, color="gray", linestyle=":", linewidth=1.4, alpha=0.8, label="Base 100 (Inicio)")
         filtro_sub = f" ({', '.join(df['ticker'].tolist())})" if tickers_filtro else ""
-        ax.set_title(f"Rendimiento Real de tus Activos vs PPC (Base 100 = Costo){filtro_sub}\n{desc_periodo}", fontsize=12, fontweight='bold', pad=12)
+        ax.set_title(f"Rendimiento Relativo de tus Activos (Base 100 = Inicio){filtro_sub}\n{desc_periodo}", fontsize=12, fontweight='bold', pad=12)
         ax.set_xlabel("Fecha")
-        ax.set_ylabel("Rendimiento vs PPC (%)")
+        ax.set_ylabel("Rendimiento Relativo (Base 100)")
         ax.grid(True, linestyle="--", alpha=0.35)
         ax.legend(loc="upper left", frameon=True)
         ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
