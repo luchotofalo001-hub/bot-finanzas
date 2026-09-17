@@ -143,34 +143,60 @@ def obtener_precio_actual(ticker: str):
         return datos["precio"], datos["ticker"]
     return None, ticker
 
-# ==================== GRÁFICOS DE EVOLUCIÓN HISTÓRICA (LÍNEAS) ====================
-def generar_grafico_evolucion_activo(ticker: str, periodo: str = "6mo"):
+# ==================== GRÁFICOS DE EVOLUCIÓN HISTÓRICA CON FECHA DE COMPRA ====================
+def generar_grafico_evolucion_activo(ticker: str, periodo_default: str = "6mo"):
     ticker = ticker.strip().upper()
     simbolo = f"{ticker}-USD" if ticker in ["BTC", "ETH", "SOL", "BNB", "ADA", "XRP"] else ticker
+    
+    fecha_inicio = None
+    ppc_referencia = None
+    
+    # 1. Buscar si tenemos compras registradas de este activo para fijar la fecha de inicio real
+    try:
+        with get_db_connection() as conn:
+            df_inv = pd.read_sql(
+                "SELECT fecha, cantidad, monto_total_usd FROM portafolio_inversiones WHERE UPPER(ticker) = %s ORDER BY fecha ASC;",
+                conn, params=(ticker,)
+            )
+            if not df_inv.empty and df_inv['cantidad'].sum() > 0:
+                fecha_inicio = df_inv['fecha'].iloc[0].strftime('%Y-%m-%d')
+                ppc_referencia = df_inv['monto_total_usd'].sum() / df_inv['cantidad'].sum()
+    except Exception as e:
+        logger.error(f"Error consultando fecha de compra para {ticker}: {e}")
+
     try:
         t = yf.Ticker(simbolo)
-        df_hist = t.history(period=periodo)
+        
+        # Si compraste el activo, el gráfico arranca en tu fecha de compra. Si no, usa el periodo por defecto.
+        if fecha_inicio:
+            df_hist = t.history(start=fecha_inicio)
+        else:
+            df_hist = t.history(period=periodo_default)
+
         if df_hist.empty and not simbolo.endswith("-USD"):
             simbolo = f"{simbolo}-USD"
             t = yf.Ticker(simbolo)
-            df_hist = t.history(period=periodo)
+            if fecha_inicio:
+                df_hist = t.history(start=fecha_inicio)
+            else:
+                df_hist = t.history(period=periodo_default)
+
         if df_hist.empty:
             return None
 
-        ppc_referencia = None
-        with get_db_connection() as conn:
-            df_inv = pd.read_sql("SELECT cantidad, monto_total_usd FROM portafolio_inversiones WHERE UPPER(ticker) = %s;", conn, params=(ticker,))
-            if not df_inv.empty and df_inv['cantidad'].sum() > 0:
-                ppc_referencia = df_inv['monto_total_usd'].sum() / df_inv['cantidad'].sum()
-
+        # Si compró hace menos de 2 días y hay pocas velas diarias, ajustamos la escala
         plt.figure(figsize=(9, 5))
-        plt.plot(df_hist.index, df_hist['Close'], label=f"{ticker} (USD)", color="#2b5c8f", linewidth=2.2)
-        plt.fill_between(df_hist.index, df_hist['Close'], alpha=0.15, color="#2b5c8f")
+        color_linea = "#2b5c8f"
+        plt.plot(df_hist.index, df_hist['Close'], label=f"{ticker} (USD)", color=color_linea, linewidth=2.2)
+        plt.fill_between(df_hist.index, df_hist['Close'], alpha=0.15, color=color_linea)
         
         if ppc_referencia:
             plt.axhline(y=ppc_referencia, color="#d62728", linestyle="--", linewidth=1.5, label=f"Tu PPC (${ppc_referencia:,.2f})")
+            subtitulo = f"Desde tu primera compra ({fecha_inicio})"
+        else:
+            subtitulo = f"Últimos 6 meses"
 
-        plt.title(f"Evolución Histórica: {ticker} ({periodo})", fontsize=13, fontweight='bold', pad=15)
+        plt.title(f"Evolución de {ticker}\n{subtitulo}", fontsize=12, fontweight='bold', pad=12)
         plt.xlabel("Fecha")
         plt.ylabel("Precio USD")
         plt.grid(True, linestyle="--", alpha=0.4)
@@ -184,6 +210,54 @@ def generar_grafico_evolucion_activo(ticker: str, periodo: str = "6mo"):
         return buf
     except Exception as e:
         logger.error(f"Error generando evolución para {ticker}: {e}")
+        return None
+
+def generar_grafico_evolucion_cartera():
+    try:
+        with get_db_connection() as conn:
+            df = pd.read_sql("SELECT ticker, MIN(fecha) as primera_compra FROM portafolio_inversiones GROUP BY ticker;", conn)
+        
+        if df.empty:
+            return None
+        
+        # Fecha de la compra más antigua de toda tu cartera
+        primera_fecha_global = df['primera_compra'].min().strftime('%Y-%m-%d')
+        
+        datos_cierre = {}
+        for _, row in df.iterrows():
+            tk = row['ticker']
+            sym = f"{tk}-USD" if tk in ["BTC", "ETH", "SOL", "BNB", "ADA", "XRP"] else tk
+            try:
+                # Descargar datos desde la fecha en que empezaste a invertir en la cartera
+                h = yf.Ticker(sym).history(start=primera_fecha_global)
+                if not h.empty and h['Close'].iloc[0] > 0:
+                    datos_cierre[tk] = (h['Close'] / h['Close'].iloc[0]) * 100
+            except Exception:
+                pass
+                
+        if not datos_cierre:
+            return None
+
+        df_comp = pd.DataFrame(datos_cierre)
+        plt.figure(figsize=(9, 5))
+        for col in df_comp.columns:
+            plt.plot(df_comp.index, df_comp[col], label=col, linewidth=2)
+            
+        plt.axhline(y=100, color="gray", linestyle=":", alpha=0.7)
+        plt.title(f"Rendimiento de Cartera (Base 100)\nDesde tu primera inversión ({primera_fecha_global})", fontsize=12, fontweight='bold', pad=12)
+        plt.xlabel("Fecha")
+        plt.ylabel("Rendimiento Relativo (%)")
+        plt.grid(True, linestyle="--", alpha=0.4)
+        plt.legend(loc="upper left")
+        plt.tight_layout()
+        
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', dpi=200)
+        buf.seek(0)
+        plt.close()
+        return buf
+    except Exception as e:
+        logger.error(f"Error generando evolución de cartera: {e}")
         return None
 
 def generar_grafico_evolucion_cartera(periodo: str = "6mo"):
