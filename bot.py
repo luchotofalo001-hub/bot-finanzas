@@ -157,7 +157,6 @@ def generar_grafico_evolucion_activo(ticker: str, periodo: str = "6mo"):
         if df_hist.empty:
             return None
 
-        # Revisar si hay PPC en base de datos para trazarlo de referencia
         ppc_referencia = None
         with get_db_connection() as conn:
             df_inv = pd.read_sql("SELECT cantidad, monto_total_usd FROM portafolio_inversiones WHERE UPPER(ticker) = %s;", conn, params=(ticker,))
@@ -537,7 +536,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cant = float(datos[3]) if len(datos) > 3 and datos[3] not in ["0", ""] else None
             
             t, c, p, m = registrar_operacion_inversion(ticker, monto, p_compra, cant)
-            texto_limpio = f"{texto_usuario}\n\n💼 *(Guardado en Cartera: {c:,.4f} {t} a PPC ${p:,.2f} USD - Total:${m:,.2f} USD)*"
+            texto_limpio = f"{texto_usuario}\n\n💼 *(Guardado en Cartera: {c:,.4f} {t} a PPC ${p:,.2f} USD - Total: ${m:,.2f} USD)*"
 
         # Registro Gasto/Ingreso ARS
         if registro_ars and not registro_inv and not necesita_precio:
@@ -568,7 +567,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if datos_mkt:
                 signo = "+" if datos_mkt["var_pct"] >= 0 else ""
                 emoji = "🟢" if datos_mkt["var_pct"] >= 0 else "🔴"
-                rango_txt = f"\n• Rango del día: ${datos_mkt['day_low']:,.2f} -${datos_mkt['day_high']:,.2f} USD" if datos_mkt["day_high"] else ""
+                rango_txt = f"\n• Rango del día: ${datos_mkt['day_low']:,.2f} - ${datos_mkt['day_high']:,.2f} USD" if datos_mkt["day_high"] else ""
                 
                 msg_mkt = (
                     f"📈 {datos_mkt['ticker']} en vivo:\n\n"
@@ -581,7 +580,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 texto_limpio += f"\n\n⚠️ No pude obtener la cotización de `{ticker_a_cotizar}` en este momento."
 
-        # Envío seguro de texto (si Markdown tiene entidades rotas, cae a texto plano)
+        # Envío seguro de texto
         if texto_limpio:
             try:
                 await update.message.reply_text(texto_limpio, parse_mode="Markdown")
@@ -620,7 +619,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     msg_rep += (
                         f"▪️ {pos['ticker']} ({peso:.1f}% de cartera):\n"
                         f"   - Tenencia: {pos['cantidad']:,.4f} acc/tokens\n"
-                        f"   - PPC: ${pos['ppc']:,.2f} \vert{} Precio hoy:${pos['precio_actual']:,.2f} USD\n"
+                        f"   - PPC: ${pos['ppc']:,.2f} - Precio hoy: ${pos['precio_actual']:,.2f} USD\n"
                         f"   - PnL: {em} {pnl_s}${pos['pnl_usd']:,.2f} USD ({pnl_s}{pos['pnl_pct']:.2f}%)\n\n"
                     )
                 try:
@@ -672,3 +671,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
