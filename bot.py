@@ -677,7 +677,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     msg_rep += (
                         f"▪️ *{pos['ticker']}* ({peso:.1f}% de cartera):\n"
                         f"   - Tenencia: {pos['cantidad']:,.4f} acc/tokens\n"
-                        f"   - PPC: ${pos['ppc']:,.2f} \vert{} Precio hoy:${pos['precio_actual']:,.2f} USD\n"
+                        f"   - PPC: ${pos['ppc']:,.2f} | Precio hoy: ${pos['precio_actual']:,.2f} USD\n"
                         f"   - PnL: {em} {pnl_s}${pos['pnl_usd']:,.2f} USD ({pnl_s}{pos['pnl_pct']:.2f}%)\n\n"
                     )
                 await update.message.reply_text(msg_rep, parse_mode="Markdown")
