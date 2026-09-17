@@ -11,6 +11,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, Messa
 from google import genai
 import psycopg2
 import pandas as pd
+import numpy as np
 import yfinance as yf
 import matplotlib
 matplotlib.use('Agg')
@@ -94,7 +95,6 @@ def init_db():
                         descripcion TEXT
                     );
                 """)
-                # Migraciones y normalización de columnas
                 cursor.execute("ALTER TABLE movimientos ADD COLUMN IF NOT EXISTS user_id BIGINT;")
                 cursor.execute("ALTER TABLE portafolio_inversiones ADD COLUMN IF NOT EXISTS user_id BIGINT;")
                 cursor.execute("ALTER TABLE portafolio_inversiones ADD COLUMN IF NOT EXISTS tipo_posicion VARCHAR(10) DEFAULT 'SPOT';")
@@ -102,29 +102,15 @@ def init_db():
                 cursor.execute("ALTER TABLE portafolio_inversiones ADD COLUMN IF NOT EXISTS precio_liquidacion NUMERIC DEFAULT NULL;")
                 cursor.execute("ALTER TABLE trades_cerrados ADD COLUMN IF NOT EXISTS user_id BIGINT;")
 
-                # Asignar todo lo previo huérfano a Lucho
                 cursor.execute("UPDATE movimientos SET user_id = %s WHERE user_id IS NULL;", (LUCHO_TELEGRAM_ID,))
                 cursor.execute("UPDATE portafolio_inversiones SET user_id = %s WHERE user_id IS NULL;", (LUCHO_TELEGRAM_ID,))
                 cursor.execute("UPDATE trades_cerrados SET user_id = %s WHERE user_id IS NULL;", (LUCHO_TELEGRAM_ID,))
 
-                # NORMALIZACIÓN AUTOMÁTICA DE POSICIONES ABIERTAS
-                cursor.execute("""
-                    UPDATE portafolio_inversiones 
-                    SET tipo_posicion = 'SPOT' 
-                    WHERE tipo_posicion IS NULL OR TRIM(tipo_posicion) = '';
-                """)
-                cursor.execute("""
-                    UPDATE portafolio_inversiones 
-                    SET apalancamiento = 1 
-                    WHERE apalancamiento IS NULL OR apalancamiento <= 0;
-                """)
-                cursor.execute("""
-                    UPDATE portafolio_inversiones 
-                    SET precio_compra = monto_total_usd / cantidad 
-                    WHERE (precio_compra IS NULL OR precio_compra <= 0) AND cantidad > 0;
-                """)
+                cursor.execute("UPDATE portafolio_inversiones SET tipo_posicion = 'SPOT' WHERE tipo_posicion IS NULL OR TRIM(tipo_posicion) = '';")
+                cursor.execute("UPDATE portafolio_inversiones SET apalancamiento = 1 WHERE apalancamiento IS NULL OR apalancamiento <= 0;")
+                cursor.execute("UPDATE portafolio_inversiones SET precio_compra = monto_total_usd / cantidad WHERE (precio_compra IS NULL OR precio_compra <= 0) AND cantidad > 0;")
                 conn.commit()
-        logger.info("Tablas inicializadas y posiciones abiertas normalizadas con éxito.")
+        logger.info("Tablas inicializadas y normalizadas.")
     except Exception as e:
         logger.error(f"Error en init_db: {e}")
 
@@ -133,14 +119,14 @@ init_db()
 # ==================== CONSULTAS DE MERCADO EN VIVO ====================
 def normalizar_ticker_yf(ticker: str):
     ticker = ticker.strip().upper()
-    if ticker in ["BTC", "ETH", "SOL", "BNB", "ADA", "XRP"]:
+    if ticker in ["BTC", "ETH", "SOL", "BNB", "ADA", "XRP", "DOGE", "SUI", "PAXG"]:
         return f"{ticker}-USD"
     return ticker
 
 def consultar_datos_mercado(ticker: str):
     ticker = ticker.strip().upper()
     simbolos_a_probar = [normalizar_ticker_yf(ticker)]
-    if not ticker.endswith("-USD") and ticker not in ["BTC", "ETH", "SOL", "BNB", "ADA", "XRP"]:
+    if not ticker.endswith("-USD") and ticker not in ["BTC", "ETH", "SOL", "BNB", "ADA", "XRP", "DOGE", "SUI", "PAXG"]:
         simbolos_a_probar.append(f"{ticker}-USD")
 
     for sym in simbolos_a_probar:
@@ -189,7 +175,7 @@ def obtener_precio_actual(ticker: str):
         return datos["precio"], datos["ticker"]
     return None, ticker
 
-# ==================== CÁLCULO DE FECHAS SEGÚN PERIODO ====================
+# ==================== CÁLCULO DE FECHAS ====================
 def resolver_fecha_inicio(periodo_str: str, fecha_compra_db: str = None):
     p = periodo_str.strip().lower() if periodo_str else ""
     hoy = datetime.now()
@@ -217,11 +203,211 @@ def resolver_fecha_inicio(periodo_str: str, fecha_compra_db: str = None):
         return (hoy - timedelta(days=365)).strftime('%Y-%m-%d'), "Último año"
     
     if fecha_compra_db:
-        return fecha_compra_db, f"Desde tu compra ({fecha_compra_db})"
+        return fecha_compra_db, f"Desde tu primera inversión ({fecha_compra_db})"
     
     return (hoy - timedelta(days=180)).strftime('%Y-%m-%d'), "Últimos 6 meses"
 
-# ==================== GRÁFICOS DE EVOLUCIÓN HISTÓRICA ====================
+# ==================== GRÁFICO CONSOLIDADO: UNA SOLA LÍNEA DE CARTERA ====================
+def generar_grafico_evolucion_cartera_consolidada(user_id: int, periodo_solicitado: str = ""):
+    """Genera la curva de patrimonio consolidado histórico (UNA SOLA LÍNEA) que combina PnL realizado y flotante"""
+    try:
+        with get_db_connection() as conn:
+            df_inv = pd.read_sql(
+                "SELECT fecha, ticker, cantidad, precio_compra, monto_total_usd, tipo_posicion, apalancamiento FROM portafolio_inversiones WHERE user_id = %s ORDER BY fecha ASC;",
+                conn, params=(user_id,)
+            )
+            df_tc = pd.read_sql(
+                "SELECT fecha, pnl_usd FROM trades_cerrados WHERE user_id = %s ORDER BY fecha ASC;",
+                conn, params=(user_id,)
+            )
+
+        if df_inv.empty and df_tc.empty:
+            return None
+
+        # Determinar fecha de inicio
+        fechas_candidatas = []
+        if not df_inv.empty:
+            fechas_candidatas.append(df_inv['fecha'].min())
+        if not df_tc.empty:
+            fechas_candidatas.append(df_tc['fecha'].min())
+
+        primera_fecha_global = min(fechas_candidatas).strftime('%Y-%m-%d')
+        fecha_start, desc_periodo = resolver_fecha_inicio(periodo_solicitado, primera_fecha_global)
+
+        # Descargar datos históricos para los tickers que cotizan
+        tickers_unicos = df_inv['ticker'].unique() if not df_inv.empty else []
+        precios_hist = {}
+        for tk in tickers_unicos:
+            if tk in ["USDT", "USDC", "DAI", "USD"]:
+                continue
+            sym = normalizar_ticker_yf(tk)
+            try:
+                h = yf.Ticker(sym).history(start=fecha_start)
+                if not h.empty:
+                    s = h['Close']
+                    s.index = pd.to_datetime(s.index).tz_localize(None)
+                    precios_hist[tk] = s
+            except Exception:
+                pass
+
+        # Crear rango de fechas diario continuo hasta hoy
+        fechas_rango = pd.date_range(start=fecha_start, end=datetime.now().strftime('%Y-%m-%d'), freq='D')
+        df_precios = pd.DataFrame(index=fechas_rango)
+        for tk, s in precios_hist.items():
+            df_precios[tk] = s
+        df_precios = df_precios.ffill().bfill()
+
+        # Construir la serie de Patrimonio Total / Rendimiento diario
+        serie_capital_invertido = pd.Series(0.0, index=fechas_rango)
+        serie_valor_mercado = pd.Series(0.0, index=fechas_rango)
+        serie_pnl_cerrado_acum = pd.Series(0.0, index=fechas_rango)
+
+        # Acumular PnL de trades cerrados en el tiempo
+        if not df_tc.empty:
+            df_tc['fecha_d'] = pd.to_datetime(df_tc['fecha']).dt.tz_localize(None).dt.floor('D')
+            pnl_por_dia = df_tc.groupby('fecha_d')['pnl_usd'].sum()
+            serie_pnl_cerrado_acum = pnl_por_dia.reindex(fechas_rango, fill_value=0.0).cumsum()
+
+        # Calcular valor diario de posiciones abiertas
+        for _, pos in df_inv.iterrows():
+            pos_fecha = pd.to_datetime(pos['fecha']).tz_localize(None).floor('D')
+            tk = pos['ticker']
+            cant = float(pos['cantidad'])
+            ppc = float(pos['precio_compra']) if pos['precio_compra'] else 1.0
+            margen = float(pos['monto_total_usd'])
+            tipo = str(pos['tipo_posicion']).upper() if pos['tipo_posicion'] else "SPOT"
+            lev = float(pos['apalancamiento']) if pos['apalancamiento'] else 1.0
+
+            mascara = fechas_rango >= pos_fecha
+            serie_capital_invertido[mascara] += margen
+
+            if tk in ["USDT", "USDC", "DAI", "USD"] or tk not in df_precios.columns:
+                serie_valor_mercado[mascara] += margen
+            else:
+                spot_t = df_precios[tk].loc[mascara]
+                if tipo == "SHORT":
+                    val_t = np.maximum(0.0, margen + margen * ((ppc - spot_t) / ppc) * lev)
+                elif tipo == "LONG":
+                    val_t = np.maximum(0.0, margen + margen * ((spot_t - ppc) / ppc) * lev)
+                else: # SPOT
+                    val_t = cant * spot_t
+                serie_valor_mercado[mascara] += val_t
+
+        # Serie neta de PnL total consolidado en USD y en %
+        serie_pnl_flotante = serie_valor_mercado - serie_capital_invertido
+        serie_pnl_total_usd = serie_pnl_flotante + serie_pnl_cerrado_acum
+
+        # Curva de Patrimonio Neto Total (Capital Inicialmente invertido + Beneficio Neto Acumulado)
+        # O Rendimiento Consolidado en % sobre el capital
+        capital_activo_final = serie_capital_invertido.iloc[-1]
+        pnl_final_usd = serie_pnl_total_usd.iloc[-1]
+        rend_pct_serie = (serie_pnl_total_usd / np.maximum(1.0, serie_capital_invertido)) * 100
+
+        fig, ax = plt.subplots(figsize=(10, 5.2))
+        color_linea = "#00b06f" if pnl_final_usd >= 0 else "#e04050"
+        
+        ax.plot(fechas_rango, serie_pnl_total_usd, label=f"PnL Total Consolidado ({pnl_final_usd:+,.2f} USD)", color=color_linea, linewidth=2.4)
+        ax.axhline(0, color="gray", linestyle="--", linewidth=1.1, alpha=0.7)
+        ax.fill_between(fechas_rango, serie_pnl_total_usd, 0, where=(serie_pnl_total_usd >= 0), alpha=0.15, color="#00b06f")
+        ax.fill_between(fechas_rango, serie_pnl_total_usd, 0, where=(serie_pnl_total_usd < 0), alpha=0.15, color="#e04050")
+
+        ax.set_title(f"Evolución Consolidada de Cartera (PnL Total Realizado + Flotante)\n{desc_periodo}", fontsize=12, fontweight='bold', pad=12)
+        ax.set_xlabel("Fecha")
+        ax.set_ylabel("Ganancia / Pérdida Acumulada (USD)")
+        ax.grid(True, linestyle="--", alpha=0.35)
+        ax.legend(loc="upper left", frameon=True)
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+        plt.tight_layout()
+
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', dpi=200)
+        buf.seek(0)
+        plt.close()
+        return buf
+    except Exception as e:
+        logger.error(f"Error generando curva consolidada de cartera: {e}", exc_info=True)
+        return None
+
+# ==================== GRÁFICO POR ACTIVOS (MÚLTIPLES LÍNEAS NORMALIZADAS AL PPC REAL) ====================
+def generar_grafico_evolucion_por_activos(user_id: int, periodo_solicitado: str = ""):
+    """Genera la comparativa multi-línea dividida por activo, indexada respecto al PPC real del usuario"""
+    try:
+        with get_db_connection() as conn:
+            df = pd.read_sql(
+                "SELECT ticker, MIN(fecha) as primera_compra, SUM(cantidad) as cantidad, SUM(monto_total_usd) as costo_total FROM portafolio_inversiones WHERE user_id = %s GROUP BY ticker;",
+                conn, params=(user_id,)
+            )
+        
+        if df.empty:
+            return None
+        
+        primera_fecha_db = df['primera_compra'].min().strftime('%Y-%m-%d')
+        fecha_start, desc_periodo = resolver_fecha_inicio(periodo_solicitado, primera_fecha_db)
+        
+        series_dict = {}
+        ppc_dict = {}
+
+        for _, row in df.iterrows():
+            tk = row['ticker']
+            if tk in ["USDT", "USDC", "DAI", "USD"]:
+                continue
+            cant = float(row['cantidad'])
+            costo = float(row['costo_total'])
+            ppc = costo / cant if cant > 0 else 1.0
+            ppc_dict[tk] = ppc
+
+            sym = normalizar_ticker_yf(tk)
+            try:
+                h = yf.Ticker(sym).history(start=fecha_start)
+                if not h.empty:
+                    s = h['Close']
+                    s.index = pd.to_datetime(s.index).tz_localize(None)
+                    series_dict[tk] = s
+            except Exception:
+                pass
+
+        if not series_dict:
+            return None
+
+        df_precios = pd.DataFrame(series_dict)
+        df_precios = df_precios.resample('D').last().ffill().bfill()
+        
+        # Rendimiento relativo de cada activo con respecto a TU PPC REAL (Base 100 = Tu punto de entrada)
+        df_norm = pd.DataFrame()
+        for col in df_precios.columns:
+            ppc = ppc_dict.get(col, df_precios[col].iloc[0])
+            if ppc > 0:
+                df_norm[col] = (df_precios[col] / ppc) * 100
+
+        fig, ax = plt.subplots(figsize=(10, 5.2))
+        colores = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2']
+        
+        for idx, col in enumerate(df_norm.columns):
+            c = colores[idx % len(colores)]
+            ultimo_val = df_norm[col].iloc[-1]
+            pnl_pct = ultimo_val - 100.0
+            signo = "+" if pnl_pct >= 0 else ""
+            ax.plot(df_norm.index, df_norm[col], label=f"{col} ({signo}{pnl_pct:.1f}%)", linewidth=2.0, color=c)
+
+        ax.axhline(y=100, color="gray", linestyle=":", linewidth=1.4, alpha=0.8, label="Tu PPC / Break-even (100)")
+        ax.set_title(f"Rendimiento de tus Activos respecto a tu PPC (Base 100 = Costo)\n{desc_periodo}", fontsize=12, fontweight='bold', pad=12)
+        ax.set_xlabel("Fecha")
+        ax.set_ylabel("Rendimiento vs PPC (%)")
+        ax.grid(True, linestyle="--", alpha=0.35)
+        ax.legend(loc="upper left", frameon=True)
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+        plt.tight_layout()
+
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', dpi=200)
+        buf.seek(0)
+        plt.close()
+        return buf
+    except Exception as e:
+        logger.error(f"Error generando comparativa por activos: {e}", exc_info=True)
+        return None
+
+# ==================== EVOLUCIÓN ACTIVO INDIVIDUAL ====================
 def generar_grafico_evolucion_activo(user_id: int, ticker: str, periodo_solicitado: str = ""):
     ticker = ticker.strip().upper()
     simbolo = normalizar_ticker_yf(ticker)
@@ -281,71 +467,7 @@ def generar_grafico_evolucion_activo(user_id: int, ticker: str, periodo_solicita
         logger.error(f"Error graficando activo {ticker}: {e}")
         return None
 
-def generar_grafico_evolucion_cartera(user_id: int, periodo_solicitado: str = ""):
-    try:
-        with get_db_connection() as conn:
-            df = pd.read_sql(
-                "SELECT ticker, MIN(fecha) as primera_compra FROM portafolio_inversiones WHERE user_id = %s GROUP BY ticker;",
-                conn, params=(user_id,)
-            )
-        
-        if df.empty:
-            return None
-        
-        primera_fecha_db = df['primera_compra'].min().strftime('%Y-%m-%d')
-        fecha_start, desc_periodo = resolver_fecha_inicio(periodo_solicitado, primera_fecha_db)
-        
-        series_dict = {}
-        for _, row in df.iterrows():
-            tk = row['ticker']
-            sym = normalizar_ticker_yf(tk)
-            try:
-                h = yf.Ticker(sym).history(start=fecha_start)
-                if not h.empty:
-                    s = h['Close']
-                    s.index = pd.to_datetime(s.index).tz_localize(None)
-                    series_dict[tk] = s
-            except Exception:
-                pass
-
-        if not series_dict:
-            return None
-
-        df_precios = pd.DataFrame(series_dict)
-        df_precios = df_precios.resample('D').last().ffill().bfill()
-        
-        df_norm = pd.DataFrame()
-        for col in df_precios.columns:
-            primer_val = df_precios[col].iloc[0]
-            if primer_val > 0:
-                df_norm[col] = (df_precios[col] / primer_val) * 100
-
-        fig, ax = plt.subplots(figsize=(10, 5.2))
-        colores = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2']
-        
-        for idx, col in enumerate(df_norm.columns):
-            c = colores[idx % len(colores)]
-            ax.plot(df_norm.index, df_norm[col], label=f"{col} ({df_norm[col].iloc[-1]:.1f}%)", linewidth=2.2, color=c)
-
-        ax.axhline(y=100, color="gray", linestyle=":", linewidth=1.3, alpha=0.75, label="Base 100")
-        ax.set_title(f"Rendimiento Relativo de Cartera (Base 100)\n{desc_periodo}", fontsize=12, fontweight='bold', pad=12)
-        ax.set_xlabel("Fecha")
-        ax.set_ylabel("Rendimiento Relativo (%)")
-        ax.grid(True, linestyle="--", alpha=0.35)
-        ax.legend(loc="upper left", frameon=True)
-        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
-        plt.tight_layout()
-
-        buf = io.BytesIO()
-        plt.savefig(buf, format='png', dpi=200)
-        buf.seek(0)
-        plt.close()
-        return buf
-    except Exception as e:
-        logger.error(f"Error generando evolución cartera: {e}")
-        return None
-
-# ==================== INVERSIONES SPOT Y FUTUROS (USD) ====================
+# ==================== OPERACIONES BANCARIAS Y CARTERA ====================
 def registrar_operacion_inversion(user_id: int, ticker: str, monto_usd: float, precio_compra: float = None, cantidad: float = None, fecha_compra: str = None, tipo_posicion: str = "SPOT", apalancamiento: float = 1.0, precio_liq: float = None):
     ticker = ticker.strip().upper()
     tipo_pos = tipo_posicion.strip().upper() if tipo_posicion else "SPOT"
@@ -393,7 +515,6 @@ def registrar_operacion_inversion(user_id: int, ticker: str, monto_usd: float, p
             conn.commit()
     return ticker, cantidad, precio_compra, monto_usd, fecha_limpia, tipo_pos, lev, precio_liq
 
-# ==================== TRADES CERRADOS Y CIERRE DE POSICIONES ABIERTAS ====================
 def registrar_trade_cerrado(user_id: int, ticker: str, pnl_usd: float, tipo_posicion: str = "SPOT", roi_pct: float = None, monto_invertido: float = None, descripcion: str = "", fecha_str: str = None):
     ticker = ticker.strip().upper()
     tipo_pos = tipo_posicion.strip().upper() if tipo_posicion else "SPOT"
@@ -423,7 +544,6 @@ def registrar_trade_cerrado(user_id: int, ticker: str, pnl_usd: float, tipo_posi
             return new_id, ticker, pnl_usd, tipo_pos, roi_pct, fecha_limpia
 
 def cerrar_posicion_abierta_por_id(user_id: int, inv_id: int, pnl_manual: float = None, precio_salida_manual: float = None):
-    """Cierra una posición que estaba en portafolio_inversiones y la pasa a trades_cerrados"""
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
@@ -448,7 +568,7 @@ def cerrar_posicion_abierta_por_id(user_id: int, inv_id: int, pnl_manual: float 
                     pnl_final = margen * ((ppc - spot) / ppc) * lev
                 elif tipo_pos == "LONG":
                     pnl_final = margen * ((spot - ppc) / ppc) * lev
-                else: # SPOT
+                else:
                     pnl_final = (cant * spot) - margen
             
             roi_final = (pnl_final / margen * 100) if margen > 0 else 0.0
@@ -474,22 +594,12 @@ def cerrar_posicion_abierta_por_id(user_id: int, inv_id: int, pnl_manual: float 
 def modificar_inversion_por_id(user_id: int, inv_id: int, campo: str, nuevo_valor: str):
     campo = campo.strip().lower()
     mapa_campos = {
-        "ticker": "ticker",
-        "activo": "ticker",
-        "cantidad": "cantidad",
-        "cant": "cantidad",
-        "precio": "precio_compra",
-        "ppc": "precio_compra",
-        "precio_compra": "precio_compra",
-        "monto": "monto_total_usd",
-        "monto_total_usd": "monto_total_usd",
-        "fecha": "fecha",
-        "tipo": "tipo_posicion",
-        "tipo_posicion": "tipo_posicion",
-        "apalancamiento": "apalancamiento",
-        "leverage": "apalancamiento",
-        "liq": "precio_liquidacion",
-        "precio_liquidacion": "precio_liquidacion"
+        "ticker": "ticker", "activo": "ticker", "cantidad": "cantidad", "cant": "cantidad",
+        "precio": "precio_compra", "ppc": "precio_compra", "precio_compra": "precio_compra",
+        "monto": "monto_total_usd", "monto_total_usd": "monto_total_usd", "fecha": "fecha",
+        "tipo": "tipo_posicion", "tipo_posicion": "tipo_posicion",
+        "apalancamiento": "apalancamiento", "leverage": "apalancamiento",
+        "liq": "precio_liquidacion", "precio_liquidacion": "precio_liquidacion"
     }
     col = mapa_campos.get(campo)
     if not col:
@@ -549,12 +659,8 @@ def agregar_margen_a_posicion(user_id: int, inv_id: int, margen_extra: float):
 def modificar_movimiento_por_id(user_id: int, mov_id: int, campo: str, nuevo_valor: str):
     campo = campo.strip().lower()
     mapa_campos = {
-        "monto": "monto",
-        "categoria": "categoria",
-        "descripcion": "descripcion",
-        "desc": "descripcion",
-        "fecha": "fecha",
-        "tipo": "tipo"
+        "monto": "monto", "categoria": "categoria", "descripcion": "descripcion",
+        "desc": "descripcion", "fecha": "fecha", "tipo": "tipo"
     }
     col = mapa_campos.get(campo)
     if not col:
@@ -675,11 +781,11 @@ def generar_grafico_distribucion_inversiones(user_id: int):
     plt.close()
     return buf
 
-# ==================== MOTOR DE MÉTRICAS ANALÍTICAS AVANZADAS ====================
+# ==================== MOTOR DE MÉTRICAS ANALÍTICAS ====================
 def calcular_super_metricas_totales(user_id: int):
     metricas = []
     
-    # 1. PnL Realizado de Trades Cerrados
+    # Trades Cerrados
     pnl_realizado_total = 0.0
     cant_trades_cerrados = 0
     try:
@@ -703,7 +809,7 @@ def calcular_super_metricas_totales(user_id: int):
     except Exception as e:
         logger.error(f"Error métricas trades cerrados: {e}")
 
-    # 2. Posiciones Abiertas
+    # Posiciones Abiertas
     try:
         resumen = obtener_resumen_portafolio(user_id)
         if resumen and resumen["posiciones"]:
@@ -734,7 +840,7 @@ def calcular_super_metricas_totales(user_id: int):
     except Exception as e:
         logger.error(f"Error métricas de inversión: {e}")
 
-    # 3. Flujo de caja ARS
+    # Flujo de caja ARS
     try:
         with get_db_connection() as conn:
             df_mov = pd.read_sql("SELECT id, fecha, tipo, monto, categoria, descripcion FROM movimientos WHERE user_id = %s ORDER BY fecha ASC;", conn, params=(user_id,))
@@ -756,7 +862,7 @@ def calcular_super_metricas_totales(user_id: int):
 
     return "\n".join(metricas)
 
-# ==================== HISTORIAL Y BORRADO POR USUARIO ====================
+# ==================== HISTORIAL Y BORRADO ====================
 def obtener_historial_completo_texto(user_id: int):
     lineas = []
     with get_db_connection() as conn:
@@ -942,13 +1048,24 @@ Eres un analista y asesor financiero cuantitativo institucional. Manejas tres mu
 
 TODOS LOS REGISTROS QUE APARECEN EN "POSICIONES / TRADES ABIERTOS" REPRESENTAN OPERACIONES QUE EL USUARIO TIENE ABIERTAS HOY EN DÍA.
 
+REGLAS DE GRÁFICOS (MUY IMPORTANTE):
+1. Si el usuario pide la evolución general de su cartera (ej: "evolución de mi cartera", "rendimiento de mi cartera", "gráfico de mi cartera", "cómo creció mi cartera"):
+   DEBES EJECUTAR: ACCION: GRAFICO_EVOLUCION_CARTERA_CONSOLIDADA|[PERIODO_DETECTADO]
+   Esto devuelve UNA SOLA LÍNEA consolidada con la subida y bajada real de todo su patrimonio combinado (trades cerrados + posiciones abiertas).
+
+2. Si el usuario pide explícitamente ver el gráfico DIVIDIDO POR ACTIVO o COMPARATIVA DE ACTIVOS (ej: "evolución dividida por activo", "gráfico por activo", "comparar el rendimiento de mis acciones", "separado por activo"):
+   DEBES EJECUTAR: ACCION: GRAFICO_EVOLUCION_POR_ACTIVOS|[PERIODO_DETECTADO]
+   Esto devuelve las líneas individuales de cada activo normalizadas exactamente respecto a su PPC real.
+
+3. Si pide la evolución de UN SOLO ACTIVO PUNTUAL (ej: "evolución de MELI", "gráfico de BTC de los últimos 2 meses"):
+   DEBES EJECUTAR: ACCION: GRAFICO_EVOLUCION_ACTIVO|[TICKER]|[PERIODO_DETECTADO]
+
 REGLAS DE CIERRE DE POSICIÓN ABIERTA:
-- Si el usuario dice que cerró una posición que tenía abierta (ej: "cerré el trade de btc", "cerré la posición ID 2 con 150 usd de ganancia", "cerré el long de SOL a precio actual"):
-  Identifica el ID de la posición abierta (o el ticker) y el PnL obtenido si lo indica.
-  Escribe: ACCION: CERRAR_POSICION|[ID]|[PNL_USD_MANUAL_O_VACIO]|[PRECIO_SALIDA_O_VACIO]
+- Si el usuario dice que cerró una posición abierta:
+  ACCION: CERRAR_POSICION|[ID]|[PNL_USD_MANUAL_O_VACIO]|[PRECIO_SALIDA_O_VACIO]
 
 REGLAS DE REGISTRO DE TRADES CERRADOS PASADOS:
-- Si el usuario menciona una ganancia o trade pasado que ya cerró hace tiempo (ej: "gané 450 usd en un trade de sol el mes pasado"):
+- Si el usuario menciona una ganancia o trade pasado que ya cerró:
   REGISTRO_TRADE_CERRADO: [TICKER]|[PNL_USD]|[TIPO_POS]|[ROI_PCT]|[MONTO_INVERTIDO]|[DESCRIPCION]|[FECHA_YYYY-MM-DD]
 
 REGLAS DE REGISTRO DE POSICIONES ABIERTAS (SPOT / FUTUROS):
@@ -959,10 +1076,6 @@ REGLAS DE MODIFICACIÓN Y AGREGADO DE MARGEN:
 - Agregar margen: ACCION: AGREGAR_MARGEN|[ID]|[MONTO_EXTRA_USD]
 - Modificar posición abierta: ACCION: MODIFICAR_INVERSION|[ID]|[CAMPO]|[NUEVO_VALOR]
 - Modificar gasto/ingreso: ACCION: MODIFICAR_MOVIMIENTO|[ID]|[CAMPO]|[NUEVO_VALOR]
-
-REGLAS DE GRÁFICOS:
-- Activo específico con periodo: ACCION: GRAFICO_EVOLUCION_ACTIVO|[TICKER]|[PERIODO_DETECTADO]
-- Cartera general con periodo: ACCION: GRAFICO_EVOLUCION_CARTERA|[PERIODO_DETECTADO]
 
 REGLAS DE BORRADO:
 - Borrar por ticker: ACCION: BORRAR_INVERSION_TICKER|[TICKER]
@@ -984,15 +1097,15 @@ REGLAS GENERALES:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 ¡Hola! Soy tu asistente financiero y analista cuantitativo institucional.\n\n"
-        "🟢 Trades Abiertos (En Vivo):\n"
+        "📈 Gráficos Renovados:\n"
+        "• 'Evolución de mi cartera' -> Una sola línea consolidada con tu PnL total real.\n"
+        "• 'Evolución dividida por activo' -> Múltiples líneas de cada activo vs tu PPC real.\n\n"
+        "🟢 Posiciones Abiertas y Futuros:\n"
         "• '¿Cómo vienen mis trades abiertos?'\n"
         "• 'Cerré la posición ID 2 con 150 usd de ganancia'\n\n"
-        "🏆 Trades Cerrados y Ganancias Realizadas:\n"
+        "🏆 Trades Cerrados:\n"
         "• 'Gané 450 usd en un trade de SOL el mes pasado'\n\n"
-        "⚡ Futuros y Apalancamiento:\n"
-        "• 'Abrí un Long en BTC x10 con 500 usd a 60.000'\n"
-        "• 'Agregué 150 usd de margen a la posición ID 1'\n\n"
-        "💼 Cartera Consolidada:\n"
+        "💼 Balance Consolidado:\n"
         "• '¿Cuál es mi balance total?' / 'Mandame un excel'"
     )
 
@@ -1040,7 +1153,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ticker_a_cotizar = m_precio.group(1).strip()
             texto_limpio = texto_limpio.replace(m_precio.group(0), "")
 
-        # Gráficos con periodos
+        # Gráfico Activo Individual
         ticker_grafico_evol = None
         periodo_activo = ""
         m_ga = re.search(r"ACCION: GRAFICO_EVOLUCION_ACTIVO\|([^\n\r|]+)(?:\|([^\n\r]+))?", texto_limpio)
@@ -1049,13 +1162,31 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             periodo_activo = m_ga.group(2).strip() if m_ga.group(2) else ""
             texto_limpio = texto_limpio.replace(m_ga.group(0), "")
 
-        necesita_grafico_evol_cartera = False
-        periodo_cartera = ""
-        m_gc = re.search(r"ACCION: GRAFICO_EVOLUCION_CARTERA(?:\|([^\n\r]+))?", texto_limpio)
+        # Gráfico Consolidado Cartera (UNA SOLA LÍNEA)
+        necesita_grafico_consolidado = False
+        periodo_consolidado = ""
+        m_gc = re.search(r"ACCION: GRAFICO_EVOLUCION_CARTERA_CONSOLIDADA(?:\|([^\n\r]+))?", texto_limpio)
         if m_gc:
-            necesita_grafico_evol_cartera = True
-            periodo_cartera = m_gc.group(1).strip() if m_gc.group(1) else ""
+            necesita_grafico_consolidado = True
+            periodo_consolidado = m_gc.group(1).strip() if m_gc.group(1) else ""
             texto_limpio = texto_limpio.replace(m_gc.group(0), "")
+
+        # Fallback de compatibilidad si Gemini pone el tag anterior
+        if not necesita_grafico_consolidado:
+            m_gc_old = re.search(r"ACCION: GRAFICO_EVOLUCION_CARTERA(?:\|([^\n\r]+))?", texto_limpio)
+            if m_gc_old:
+                necesita_grafico_consolidado = True
+                periodo_consolidado = m_gc_old.group(1).strip() if m_gc_old.group(1) else ""
+                texto_limpio = texto_limpio.replace(m_gc_old.group(0), "")
+
+        # Gráfico Dividido Por Activos (MÚLTIPLES LÍNEAS NORMALIZADAS AL PPC REAL)
+        necesita_grafico_por_activos = False
+        periodo_por_activos = ""
+        m_gpa = re.search(r"ACCION: GRAFICO_EVOLUCION_POR_ACTIVOS(?:\|([^\n\r]+))?", texto_limpio)
+        if m_gpa:
+            necesita_grafico_por_activos = True
+            periodo_por_activos = m_gpa.group(1).strip() if m_gpa.group(1) else ""
+            texto_limpio = texto_limpio.replace(m_gpa.group(0), "")
 
         # Cierre de posición abierta
         m_close_pos = re.search(r"ACCION: CERRAR_POSICION\|(\d+)(?:\|([^|\n\r]*))?(?:\|([^\n\r]*))?", texto_limpio)
@@ -1231,7 +1362,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 await update.message.reply_text(texto_limpio)
 
-        # Gráfico activo puntual
+        # 1. Gráfico Activo Puntual
         if ticker_grafico_evol:
             buf_img = generar_grafico_evolucion_activo(user_id, ticker_grafico_evol, periodo_activo)
             if buf_img:
@@ -1239,19 +1370,26 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await update.message.reply_text(f"⚠️ No pude generar la curva de evolución para {ticker_grafico_evol}.")
 
-        # Gráfico evolución cartera
-        if necesita_grafico_evol_cartera:
-            buf_img = generar_grafico_evolucion_cartera(user_id, periodo_cartera)
+        # 2. Gráfico Consolidado Cartera (UNA SOLA LÍNEA REAL)
+        if necesita_grafico_consolidado:
+            buf_img = generar_grafico_evolucion_cartera_consolidada(user_id, periodo_consolidado)
             if buf_img:
-                await update.message.reply_photo(photo=buf_img, caption="📈 Evolución relativa de tus activos (Base 100).")
+                await update.message.reply_photo(photo=buf_img, caption="📈 Evolución Consolidada de Cartera (PnL Total Realizado + Flotante).")
             else:
-                await update.message.reply_text("No hay suficientes activos registrados en tu cartera para armar el gráfico comparativo.")
+                await update.message.reply_text("No hay suficientes datos registrados para trazar la curva consolidada.")
+
+        # 3. Gráfico Por Activos (MÚLTIPLES LÍNEAS NORMALIZADAS AL PPC REAL)
+        if necesita_grafico_por_activos:
+            buf_img = generar_grafico_por_activos(user_id, periodo_por_activos)
+            if buf_img:
+                await update.message.reply_photo(photo=buf_img, caption="📊 Rendimiento relativo de cada activo respecto a tu PPC (Base 100).")
+            else:
+                await update.message.reply_text("No hay suficientes activos registrados para armar la comparativa.")
 
         # Reporte de cartera
         if necesita_cartera:
             resumen = obtener_resumen_portafolio(user_id)
             
-            # Obtener PnL Realizado
             with get_db_connection() as conn:
                 df_tc = pd.read_sql("SELECT SUM(pnl_usd) as pnl_tot, COUNT(id) as total_c FROM trades_cerrados WHERE user_id = %s;", conn, params=(user_id,))
             pnl_realizado = float(df_tc['pnl_tot'].iloc[0]) if not df_tc.empty and pd.notnull(df_tc['pnl_tot'].iloc[0]) else 0.0
