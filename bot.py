@@ -92,6 +92,7 @@ def consultar_datos_mercado(ticker: str):
     for sym in simbolos_a_probar:
         try:
             t = yf.Ticker(sym)
+            # 1. Intento por histórico reciente (el más confiable siempre, incluso fuera de hora)
             df_hist = t.history(period="5d")
             if not df_hist.empty:
                 last_price = float(df_hist['Close'].iloc[-1])
@@ -116,6 +117,7 @@ def consultar_datos_mercado(ticker: str):
                     "day_low": day_low
                 }
             
+            # 2. Intento de respaldo por fast_info
             fi = t.fast_info
             last_price = getattr(fi, "last_price", None) or fi.get("last_price", None)
             if last_price:
@@ -136,103 +138,12 @@ def consultar_datos_mercado(ticker: str):
             pass
             
     return None
-
 def obtener_precio_actual(ticker: str):
     datos = consultar_datos_mercado(ticker)
     if datos:
         return datos["precio"], datos["ticker"]
     return None, ticker
 
-# ==================== GRÁFICOS DE EVOLUCIÓN HISTÓRICA (LÍNEAS) ====================
-def generar_grafico_evolucion_activo(ticker: str, periodo: str = "6mo"):
-    ticker = ticker.strip().upper()
-    simbolo = f"{ticker}-USD" if ticker in ["BTC", "ETH", "SOL", "BNB", "ADA", "XRP"] else ticker
-    
-    try:
-        t = yf.Ticker(simbolo)
-        df_hist = t.history(period=periodo)
-        if df_hist.empty:
-            if not simbolo.endswith("-USD"):
-                simbolo = f"{simbolo}-USD"
-                t = yf.Ticker(simbolo)
-                df_hist = t.history(period=periodo)
-                
-        if df_hist.empty:
-            return None
-
-        ppc_referencia = None
-        with get_db_connection() as conn:
-            df_inv = pd.read_sql("SELECT cantidad, monto_total_usd FROM portafolio_inversiones WHERE UPPER(ticker) = %s;", conn, params=(ticker,))
-            if not df_inv.empty and df_inv['cantidad'].sum() > 0:
-                ppc_referencia = df_inv['monto_total_usd'].sum() / df_inv['cantidad'].sum()
-
-        plt.figure(figsize=(10, 5))
-        color_linea = "#2b5c8f"
-        plt.plot(df_hist.index, df_hist['Close'], label=f"Precio {ticker} (USD)", color=color_linea, linewidth=2.2)
-        plt.fill_between(df_hist.index, df_hist['Close'], alpha=0.12, color=color_linea)
-        
-        if ppc_referencia:
-            plt.axhline(y=ppc_referencia, color="#d62728", linestyle="--", linewidth=1.5, label=f"Tu PPC (${ppc_referencia:,.2f})")
-
-        plt.title(f"Evolución de {ticker} - Últimos 6 Meses", fontsize=13, fontweight='bold', pad=15)
-        plt.xlabel("Fecha", fontsize=10)
-        plt.ylabel("Precio en USD", fontsize=10)
-        plt.grid(True, linestyle="--", alpha=0.4)
-        plt.legend(loc="upper left")
-        plt.tight_layout()
-        
-        buf = io.BytesIO()
-        plt.savefig(buf, format='png', dpi=200)
-        buf.seek(0)
-        plt.close()
-        return buf
-    except Exception as e:
-        logger.error(f"Error generando gráfico de evolución para {ticker}: {e}")
-        return None
-
-def generar_grafico_evolucion_cartera(periodo: str = "6mo"):
-    with get_db_connection() as conn:
-        df = pd.read_sql("SELECT DISTINCT ticker FROM portafolio_inversiones;", conn)
-    
-    if df.empty:
-        return None
-        
-    tickers = df['ticker'].tolist()
-    datos_cierre = {}
-    
-    for tk in tickers:
-        sym = f"{tk}-USD" if tk in ["BTC", "ETH", "SOL", "BNB", "ADA", "XRP"] else tk
-        try:
-            h = yf.Ticker(sym).history(period=periodo)
-            if not h.empty:
-                serie = h['Close']
-                if serie.iloc[0] > 0:
-                    datos_cierre[tk] = (serie / serie.iloc[0]) * 100
-        except Exception:
-            pass
-            
-    if not datos_cierre:
-        return None
-        
-    df_comparativo = pd.DataFrame(datos_cierre)
-    
-    plt.figure(figsize=(10, 5.5))
-    for col in df_comparativo.columns:
-        plt.plot(df_comparativo.index, df_comparativo[col], label=col, linewidth=2)
-        
-    plt.axhline(y=100, color="gray", linestyle=":", alpha=0.7)
-    plt.title(f"Evolución Comparativa de tus Activos (Base 100) - {periodo}", fontsize=13, fontweight='bold', pad=15)
-    plt.xlabel("Fecha", fontsize=10)
-    plt.ylabel("Rendimiento Relativo (%)", fontsize=10)
-    plt.grid(True, linestyle="--", alpha=0.4)
-    plt.legend(loc="upper left")
-    plt.tight_layout()
-    
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png', dpi=200)
-    buf.seek(0)
-    plt.close()
-    return buf
 
 # ==================== INVERSIONES (USD) ====================
 def registrar_operacion_inversion(ticker: str, monto_usd: float, precio_compra: float = None, cantidad: float = None):
@@ -465,12 +376,7 @@ REGLAS DE PRECIO Y MERCADO:
 - Si el usuario te pregunta por la cotización, precio o variación de un activo o acción (ej: "¿a cuánto está MELI?", "precio de BTC", "cómo viene AAPL hoy"):
   Identifica el ticker y responde OBLIGATORIAMENTE agregando al final una única línea:
   ACCION: CONSULTA_PRECIO|[TICKER]
-
-REGLAS DE GRÁFICOS DE EVOLUCIÓN:
-- Si el usuario pide un gráfico de evolución, histórico o línea temporal de un activo específico (ej: "gráfico de evolución de MELI", "evolución de BTC en los últimos meses", "gráfico de AAPL"):
-  ACCION: GRAFICO_EVOLUCION_ACTIVO|[TICKER]
-- Si pide la evolución histórica o gráfico temporal de toda su cartera o de sus inversiones en conjunto (ej: "gráfico de evolución de mis inversiones", "cómo evolucionó mi cartera"):
-  ACCION: GRAFICO_EVOLUCION_CARTERA
+  (No inventes números; el sistema consultará el precio exacto y la variación del día).
 
 REGLAS DE COMPRA / APORTE A CARTERA:
 - Si el usuario indica compra de activos (ej: "compre 1000 usd de MELI", "compre 0.5 BTC a 62000"):
@@ -478,14 +384,14 @@ REGLAS DE COMPRA / APORTE A CARTERA:
   REGISTRO_INV: [TICKER]|[MONTO_USD]|[PRECIO_COMPRA]|[CANTIDAD]
 
 REGLAS DE SEGUIMIENTO DE CARTERA:
-- Si pregunta por el rendimiento o estado actual de su cartera propia:
+- Si pregunta por el rendimiento o evolución de su cartera propia:
   ACCION: VER_CARTERA
-- Si pide gráfico de distribución (torta) de cartera de inversión:
+- Si pide gráfico de cartera de inversión:
   ACCION: GRAFICO_INVERSIONES
 
 REGLAS DE GASTOS ARS:
 - Registro diario: REGISTRO: [TIPO]|[MONTO]|[CATEGORIA]|[DESCRIPCION]
-- Gráfico de torta de gastos: ACCION: GRAFICO_GASTOS
+- Gráfico de gastos: ACCION: GRAFICO_GASTOS
 - Borrados: ACCION: BORRAR_ID|[ID] / ACCION: BORRAR_ULTIMO / ACCION: BORRAR_TODO
 - Excel: ACCION: EXCEL
 """
@@ -493,18 +399,18 @@ REGLAS DE GASTOS ARS:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 ¡Hola! Soy tu asistente financiero y de mercado en vivo.\n\n"
-        "📈 Mercado y Gráficos de Evolución:\n"
-        "• '¿A cuánto está MELI?' / 'Precio de BTC'\n"
-        "• 'Gráfico de evolución de MELI' (Línea histórica)\n"
-        "• 'Evolución de mis inversiones'\n\n"
-        "💼 Cartera (USD):\n"
-        "• 'Compré 1000 usd de AAPL'\n"
-        "• '¿Cómo vienen mis inversiones?'\n"
-        "• 'Distribución de mis activos' (Torta)\n\n"
-        "💸 Gastos y Análisis (ARS):\n"
-        "• 'Almuerzo 12k' / 'Sueldo 950 lucas'\n"
-        "• '¿Cuál es mi gasto promedio?'\n"
-        "• 'Mandame un excel'"
+        "📊 **Mercado en vivo (Precios y Variación)**:\n"
+        "• '¿a cuánto está MELI?'\n"
+        "• '¿cómo viene AAPL hoy?'\n"
+        "• 'precio de BTC / SPY / TSLA'\n\n"
+        "📈 **Cartera (USD)**:\n"
+        "• 'compré 1000 usd de MELI'\n"
+        "• '¿cómo viene evolucionando mi cartera?'\n"
+        "• 'mostrame la distribución de mis activos'\n\n"
+        "💸 **Gastos y Análisis (ARS)**:\n"
+        "• 'uber 8.5k' / 'sueldo 950 lucas'\n"
+        "• '¿cuál es mi gasto promedio?'\n"
+        "• 'mandame un excel'"
     )
 
 async def cmd_borrar_todo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -534,31 +440,28 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         necesita_cartera = "ACCION: VER_CARTERA" in reply
         necesita_grafico_inv = "ACCION: GRAFICO_INVERSIONES" in reply
-        necesita_grafico_evol_cartera = "ACCION: GRAFICO_EVOLUCION_CARTERA" in reply
         necesita_grafico_gastos = "ACCION: GRAFICO_GASTOS" in reply
         necesita_excel = "ACCION: EXCEL" in reply
         necesita_borrar_todo = "ACCION: BORRAR_TODO" in reply
         necesita_borrar_ultimo = "ACCION: BORRAR_ULTIMO" in reply
         necesita_borrar_id = "ACCION: BORRAR_ID|" in reply
         necesita_precio = "ACCION: CONSULTA_PRECIO|" in reply
-        necesita_grafico_evol_activo = "ACCION: GRAFICO_EVOLUCION_ACTIVO|" in reply
         registro_inv = "REGISTRO_INV:" in reply
         registro_ars = "REGISTRO:" in reply
         
         texto_limpio = reply
-        for tag in ["ACCION: VER_CARTERA", "ACCION: GRAFICO_INVERSIONES", "ACCION: GRAFICO_EVOLUCION_CARTERA", "ACCION: GRAFICO_GASTOS", "ACCION: EXCEL", "ACCION: BORRAR_TODO", "ACCION: BORRAR_ULTIMO"]:
+        for tag in ["ACCION: VER_CARTERA", "ACCION: GRAFICO_INVERSIONES", "ACCION: GRAFICO_GASTOS", "ACCION: EXCEL", "ACCION: BORRAR_TODO", "ACCION: BORRAR_ULTIMO"]:
             texto_limpio = texto_limpio.replace(tag, "")
             
         id_a_borrar = None
         ticker_a_cotizar = None
-        ticker_grafico_evol = None
 
         if necesita_borrar_id:
             for linea in texto_limpio.splitlines():
                 if "ACCION: BORRAR_ID|" in linea:
                     try:
                         id_a_borrar = int(linea.split("ACCION: BORRAR_ID|")[1].strip())
-                    except Exception:
+                    except:
                         pass
                     texto_limpio = texto_limpio.replace(linea, "")
 
@@ -566,12 +469,6 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for linea in texto_limpio.splitlines():
                 if "ACCION: CONSULTA_PRECIO|" in linea:
                     ticker_a_cotizar = linea.split("ACCION: CONSULTA_PRECIO|")[1].strip()
-                    texto_limpio = texto_limpio.replace(linea, "")
-
-        if necesita_grafico_evol_activo:
-            for linea in texto_limpio.splitlines():
-                if "ACCION: GRAFICO_EVOLUCION_ACTIVO|" in linea:
-                    ticker_grafico_evol = linea.split("ACCION: GRAFICO_EVOLUCION_ACTIVO|")[1].strip()
                     texto_limpio = texto_limpio.replace(linea, "")
 
         texto_limpio = texto_limpio.strip()
@@ -587,7 +484,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cant = float(datos[3]) if len(datos) > 3 and datos[3] not in ["0", ""] else None
             
             t, c, p, m = registrar_operacion_inversion(ticker, monto, p_compra, cant)
-            texto_limpio = f"{texto_usuario}\n\n💼 *(Guardado en Cartera: {c:,.4f} {t} a PPC ${p:,.2f} USD \vert{} Total:${m:,.2f} USD)*"
+            texto_limpio = f"{texto_usuario}\n\n💼 *(Guardado en Cartera: {c:,.4f} {t} a PPC ${p:,.2f} USD | Total: ${m:,.2f} USD)*"
 
         # Registro Gasto/Ingreso ARS
         if registro_ars and not registro_inv and not necesita_precio:
@@ -612,47 +509,26 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if eliminado:
                 texto_limpio += f"\n\n🗑️ *(Eliminado ID {eliminado[0]})*"
 
-        # Cotización puntual en vivo
+        # Si consultó precio en vivo de una acción / cripto
         if ticker_a_cotizar:
             datos_mkt = consultar_datos_mercado(ticker_a_cotizar)
             if datos_mkt:
                 signo = "+" if datos_mkt["var_pct"] >= 0 else ""
                 emoji = "🟢" if datos_mkt["var_pct"] >= 0 else "🔴"
-                rango_txt = f"\n• Rango del día: ${datos_mkt['day_low']:,.2f} -${datos_mkt['day_high']:,.2f} USD" if datos_mkt["day_high"] else ""
+                rango_txt = f"\n• *Rango del día:* ${datos_mkt['day_low']:,.2f} - ${datos_mkt['day_high']:,.2f} USD" if datos_mkt["day_high"] else ""
                 
                 msg_mkt = (
-                    f"📈 {datos_mkt['ticker']} en vivo:\n\n"
-                    f"• Precio actual: ${datos_mkt['precio']:,.2f} USD\n"
-                    f"• Variación del día: {emoji} {signo}${datos_mkt['var_usd']:,.2f} USD ({signo}{datos_mkt['var_pct']:.2f}%)\n"
-                    f"• Cierre anterior: ${datos_mkt['prev_close']:,.2f} USD"
+                    f"📈 *{datos_mkt['ticker']} en vivo:*\n\n"
+                    f"• *Precio actual:* ${datos_mkt['precio']:,.2f} USD\n"
+                    f"• *Variación del día:* {emoji} {signo}${datos_mkt['var_usd']:,.2f} USD ({signo}{datos_mkt['var_pct']:.2f}%)\n"
+                    f"• *Cierre anterior:* ${datos_mkt['prev_close']:,.2f} USD"
                     f"{rango_txt}"
                 )
                 texto_limpio = f"{texto_limpio}\n\n{msg_mkt}".strip()
             else:
                 texto_limpio += f"\n\n⚠️ No pude obtener la cotización de `{ticker_a_cotizar}` en este momento."
 
-        # Envío seguro de texto principal (fallback si Markdown falla)
-        if texto_limpio:
-            try:
-                await update.message.reply_text(texto_limpio, parse_mode="Markdown")
-            except Exception:
-                await update.message.reply_text(texto_limpio)
-
-        # Gráfico de evolución de activo puntual (Línea)
-        if ticker_grafico_evol:
-            buf_img = generar_grafico_evolucion_activo(ticker_grafico_evol)
-            if buf_img:
-                await update.message.reply_photo(photo=buf_img, caption=f"📈 Evolución de {ticker_grafico_evol} en los últimos 6 meses.")
-            else:
-                await update.message.reply_text(f"⚠️ No pude generar la curva de evolución para `{ticker_grafico_evol}`.")
-
-        # Gráfico de evolución comparativa de la cartera (Líneas comparadas)
-        if necesita_grafico_evol_cartera:
-            buf_img = generar_grafico_evolucion_cartera()
-            if buf_img:
-                await update.message.reply_photo(photo=buf_img, caption="📈 Evolución relativa de tus activos en los últimos 6 meses (Base 100).")
-            else:
-                await update.message.reply_text("No hay suficientes activos en tu cartera para armar la comparativa.")
+        await update.message.reply_text(texto_limpio, parse_mode="Markdown")
 
         # Reporte de cartera
         if necesita_cartera:
@@ -664,11 +540,11 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 emoji_rend = "🟢" if resumen["pnl_total_usd"] >= 0 else "🔴"
                 
                 msg_rep = (
-                    f"💼 ESTADO DE TU CARTERA EN VIVO\n\n"
-                    f"• Capital Invertido: ${resumen['total_invertido']:,.2f} USD\n"
-                    f"• Valor de Mercado Actual: ${resumen['total_actual']:,.2f} USD\n"
-                    f"• Resultado Total (PnL): {emoji_rend} {signo}${resumen['pnl_total_usd']:,.2f} USD ({signo}{resumen['pnl_total_pct']:.2f}%)\n\n"
-                    f"📊 Detalle por Activo:\n"
+                    f"💼 *ESTADO DE TU CARTERA EN VIVO*\n\n"
+                    f"• *Capital Invertido:* ${resumen['total_invertido']:,.2f} USD\n"
+                    f"• *Valor de Mercado Actual:* ${resumen['total_actual']:,.2f} USD\n"
+                    f"• *Resultado Total (PnL):* {emoji_rend} {signo}${resumen['pnl_total_usd']:,.2f} USD ({signo}{resumen['pnl_total_pct']:.2f}%)\n\n"
+                    f"📊 *Detalle por Activo:*\n"
                 )
                 
                 for pos in resumen["posiciones"]:
@@ -676,17 +552,13 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     em = "🟢" if pos["pnl_usd"] >= 0 else "🔴"
                     peso = (pos['valor_mercado'] / resumen['total_actual'] * 100) if resumen['total_actual'] > 0 else 0
                     msg_rep += (
-                        f"▪️ {pos['ticker']} ({peso:.1f}% de cartera):\n"
+                        f"▪️ *{pos['ticker']}* ({peso:.1f}% de cartera):\n"
                         f"   - Tenencia: {pos['cantidad']:,.4f} acc/tokens\n"
-                        f"   - PPC: ${pos['ppc']:,.2f} \vert{} Precio hoy:${pos['precio_actual']:,.2f} USD\n"
+                        f"   - PPC: ${pos['ppc']:,.2f} | Precio hoy: ${pos['precio_actual']:,.2f} USD\n"
                         f"   - PnL: {em} {pnl_s}${pos['pnl_usd']:,.2f} USD ({pnl_s}{pos['pnl_pct']:.2f}%)\n\n"
                     )
-                try:
-                    await update.message.reply_text(msg_rep, parse_mode="Markdown")
-                except Exception:
-                    await update.message.reply_text(msg_rep)
+                await update.message.reply_text(msg_rep, parse_mode="Markdown")
 
-        # Gráficos de torta
         if necesita_grafico_inv:
             buf_img = generar_grafico_distribucion_inversiones()
             if buf_img:
@@ -701,7 +573,6 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await update.message.reply_text("No tienes gastos en ARS registrados para graficar.")
 
-        # Excel completo
         if necesita_excel:
             excel_buf = generar_excel_completo()
             if excel_buf:
