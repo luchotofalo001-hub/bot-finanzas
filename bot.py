@@ -81,18 +81,50 @@ def init_db():
                         precio_liquidacion NUMERIC DEFAULT NULL
                     );
                 """)
-                # Migración de columnas si no existen
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS trades_cerrados (
+                        id SERIAL PRIMARY KEY,
+                        user_id BIGINT,
+                        fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        ticker VARCHAR(20),
+                        tipo_posicion VARCHAR(10) DEFAULT 'SPOT',
+                        pnl_usd NUMERIC,
+                        roi_pct NUMERIC DEFAULT NULL,
+                        monto_invertido NUMERIC DEFAULT NULL,
+                        descripcion TEXT
+                    );
+                """)
+                # Migraciones y normalización de columnas
                 cursor.execute("ALTER TABLE movimientos ADD COLUMN IF NOT EXISTS user_id BIGINT;")
                 cursor.execute("ALTER TABLE portafolio_inversiones ADD COLUMN IF NOT EXISTS user_id BIGINT;")
                 cursor.execute("ALTER TABLE portafolio_inversiones ADD COLUMN IF NOT EXISTS tipo_posicion VARCHAR(10) DEFAULT 'SPOT';")
                 cursor.execute("ALTER TABLE portafolio_inversiones ADD COLUMN IF NOT EXISTS apalancamiento NUMERIC DEFAULT 1;")
                 cursor.execute("ALTER TABLE portafolio_inversiones ADD COLUMN IF NOT EXISTS precio_liquidacion NUMERIC DEFAULT NULL;")
+                cursor.execute("ALTER TABLE trades_cerrados ADD COLUMN IF NOT EXISTS user_id BIGINT;")
 
-                # Asignar todo el historial previo existente a Lucho para no perder nada
+                # Asignar todo lo previo huérfano a Lucho
                 cursor.execute("UPDATE movimientos SET user_id = %s WHERE user_id IS NULL;", (LUCHO_TELEGRAM_ID,))
                 cursor.execute("UPDATE portafolio_inversiones SET user_id = %s WHERE user_id IS NULL;", (LUCHO_TELEGRAM_ID,))
+                cursor.execute("UPDATE trades_cerrados SET user_id = %s WHERE user_id IS NULL;", (LUCHO_TELEGRAM_ID,))
+
+                # NORMALIZACIÓN AUTOMÁTICA DE POSICIONES ABIERTAS
+                cursor.execute("""
+                    UPDATE portafolio_inversiones 
+                    SET tipo_posicion = 'SPOT' 
+                    WHERE tipo_posicion IS NULL OR TRIM(tipo_posicion) = '';
+                """)
+                cursor.execute("""
+                    UPDATE portafolio_inversiones 
+                    SET apalancamiento = 1 
+                    WHERE apalancamiento IS NULL OR apalancamiento <= 0;
+                """)
+                cursor.execute("""
+                    UPDATE portafolio_inversiones 
+                    SET precio_compra = monto_total_usd / cantidad 
+                    WHERE (precio_compra IS NULL OR precio_compra <= 0) AND cantidad > 0;
+                """)
                 conn.commit()
-        logger.info("Tablas inicializadas y migradas con multiusuario.")
+        logger.info("Tablas inicializadas y posiciones abiertas normalizadas con éxito.")
     except Exception as e:
         logger.error(f"Error en init_db: {e}")
 
@@ -157,7 +189,7 @@ def obtener_precio_actual(ticker: str):
         return datos["precio"], datos["ticker"]
     return None, ticker
 
-# ==================== CÁLCULO DE FECHAS SEGÚN PERIODO DINÁMICO ====================
+# ==================== CÁLCULO DE FECHAS SEGÚN PERIODO ====================
 def resolver_fecha_inicio(periodo_str: str, fecha_compra_db: str = None):
     p = periodo_str.strip().lower() if periodo_str else ""
     hoy = datetime.now()
@@ -189,7 +221,7 @@ def resolver_fecha_inicio(periodo_str: str, fecha_compra_db: str = None):
     
     return (hoy - timedelta(days=180)).strftime('%Y-%m-%d'), "Últimos 6 meses"
 
-# ==================== GRÁFICOS DE EVOLUCIÓN HISTÓRICA POR USUARIO ====================
+# ==================== GRÁFICOS DE EVOLUCIÓN HISTÓRICA ====================
 def generar_grafico_evolucion_activo(user_id: int, ticker: str, periodo_solicitado: str = ""):
     ticker = ticker.strip().upper()
     simbolo = normalizar_ticker_yf(ticker)
@@ -354,12 +386,90 @@ def registrar_operacion_inversion(user_id: int, ticker: str, monto_usd: float, p
                 )
             else:
                 cursor.execute(
-                    """INSERT INTO portafolio_inversiones (user_id, fecha, ticker, cantidad, precio_compra, monto_total_usd, tipo_posicion, apalancamiento, precio_liquidacion)
+                    """INSERT INTO portafolio_inversIONES (user_id, fecha, ticker, cantidad, precio_compra, monto_total_usd, tipo_posicion, apalancamiento, precio_liquidacion)
                        VALUES (%s, NOW(), %s, %s, %s, %s, %s, %s, %s);""",
                     (user_id, ticker, float(cantidad), float(precio_compra), float(monto_usd), tipo_pos, float(lev), float(precio_liq) if precio_liq else None)
                 )
             conn.commit()
     return ticker, cantidad, precio_compra, monto_usd, fecha_limpia, tipo_pos, lev, precio_liq
+
+# ==================== TRADES CERRADOS Y CIERRE DE POSICIONES ABIERTAS ====================
+def registrar_trade_cerrado(user_id: int, ticker: str, pnl_usd: float, tipo_posicion: str = "SPOT", roi_pct: float = None, monto_invertido: float = None, descripcion: str = "", fecha_str: str = None):
+    ticker = ticker.strip().upper()
+    tipo_pos = tipo_posicion.strip().upper() if tipo_posicion else "SPOT"
+    
+    fecha_limpia = None
+    if fecha_str:
+        f_cand = fecha_str.strip().split()[0]
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", f_cand):
+            fecha_limpia = f_cand
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            if fecha_limpia:
+                cursor.execute(
+                    """INSERT INTO trades_cerrados (user_id, fecha, ticker, tipo_posicion, pnl_usd, roi_pct, monto_invertido, descripcion)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id;""",
+                    (user_id, fecha_limpia, ticker, tipo_pos, float(pnl_usd), float(roi_pct) if roi_pct else None, float(monto_invertido) if monto_invertido else None, descripcion)
+                )
+            else:
+                cursor.execute(
+                    """INSERT INTO trades_cerrados (user_id, fecha, ticker, tipo_posicion, pnl_usd, roi_pct, monto_invertido, descripcion)
+                       VALUES (%s, NOW(), %s, %s, %s, %s, %s, %s) RETURNING id;""",
+                    (user_id, ticker, tipo_pos, float(pnl_usd), float(roi_pct) if roi_pct else None, float(monto_invertido) if monto_invertido else None, descripcion)
+                )
+            new_id = cursor.fetchone()[0]
+            conn.commit()
+            return new_id, ticker, pnl_usd, tipo_pos, roi_pct, fecha_limpia
+
+def cerrar_posicion_abierta_por_id(user_id: int, inv_id: int, pnl_manual: float = None, precio_salida_manual: float = None):
+    """Cierra una posición que estaba en portafolio_inversiones y la pasa a trades_cerrados"""
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT id, ticker, cantidad, precio_compra, monto_total_usd, tipo_posicion, apalancamiento FROM portafolio_inversiones WHERE id = %s AND user_id = %s;",
+                (inv_id, user_id)
+            )
+            reg = cursor.fetchone()
+            if not reg:
+                return None, "Posición abierta no encontrada"
+            
+            _, ticker, cant, ppc, margen, tipo_pos, lev = reg
+            cant, ppc, margen, lev = float(cant), float(ppc), float(margen), float(lev)
+            tipo_pos = str(tipo_pos).upper() if tipo_pos else "SPOT"
+            
+            if pnl_manual is not None:
+                pnl_final = float(pnl_manual)
+            else:
+                spot = float(precio_salida_manual) if precio_salida_manual else obtener_precio_actual(ticker)[0]
+                if spot is None:
+                    spot = ppc
+                if tipo_pos == "SHORT":
+                    pnl_final = margen * ((ppc - spot) / ppc) * lev
+                elif tipo_pos == "LONG":
+                    pnl_final = margen * ((spot - ppc) / ppc) * lev
+                else: # SPOT
+                    pnl_final = (cant * spot) - margen
+            
+            roi_final = (pnl_final / margen * 100) if margen > 0 else 0.0
+            desc = f"Posición cerrada (Entrada: ${ppc:,.2f})"
+
+            cursor.execute(
+                """INSERT INTO trades_cerrados (user_id, fecha, ticker, tipo_posicion, pnl_usd, roi_pct, monto_invertido, descripcion)
+                   VALUES (%s, NOW(), %s, %s, %s, %s, %s, %s) RETURNING id;""",
+                (user_id, ticker, tipo_pos, pnl_final, roi_final, margen, desc)
+            )
+            nuevo_tc_id = cursor.fetchone()[0]
+            cursor.execute("DELETE FROM portafolio_inversiones WHERE id = %s AND user_id = %s;", (inv_id, user_id))
+            conn.commit()
+            return {
+                "tc_id": nuevo_tc_id,
+                "ticker": ticker,
+                "tipo_pos": tipo_pos,
+                "pnl_usd": pnl_final,
+                "roi_pct": roi_final,
+                "margen": margen
+            }, "Posición cerrada exitosamente"
 
 def modificar_inversion_por_id(user_id: int, inv_id: int, campo: str, nuevo_valor: str):
     campo = campo.strip().lower()
@@ -557,7 +667,7 @@ def generar_grafico_distribucion_inversiones(user_id: int):
         colors=colores[:len(agrup)],
         wedgeprops=dict(width=0.6, edgecolor='w')
     )
-    plt.title('Distribución de Cartera de Inversiones (USD)', fontsize=14, pad=20)
+    plt.title('Distribución de Posiciones Abiertas (USD)', fontsize=14, pad=20)
     plt.tight_layout()
     buf = io.BytesIO()
     plt.savefig(buf, format='png', dpi=200)
@@ -565,38 +675,66 @@ def generar_grafico_distribucion_inversiones(user_id: int):
     plt.close()
     return buf
 
-# ==================== MOTOR DE MÉTRICAS ANALÍTICAS AVANZADAS POR USUARIO ====================
+# ==================== MOTOR DE MÉTRICAS ANALÍTICAS AVANZADAS ====================
 def calcular_super_metricas_totales(user_id: int):
     metricas = []
     
-    # Inversiones USD
+    # 1. PnL Realizado de Trades Cerrados
+    pnl_realizado_total = 0.0
+    cant_trades_cerrados = 0
+    try:
+        with get_db_connection() as conn:
+            df_tc = pd.read_sql("SELECT id, fecha, ticker, tipo_posicion, pnl_usd, roi_pct, monto_invertido, descripcion FROM trades_cerrados WHERE user_id = %s ORDER BY fecha ASC;", conn, params=(user_id,))
+        if not df_tc.empty:
+            pnl_realizado_total = float(df_tc['pnl_usd'].sum())
+            cant_trades_cerrados = len(df_tc)
+            trades_ganadores = len(df_tc[df_tc['pnl_usd'] > 0])
+            win_rate = (trades_ganadores / cant_trades_cerrados * 100) if cant_trades_cerrados > 0 else 0.0
+            
+            metricas.append("=== TRADES CERRADOS (GANANCIAS REALIZADAS EN BOLSILLO) ===")
+            metricas.append(f"• PnL Realizado Total: ${pnl_realizado_total:+,.2f} USD")
+            metricas.append(f"• Operaciones cerradas registradas: {cant_trades_cerrados} (Win Rate: {win_rate:.1f}%)")
+            metricas.append("• Desglose de Trades Cerrados:")
+            for _, tc in df_tc.iterrows():
+                roi_txt = f" ({tc['roi_pct']:+.2f}%)" if pd.notnull(tc['roi_pct']) else ""
+                metricas.append(f"   - [{tc['fecha'].strftime('%Y-%m-%d')}] {tc['ticker']} ({tc['tipo_posicion']}): PnL ${tc['pnl_usd']:+,.2f} USD{roi_txt} - {tc['descripcion']}")
+        else:
+            metricas.append("=== TRADES CERRADOS: Sin historial de ganancias realizadas cargado ===")
+    except Exception as e:
+        logger.error(f"Error métricas trades cerrados: {e}")
+
+    # 2. Posiciones Abiertas
     try:
         resumen = obtener_resumen_portafolio(user_id)
         if resumen and resumen["posiciones"]:
-            metricas.append("=== MÉTRICAS DE CARTERA (SPOT & FUTUROS USD) ===")
-            metricas.append(f"• Margen / Capital Invertido Total: ${resumen['total_invertido']:,.2f} USD")
-            metricas.append(f"• Valoración Actual de Cartera: ${resumen['total_actual']:,.2f} USD")
-            metricas.append(f"• PnL Neto Consolidado: ${resumen['pnl_total_usd']:,.2f} USD ({resumen['pnl_total_pct']:+.2f}%)")
+            pnl_no_realizado = resumen['pnl_total_usd']
+            pnl_neto_global_combinado = pnl_realizado_total + pnl_no_realizado
+            
+            metricas.append("\n=== CARTERA ACTUAL (TRADES / POSICIONES ABIERTAS) ===")
+            metricas.append(f"• Capital/Margen Total Abierto: ${resumen['total_invertido']:,.2f} USD")
+            metricas.append(f"• Valor de Mercado Actual: ${resumen['total_actual']:,.2f} USD")
+            metricas.append(f"• PnL Flotante (No Realizado): ${pnl_no_realizado:+,.2f} USD ({resumen['pnl_total_pct']:+.2f}%)")
+            metricas.append(f"• PnL TOTAL HISTÓRICO CONSOLIDADO (Realizado + Flotante): ${pnl_neto_global_combinado:+,.2f} USD")
             
             pos_ordenadas = sorted(resumen["posiciones"], key=lambda x: x['pnl_pct'], reverse=True)
             top = pos_ordenadas[0]
             worst = pos_ordenadas[-1]
-            metricas.append(f"• Posición más rentable (Top ROI): {top['ticker']} ({top['tipo_pos']} {top['lev']:.0f}x) con {top['pnl_pct']:+.2f}% (${top['pnl_usd']:,.2f} USD)")
-            metricas.append(f"• Posición más rezagada: {worst['ticker']} ({worst['tipo_pos']} {worst['lev']:.0f}x) con {worst['pnl_pct']:+.2f}% (${worst['pnl_usd']:,.2f} USD)")
+            metricas.append(f"• Posición abierta más rentable: {top['ticker']} ({top['tipo_pos']} {top['lev']:.0f}x) con {top['pnl_pct']:+.2f}% (${top['pnl_usd']:,.2f} USD)")
+            metricas.append(f"• Posición abierta más rezagada: {worst['ticker']} ({worst['tipo_pos']} {worst['lev']:.0f}x) con {worst['pnl_pct']:+.2f}% (${worst['pnl_usd']:,.2f} USD)")
             
-            metricas.append("• Detalle de Posiciones:")
+            metricas.append("• Detalle de Posiciones Abiertas:")
             for p in resumen["posiciones"]:
                 liq_txt = f" | Liq: ${p['precio_liq']:,.2f}" if p['precio_liq'] else ""
                 lev_txt = f" [{p['tipo_pos']} {p['lev']:.0f}x]" if p['tipo_pos'] != "SPOT" else " [SPOT]"
                 metricas.append(
-                    f"   - ID {p['id']}: {p['ticker']}{lev_txt} | Margen: ${p['costo_margen']:,.2f} USD | PPC: ${p['ppc']:,.2f} | Spot: ${p['spot']:,.2f} | PnL: ${p['pnl_usd']:,.2f} ({p['pnl_pct']:+.2f}%){liq_txt}"
+                    f"   - ID {p['id']}: {p['ticker']}{lev_txt} (ABIERTO) | Margen: ${p['costo_margen']:,.2f} USD | PPC: ${p['ppc']:,.2f} | Spot: ${p['spot']:,.2f} | PnL: ${p['pnl_usd']:,.2f} ({p['pnl_pct']:+.2f}%){liq_txt}"
                 )
         else:
-            metricas.append("=== INVERSIONES: Sin posiciones activas cargadas ===")
+            metricas.append("\n=== CARTERA ACTUAL: Sin trades o posiciones abiertas ===")
     except Exception as e:
         logger.error(f"Error métricas de inversión: {e}")
 
-    # Flujo de caja ARS
+    # 3. Flujo de caja ARS
     try:
         with get_db_connection() as conn:
             df_mov = pd.read_sql("SELECT id, fecha, tipo, monto, categoria, descripcion FROM movimientos WHERE user_id = %s ORDER BY fecha ASC;", conn, params=(user_id,))
@@ -612,14 +750,7 @@ def calcular_super_metricas_totales(user_id: int):
             metricas.append("\n=== FLUJO DE CAJA (ARS) ===")
             metricas.append(f"• Ingresos Totales: ${tot_i:,.2f} ARS")
             metricas.append(f"• Gastos Totales: ${tot_g:,.2f} ARS")
-            metricas.append(f"• Superávit/Ahorro Neto: ${ahorro:,.2f} ARS")
-            metricas.append(f"• Tasa de Ahorro: {tasa_ahorro:.2f}%")
-            if not df_gastos.empty:
-                df_gastos['mes_ano'] = df_gastos['fecha'].dt.to_period('M').astype(str)
-                prom_m = df_gastos.groupby('mes_ano')['monto'].sum().mean()
-                max_g = df_gastos.sort_values(by='monto', ascending=False).iloc[0]
-                metricas.append(f"• Gasto promedio mensual: ${prom_m:,.2f} ARS")
-                metricas.append(f"• Mayor gasto individual: ${max_g['monto']:,.2f} ARS en {max_g['categoria']} ({max_g['descripcion']} el {max_g['fecha'].strftime('%Y-%m-%d')})")
+            metricas.append(f"• Superávit/Ahorro Neto: ${ahorro:,.2f} ARS (Tasa: {tasa_ahorro:.2f}%)")
     except Exception as e:
         logger.error(f"Error métricas ARS: {e}")
 
@@ -630,29 +761,33 @@ def obtener_historial_completo_texto(user_id: int):
     lineas = []
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
-            cursor.execute("SELECT id, fecha, tipo, monto, categoria, descripcion FROM movimientos WHERE user_id = %s ORDER BY fecha DESC LIMIT 40;", (user_id,))
+            cursor.execute("SELECT id, fecha, tipo, monto, categoria, descripcion FROM movimientos WHERE user_id = %s ORDER BY fecha DESC LIMIT 30;", (user_id,))
             movs = cursor.fetchall()
             if movs:
                 lineas.append("📋 GASTOS E INGRESOS (ARS):")
                 for m in movs:
-                    lineas.append(f"- ID {m[0]} | Fecha: {m[1].strftime('%Y-%m-%d %H:%M')} | {m[2]}: ${m[3]:,.2f} ARS | Cat: {m[4]} | Desc: {m[5]}")
-            else:
-                lineas.append("📋 GASTOS E INGRESOS: Sin registros.")
+                    lineas.append(f"- ID {m[0]} | Fecha: {m[1].strftime('%Y-%m-%d')} | {m[2]}: ${m[3]:,.2f} ARS | {m[4]} | {m[5]}")
 
             cursor.execute(
-                "SELECT id, fecha, ticker, cantidad, precio_compra, monto_total_usd, tipo_posicion, apalancamiento, precio_liquidacion FROM portafolio_inversiones WHERE user_id = %s ORDER BY fecha DESC LIMIT 40;",
+                "SELECT id, fecha, ticker, cantidad, precio_compra, monto_total_usd, tipo_posicion, apalancamiento, precio_liquidacion FROM portafolio_inversiones WHERE user_id = %s ORDER BY fecha DESC LIMIT 30;",
                 (user_id,)
             )
             invs = cursor.fetchall()
-            lineas.append("\n💼 INVERSIONES Y FUTUROS (USD):")
+            lineas.append("\n💼 POSICIONES / TRADES ABIERTOS (USD):")
             if invs:
                 for inv in invs:
                     tipo_p = inv[6] if inv[6] else "SPOT"
                     lev_p = f" x{inv[7]:.0f}" if inv[7] and inv[7] > 1 else ""
                     liq_p = f" | Liq: ${inv[8]:,.2f}" if inv[8] else ""
-                    lineas.append(f"- ID {inv[0]} (INV) | Fecha: {inv[1].strftime('%Y-%m-%d')} | {inv[2]} [{tipo_p}{lev_p}] | Margen: ${inv[5]:,.2f} USD | PPC: ${inv[4]:,.2f} | Cant: {inv[3]:,.4f}{liq_p}")
-            else:
-                lineas.append("Sin inversiones registradas.")
+                    lineas.append(f"- ID {inv[0]} (INV ABIERTA) | Fecha: {inv[1].strftime('%Y-%m-%d')} | {inv[2]} [{tipo_p}{lev_p}] | Margen: ${inv[5]:,.2f} USD | PPC: ${inv[4]:,.2f}{liq_p}")
+
+            cursor.execute("SELECT id, fecha, ticker, tipo_posicion, pnl_usd, roi_pct, descripcion FROM trades_cerrados WHERE user_id = %s ORDER BY fecha DESC LIMIT 30;", (user_id,))
+            tcs = cursor.fetchall()
+            lineas.append("\n🏆 TRADES CERRADOS / GANANCIAS REALIZADAS (USD):")
+            if tcs:
+                for tc in tcs:
+                    roi_s = f" ({tc[5]:+.2f}%)" if tc[5] else ""
+                    lineas.append(f"- ID {tc[0]} (CERRADO) | Fecha: {tc[1].strftime('%Y-%m-%d')} | {tc[2]} ({tc[3]}): PnL ${tc[4]:+,.2f} USD{roi_s} | {tc[6]}")
     return "\n".join(lineas)
 
 def borrar_inversion_por_ticker(user_id: int, ticker: str):
@@ -675,6 +810,17 @@ def borrar_inversion_por_id(user_id: int, inv_id: int):
                 return reg
             return None
 
+def borrar_trade_cerrado_por_id(user_id: int, tc_id: int):
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT id, ticker, pnl_usd FROM trades_cerrados WHERE id = %s AND user_id = %s;", (tc_id, user_id))
+            reg = cursor.fetchone()
+            if reg:
+                cursor.execute("DELETE FROM trades_cerrados WHERE id = %s AND user_id = %s;", (tc_id, user_id))
+                conn.commit()
+                return reg
+            return None
+
 def borrar_movimiento_por_id(user_id: int, mov_id: int):
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
@@ -693,32 +839,34 @@ def borrar_ultimo_registro_general(user_id: int):
             ultimo_mov = cursor.fetchone()
             cursor.execute("SELECT 'INV' as origen, id, fecha, ticker, monto_total_usd FROM portafolio_inversiones WHERE user_id = %s ORDER BY id DESC LIMIT 1;", (user_id,))
             ultimo_inv = cursor.fetchone()
+            cursor.execute("SELECT 'TC' as origen, id, fecha, ticker, pnl_usd FROM trades_cerrados WHERE user_id = %s ORDER BY id DESC LIMIT 1;", (user_id,))
+            ultimo_tc = cursor.fetchone()
             
-            if not ultimo_mov and not ultimo_inv:
+            candidatos = []
+            if ultimo_mov: candidatos.append((ultimo_mov[2], 'MOV', ultimo_mov[1], f"Gasto/Ingreso {ultimo_mov[3]} ${ultimo_mov[4]:,.2f} ARS"))
+            if ultimo_inv: candidatos.append((ultimo_inv[2], 'INV', ultimo_inv[1], f"Posición abierta {ultimo_inv[3]} ${ultimo_inv[4]:,.2f} USD"))
+            if ultimo_tc: candidatos.append((ultimo_tc[2], 'TC', ultimo_tc[1], f"Trade cerrado {ultimo_tc[3]} PnL ${ultimo_tc[4]:+,.2f} USD"))
+
+            if not candidatos:
                 return None
-            if ultimo_mov and not ultimo_inv:
-                cursor.execute("DELETE FROM movimientos WHERE id = %s AND user_id = %s;", (ultimo_mov[1], user_id))
-                conn.commit()
-                return f"Gasto/Ingreso {ultimo_mov[3]} de ${ultimo_mov[4]:,.2f} ARS (ID {ultimo_mov[1]})"
-            if ultimo_inv and not ultimo_mov:
-                cursor.execute("DELETE FROM portafolio_inversiones WHERE id = %s AND user_id = %s;", (ultimo_inv[1], user_id))
-                conn.commit()
-                return f"Inversión de {ultimo_inv[3]} de ${ultimo_inv[4]:,.2f} USD (ID {ultimo_inv[1]})"
             
-            if ultimo_mov[2] >= ultimo_inv[2]:
-                cursor.execute("DELETE FROM movimientos WHERE id = %s AND user_id = %s;", (ultimo_mov[1], user_id))
-                conn.commit()
-                return f"Gasto/Ingreso {ultimo_mov[3]} de ${ultimo_mov[4]:,.2f} ARS (ID {ultimo_mov[1]})"
+            candidatos.sort(key=lambda x: x[0], reverse=True)
+            sel = candidatos[0]
+            if sel[1] == 'MOV':
+                cursor.execute("DELETE FROM movimientos WHERE id = %s AND user_id = %s;", (sel[2], user_id))
+            elif sel[1] == 'INV':
+                cursor.execute("DELETE FROM portafolio_inversiones WHERE id = %s AND user_id = %s;", (sel[2], user_id))
             else:
-                cursor.execute("DELETE FROM portafolio_inversiones WHERE id = %s AND user_id = %s;", (ultimo_inv[1], user_id))
-                conn.commit()
-                return f"Inversión de {ultimo_inv[3]} de ${ultimo_inv[4]:,.2f} USD (ID {ultimo_inv[1]})"
+                cursor.execute("DELETE FROM trades_cerrados WHERE id = %s AND user_id = %s;", (sel[2], user_id))
+            conn.commit()
+            return sel[3]
 
 def borrar_todos_los_movimientos(user_id: int):
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute("DELETE FROM movimientos WHERE user_id = %s;", (user_id,))
             cursor.execute("DELETE FROM portafolio_inversiones WHERE user_id = %s;", (user_id,))
+            cursor.execute("DELETE FROM trades_cerrados WHERE user_id = %s;", (user_id,))
             conn.commit()
 
 # ==================== GASTOS (ARS) ====================
@@ -771,55 +919,62 @@ def generar_excel_completo(user_id: int):
     with get_db_connection() as conn:
         df_mov = pd.read_sql("SELECT id, fecha, tipo, monto, categoria, descripcion FROM movimientos WHERE user_id = %s ORDER BY fecha ASC;", conn, params=(user_id,))
         df_inv = pd.read_sql("SELECT id, fecha, ticker, cantidad, precio_compra, monto_total_usd, tipo_posicion, apalancamiento, precio_liquidacion FROM portafolio_inversiones WHERE user_id = %s ORDER BY fecha ASC;", conn, params=(user_id,))
-    if df_mov.empty and df_inv.empty:
+        df_tc = pd.read_sql("SELECT id, fecha, ticker, tipo_posicion, pnl_usd, roi_pct, monto_invertido, descripcion FROM trades_cerrados WHERE user_id = %s ORDER BY fecha ASC;", conn, params=(user_id,))
+    if df_mov.empty and df_inv.empty and df_tc.empty:
         return None
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine='openpyxl') as writer:
         if not df_mov.empty:
             df_mov.to_excel(writer, sheet_name='Gastos_Ingresos_ARS', index=False)
         if not df_inv.empty:
-            df_inv.to_excel(writer, sheet_name='Inversiones_Spot_Futuros_USD', index=False)
+            df_inv.to_excel(writer, sheet_name='Posiciones_Abiertas_USD', index=False)
+        if not df_tc.empty:
+            df_tc.to_excel(writer, sheet_name='Trades_Cerrados_Ganancias', index=False)
     buf.seek(0)
     return buf
 
 # ==================== SYSTEM INSTRUCTION ====================
 SYSTEM_INSTRUCTION = """
-Eres un analista y asesor financiero cuantitativo institucional. Manejas dos mundos:
+Eres un analista y asesor financiero cuantitativo institucional. Manejas tres mundos:
 1. GASTOS E INGRESOS: Flujo cotidiano en Pesos Argentinos (ARS $).
-2. MERCADO E INVERSIONES: Activos en Dólares (USD $), incluyendo SPOT y POSICIONES APALANCADAS EN FUTUROS (LONG / SHORT).
+2. CARTERA ACTUAL: Trades o posiciones que ESTÁN ABIERTOS TODAVÍA en Dólares (USD $), incluyendo SPOT y FUTUROS (LONG / SHORT).
+3. TRADES CERRADOS / GANANCIAS REALIZADAS: Operaciones que YA SE CERRARON y cuyo dinero ya está en el bolsillo.
 
-DISPONES EN TIEMPO REAL DEL BLOQUE DE MÉTRICAS CUANTITATIVAS REALES Y DEL HISTORIAL COMPLETO CON IDS Y FECHAS DEL USUARIO QUE TE ESTÁ HABLANDO.
+TODOS LOS REGISTROS QUE APARECEN EN "POSICIONES / TRADES ABIERTOS" REPRESENTAN OPERACIONES QUE EL USUARIO TIENE ABIERTAS HOY EN DÍA.
 
-REGLAS DE REGISTRO DE INVERSIÓN O FUTUROS (EN UNA SOLA LÍNEA):
-- Si el usuario registra una inversión spot o posición en futuros (ej: "abrí un long en btc x10 con 500 usd a 60k", "short en sol x5 con 200 usd a 150", "compré 1000 usd de MELI el 29/05"):
-  Identifica TICKER, MARGEN_USD, PPC, CANTIDAD, FECHA_YYYY-MM-DD, TIPO_POS (SPOT / LONG / SHORT), APALANCAMIENTO (número, ej: 1, 5, 10), PRECIO_LIQ (si lo menciona, sino vacío).
-  Escribe obligatoriamente al final:
+REGLAS DE CIERRE DE POSICIÓN ABIERTA:
+- Si el usuario dice que cerró una posición que tenía abierta (ej: "cerré el trade de btc", "cerré la posición ID 2 con 150 usd de ganancia", "cerré el long de SOL a precio actual"):
+  Identifica el ID de la posición abierta (o el ticker) y el PnL obtenido si lo indica.
+  Escribe: ACCION: CERRAR_POSICION|[ID]|[PNL_USD_MANUAL_O_VACIO]|[PRECIO_SALIDA_O_VACIO]
+
+REGLAS DE REGISTRO DE TRADES CERRADOS PASADOS:
+- Si el usuario menciona una ganancia o trade pasado que ya cerró hace tiempo (ej: "gané 450 usd en un trade de sol el mes pasado"):
+  REGISTRO_TRADE_CERRADO: [TICKER]|[PNL_USD]|[TIPO_POS]|[ROI_PCT]|[MONTO_INVERTIDO]|[DESCRIPCION]|[FECHA_YYYY-MM-DD]
+
+REGLAS DE REGISTRO DE POSICIONES ABIERTAS (SPOT / FUTUROS):
+- Si el usuario abre un trade o compra activa:
   REGISTRO_INV: [TICKER]|[MARGEN_USD]|[PPC]|[CANTIDAD]|[FECHA_YYYY-MM-DD]|[TIPO_POS]|[APALANCAMIENTO]|[PRECIO_LIQ]
 
 REGLAS DE MODIFICACIÓN Y AGREGADO DE MARGEN:
-- Si el usuario agrega margen a un trade abierto sin modificar cantidad (ej: "le agregué 200 usd de margen a la inversión ID 2", "sumé 100 usd de colateral a BTC"):
-  ACCION: AGREGAR_MARGEN|[ID]|[MONTO_EXTRA_USD]
-- Si pide modificar o corregir algún dato de una inversión (ej: "modificá la inversión ID 3, el ppc era 62000", "en la inversión 2 el apalancamiento era 10x"):
-  ACCION: MODIFICAR_INVERSION|[ID]|[CAMPO]|[NUEVO_VALOR]
-- Si pide modificar un gasto o ingreso (ej: "corregí el gasto ID 4 a 15000"):
-  ACCION: MODIFICAR_MOVIMIENTO|[ID]|[CAMPO]|[NUEVO_VALOR]
+- Agregar margen: ACCION: AGREGAR_MARGEN|[ID]|[MONTO_EXTRA_USD]
+- Modificar posición abierta: ACCION: MODIFICAR_INVERSION|[ID]|[CAMPO]|[NUEVO_VALOR]
+- Modificar gasto/ingreso: ACCION: MODIFICAR_MOVIMIENTO|[ID]|[CAMPO]|[NUEVO_VALOR]
 
-REGLAS DE GRÁFICOS DE EVOLUCIÓN CON PERIODO EXACTO:
-- Activo específico con periodo (ej: "evolución de MELI los últimos 2 meses", "gráfico de BTC de los últimos 3 meses"):
-  ACCION: GRAFICO_EVOLUCION_ACTIVO|[TICKER]|[PERIODO_DETECTADO]
-- Cartera general con periodo (ej: "haceme una evolución del rendimiento de mi cartera los últimos meses", "evolución de mis inversiones los últimos 2 meses"):
-  ACCION: GRAFICO_EVOLUCION_CARTERA|[PERIODO_DETECTADO]
+REGLAS DE GRÁFICOS:
+- Activo específico con periodo: ACCION: GRAFICO_EVOLUCION_ACTIVO|[TICKER]|[PERIODO_DETECTADO]
+- Cartera general con periodo: ACCION: GRAFICO_EVOLUCION_CARTERA|[PERIODO_DETECTADO]
 
 REGLAS DE BORRADO:
 - Borrar por ticker: ACCION: BORRAR_INVERSION_TICKER|[TICKER]
-- Borrar inversión por ID: ACCION: BORRAR_INVERSION_ID|[ID]
+- Borrar posición abierta por ID: ACCION: BORRAR_INVERSION_ID|[ID]
+- Borrar trade cerrado por ID: ACCION: BORRAR_TRADE_CERRADO_ID|[ID]
 - Borrar movimiento ARS por ID: ACCION: BORRAR_MOVIMIENTO_ID|[ID]
 - Borrar último registro: ACCION: BORRAR_ULTIMO
 - Resetear todo: ACCION: BORRAR_TODO
 
 REGLAS GENERALES:
 - Registro ARS: REGISTRO_ARS: [TIPO]|[MONTO]|[CATEGORIA]|[DESCRIPCION]|[FECHA_YYYY-MM-DD]
-- Ver cartera: ACCION: VER_CARTERA
+- Ver cartera y balance: ACCION: VER_CARTERA
 - Cotización en vivo: ACCION: CONSULTA_PRECIO|[TICKER]
 - Gráfico torta inversiones: ACCION: GRAFICO_INVERSIONES
 - Gráfico torta gastos: ACCION: GRAFICO_GASTOS
@@ -828,24 +983,23 @@ REGLAS GENERALES:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 ¡Hola! Soy tu asistente financiero y analista institucional privado.\n\n"
+        "👋 ¡Hola! Soy tu asistente financiero y analista cuantitativo institucional.\n\n"
+        "🟢 Trades Abiertos (En Vivo):\n"
+        "• '¿Cómo vienen mis trades abiertos?'\n"
+        "• 'Cerré la posición ID 2 con 150 usd de ganancia'\n\n"
+        "🏆 Trades Cerrados y Ganancias Realizadas:\n"
+        "• 'Gané 450 usd en un trade de SOL el mes pasado'\n\n"
         "⚡ Futuros y Apalancamiento:\n"
         "• 'Abrí un Long en BTC x10 con 500 usd a 60.000'\n"
         "• 'Agregué 150 usd de margen a la posición ID 1'\n\n"
-        "✏️ Modificaciones:\n"
-        "• 'Modificá la inversión ID 2, el PPC era 62000'\n\n"
-        "📈 Gráficos Dinámicos:\n"
-        "• 'Evolución del rendimiento de mi cartera los últimos 2 meses'\n"
-        "• 'Gráfico de MELI de los últimos 3 meses'\n\n"
-        "💼 Cartera y Métricas:\n"
-        "• '¿Cuál es mi rendimiento total?' / '¿Cómo viene mi cartera?'\n"
-        "• 'Mandame un excel'"
+        "💼 Cartera Consolidada:\n"
+        "• '¿Cuál es mi balance total?' / 'Mandame un excel'"
     )
 
 async def cmd_borrar_todo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     borrar_todos_los_movimientos(user_id)
-    await update.message.reply_text("🗑️ Tu base de datos y cartera privadas han sido reseteadas.")
+    await update.message.reply_text("🗑️ Tu base de datos, cartera y trades cerrados han sido reseteados.")
 
 async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -903,6 +1057,22 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             periodo_cartera = m_gc.group(1).strip() if m_gc.group(1) else ""
             texto_limpio = texto_limpio.replace(m_gc.group(0), "")
 
+        # Cierre de posición abierta
+        m_close_pos = re.search(r"ACCION: CERRAR_POSICION\|(\d+)(?:\|([^|\n\r]*))?(?:\|([^\n\r]*))?", texto_limpio)
+        if m_close_pos:
+            c_inv_id = int(m_close_pos.group(1))
+            c_pnl = float(m_close_pos.group(2).strip()) if m_close_pos.group(2) and m_close_pos.group(2).strip() not in ["", "None"] else None
+            c_spot = float(m_close_pos.group(3).strip()) if m_close_pos.group(3) and m_close_pos.group(3).strip() not in ["", "None"] else None
+            texto_limpio = texto_limpio.replace(m_close_pos.group(0), "")
+            
+            res_cierre, msg_cierre = cerrar_posicion_abierta_por_id(user_id, c_inv_id, c_pnl, c_spot)
+            if res_cierre:
+                signo_pnl = "+" if res_cierre["pnl_usd"] >= 0 else ""
+                roi_str = f" ({res_cierre['roi_pct']:+.2f}%)" if res_cierre['roi_pct'] else ""
+                texto_limpio += f"\n\n🎯 *(Trade Cerrado con éxito: {res_cierre['ticker']} [{res_cierre['tipo_pos']}] | PnL Realizado: {signo_pnl}${res_cierre['pnl_usd']:,.2f} USD{roi_str} - Pasado a histórico ID {res_cierre['tc_id']})*"
+            else:
+                texto_limpio += f"\n\n⚠️ No se pudo cerrar la posición: {msg_cierre}"
+
         # Agregar margen
         m_add_m = re.search(r"ACCION: AGREGAR_MARGEN\|(\d+)\|([^\n\r]+)", texto_limpio)
         if m_add_m:
@@ -948,7 +1118,15 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             texto_limpio = texto_limpio.replace(m_bid.group(0), "")
             r_del = borrar_inversion_por_id(user_id, iid_b)
             if r_del:
-                texto_limpio += f"\n\n🗑️ *(Eliminada inversión ID {iid_b}: {r_del[1]})*"
+                texto_limpio += f"\n\n🗑️ *(Eliminada posición abierta ID {iid_b}: {r_del[1]})*"
+
+        m_btc_id = re.search(r"ACCION: BORRAR_TRADE_CERRADO_ID\|(\d+)", texto_limpio)
+        if m_btc_id:
+            tcid_b = int(m_btc_id.group(1))
+            texto_limpio = texto_limpio.replace(m_btc_id.group(0), "")
+            r_del = borrar_trade_cerrado_por_id(user_id, tcid_b)
+            if r_del:
+                texto_limpio += f"\n\n🗑️ *(Eliminado trade cerrado ID {tcid_b}: {r_del[1]})*"
 
         m_bmid = re.search(r"ACCION: BORRAR_MOVIMIENTO_ID\|(\d+)", texto_limpio)
         if m_bmid:
@@ -958,7 +1136,27 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if r_del:
                 texto_limpio += f"\n\n🗑️ *(Eliminado gasto/ingreso ID {mid_b})*"
 
-        # Registro Inversión
+        # Registro Trade Cerrado Pasado
+        match_tc = re.search(r"REGISTRO_TRADE_CERRADO:\s*([^\n\r]+)", texto_limpio)
+        if match_tc:
+            linea_tc = match_tc.group(1).strip()
+            texto_limpio = texto_limpio.replace(match_tc.group(0), "").strip()
+            partes = [p.strip() for p in linea_tc.split("|")]
+            tk_c = partes[0].upper()
+            pnl_c = float(partes[1])
+            tipo_c = partes[2].upper() if len(partes) > 2 and partes[2] not in ["", "None"] else "SPOT"
+            roi_c = float(partes[3]) if len(partes) > 3 and partes[3] not in ["", "None"] else None
+            monto_c = float(partes[4]) if len(partes) > 4 and partes[4] not in ["", "None"] else None
+            desc_c = partes[5] if len(partes) > 5 else "Trade cerrado"
+            f_c = partes[6].split()[0] if len(partes) > 6 and partes[6] not in ["", "None"] else None
+
+            tid, t, p, tp, r, f = registrar_trade_cerrado(user_id, tk_c, pnl_c, tipo_c, roi_c, monto_c, desc_c, f_c)
+            signo_p = "+" if p >= 0 else ""
+            roi_s = f" ({r:+.2f}%)" if r else ""
+            f_txt = f" - Fecha: {f}" if f else ""
+            texto_limpio = f"{texto_limpio}\n\n🏆 *(Trade Cerrado Registrado: {t} [{tp}] | PnL Realizado: {signo_p}${p:,.2f} USD{roi_s}{f_txt} - ID {tid})*".strip()
+
+        # Registro Inversión Abierta
         match_inv = re.search(r"REGISTRO_INV:\s*([^\n\r]+)", texto_limpio)
         if match_inv:
             linea_inv = match_inv.group(1).strip()
@@ -979,7 +1177,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             fecha_str = f" - Fecha: {f_reg}" if f_reg else ""
             lev_str = f" [{pos_t} {lev_t:.0f}x]" if pos_t != "SPOT" else " [SPOT]"
             liq_str = f" | Liq est: ${liq_t:,.2f}" if liq_t else ""
-            texto_limpio = f"{texto_limpio}\n\n💼 *(Guardado: {t}{lev_str} | Margen: ${m:,.2f} USD | PPC: ${p:,.2f} | Cant: {c:,.4f}{liq_str}{fecha_str})*".strip()
+            texto_limpio = f"{texto_limpio}\n\n💼 *(Guardado como Abierto: {t}{lev_str} | Margen: ${m:,.2f} USD | PPC: ${p:,.2f} | Cant: {c:,.4f}{liq_str}{fecha_str})*".strip()
 
         # Registro ARS
         match_ars = re.search(r"REGISTRO_ARS:\s*([^\n\r]+)", texto_limpio)
@@ -1001,7 +1199,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if necesita_borrar_todo:
             borrar_todos_los_movimientos(user_id)
-            texto_limpio += "\n\n🗑️ *(Tu base de datos y cartera privadas han sido reseteadas)*"
+            texto_limpio += "\n\n🗑️ *(Tu base de datos, cartera y trades cerrados han sido reseteados)*"
 
         if necesita_borrar_ultimo:
             res_ultimo = borrar_ultimo_registro_general(user_id)
@@ -1052,29 +1250,47 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Reporte de cartera
         if necesita_cartera:
             resumen = obtener_resumen_portafolio(user_id)
-            if not resumen:
-                await update.message.reply_text("📉 No tienes activos cargados en tu cartera todavía.")
+            
+            # Obtener PnL Realizado
+            with get_db_connection() as conn:
+                df_tc = pd.read_sql("SELECT SUM(pnl_usd) as pnl_tot, COUNT(id) as total_c FROM trades_cerrados WHERE user_id = %s;", conn, params=(user_id,))
+            pnl_realizado = float(df_tc['pnl_tot'].iloc[0]) if not df_tc.empty and pd.notnull(df_tc['pnl_tot'].iloc[0]) else 0.0
+            cant_c = int(df_tc['total_c'].iloc[0]) if not df_tc.empty and pd.notnull(df_tc['total_c'].iloc[0]) else 0
+            
+            if not resumen and cant_c == 0:
+                await update.message.reply_text("📉 No tienes activos ni trades cargados todavía.")
             else:
-                signo = "+" if resumen["pnl_total_usd"] >= 0 else ""
-                emoji_rend = "🟢" if resumen["pnl_total_usd"] >= 0 else "🔴"
+                total_inv = resumen['total_invertido'] if resumen else 0.0
+                total_act = resumen['total_actual'] if resumen else 0.0
+                pnl_flot = resumen['pnl_total_usd'] if resumen else 0.0
+                pnl_global = pnl_flot + pnl_realizado
+
+                em_flot = "🟢" if pnl_flot >= 0 else "🔴"
+                em_real = "🟢" if pnl_realizado >= 0 else "🔴"
+                em_glob = "🟢" if pnl_global >= 0 else "🔴"
+
                 msg_rep = (
-                    f"💼 ESTADO DE TU CARTERA (SPOT & FUTUROS)\n\n"
-                    f"• Margen / Capital Invertido: ${resumen['total_invertido']:,.2f} USD\n"
-                    f"• Valoración Actual: ${resumen['total_actual']:,.2f} USD\n"
-                    f"• Resultado Neto (PnL): {emoji_rend} {signo}${resumen['pnl_total_usd']:,.2f} USD ({signo}{resumen['pnl_total_pct']:.2f}%)\n\n"
-                    f"📊 Posiciones Abiertas:\n"
+                    f"💼 ESTADO DE TU CARTERA CONSOLIDADA\n\n"
+                    f"• Capital Abierto en Cartera: ${total_inv:,.2f} USD\n"
+                    f"• Valor Actual de Posiciones: ${total_act:,.2f} USD\n"
+                    f"• PnL Flotante (No Realizado): {em_flot} {pnl_flot:+,.2f} USD\n"
+                    f"• PnL Realizado (Trades Cerrados): {em_real} {pnl_realizado:+,.2f} USD ({cant_c} ops)\n"
+                    f"• RESULTADO NETO HISTÓRICO GLOBAL: {em_glob} {pnl_global:+,.2f} USD\n\n"
                 )
-                for pos in resumen["posiciones"]:
-                    pnl_s = "+" if pos["pnl_usd"] >= 0 else ""
-                    em = "🟢" if pos["pnl_usd"] >= 0 else "🔴"
-                    lev_tag = f"[{pos['tipo_pos']} {pos['lev']:.0f}x]" if pos['tipo_pos'] != "SPOT" else "[SPOT]"
-                    liq_tag = f"\n   - Liquidación est: ${pos['precio_liq']:,.2f} USD" if pos['precio_liq'] else ""
-                    msg_rep += (
-                        f"▪️ ID {pos['id']} | *{pos['ticker']}* {lev_tag}:\n"
-                        f"   - Margen: ${pos['costo_margen']:,.2f} USD | Cant: {pos['cantidad']:,.4f}\n"
-                        f"   - Entrada (PPC): ${pos['ppc']:,.2f} | Spot: ${pos['spot']:,.2f} USD\n"
-                        f"   - PnL (ROE): {em} {pnl_s}${pos['pnl_usd']:,.2f} USD ({pnl_s}{pos['pnl_pct']:.2f}%){liq_tag}\n\n"
-                    )
+
+                if resumen and resumen["posiciones"]:
+                    msg_rep += "📊 Posiciones / Trades Abiertos Actualmente:\n"
+                    for pos in resumen["posiciones"]:
+                        pnl_s = "+" if pos["pnl_usd"] >= 0 else ""
+                        em = "🟢" if pos["pnl_usd"] >= 0 else "🔴"
+                        lev_tag = f"[{pos['tipo_pos']} {pos['lev']:.0f}x]" if pos['tipo_pos'] != "SPOT" else "[SPOT]"
+                        liq_tag = f"\n   - Liquidación est: ${pos['precio_liq']:,.2f} USD" if pos['precio_liq'] else ""
+                        msg_rep += (
+                            f"▪️ ID {pos['id']} | *{pos['ticker']}* {lev_tag} (ABIERTO):\n"
+                            f"   - Margen: ${pos['costo_margen']:,.2f} USD | Cant: {pos['cantidad']:,.4f}\n"
+                            f"   - Entrada: ${pos['ppc']:,.2f} | Spot: ${pos['spot']:,.2f} USD\n"
+                            f"   - PnL Flotante: {em} {pnl_s}${pos['pnl_usd']:,.2f} USD ({pnl_s}{pos['pnl_pct']:.2f}%){liq_tag}\n\n"
+                        )
                 try:
                     await update.message.reply_text(msg_rep, parse_mode="Markdown")
                 except Exception:
@@ -1083,7 +1299,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if necesita_grafico_inv:
             buf_img = generar_grafico_distribucion_inversiones(user_id)
             if buf_img:
-                await update.message.reply_photo(photo=buf_img, caption="📊 Asset Allocation: Distribución actual de tu cartera.")
+                await update.message.reply_photo(photo=buf_img, caption="📊 Asset Allocation: Distribución de posiciones abiertas.")
 
         if necesita_grafico_gastos:
             buf_img = generar_grafico_gastos(user_id)
@@ -1095,8 +1311,8 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if excel_buf:
                 await update.message.reply_document(
                     document=excel_buf, 
-                    filename="Finanzas_Spot_y_Futuros.xlsx", 
-                    caption="📁 Planilla completa con hojas de Gastos (ARS) e Inversiones Spot y Futuros (USD)."
+                    filename="Finanzas_Consolidadas.xlsx", 
+                    caption="📁 Planilla completa con Gastos (ARS), Posiciones Abiertas (USD) y Trades Cerrados con Ganancias."
                 )
 
     except Exception as e:
