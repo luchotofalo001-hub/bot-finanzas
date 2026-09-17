@@ -3,6 +3,7 @@ import io
 import asyncio
 import logging
 import threading
+from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
@@ -143,7 +144,7 @@ def obtener_precio_actual(ticker: str):
         return datos["precio"], datos["ticker"]
     return None, ticker
 
-# ==================== GRÁFICOS DE EVOLUCIÓN HISTÓRICA CON FECHA DE COMPRA ====================
+# ==================== GRÁFICOS DE EVOLUCIÓN HISTÓRICA CON FECHA ====================
 def generar_grafico_evolucion_activo(ticker: str, periodo_default: str = "6mo"):
     ticker = ticker.strip().upper()
     simbolo = f"{ticker}-USD" if ticker in ["BTC", "ETH", "SOL", "BNB", "ADA", "XRP"] else ticker
@@ -151,7 +152,6 @@ def generar_grafico_evolucion_activo(ticker: str, periodo_default: str = "6mo"):
     fecha_inicio = None
     ppc_referencia = None
     
-    # 1. Buscar si tenemos compras registradas de este activo para fijar la fecha de inicio real
     try:
         with get_db_connection() as conn:
             df_inv = pd.read_sql(
@@ -166,8 +166,6 @@ def generar_grafico_evolucion_activo(ticker: str, periodo_default: str = "6mo"):
 
     try:
         t = yf.Ticker(simbolo)
-        
-        # Si compraste el activo, el gráfico arranca en tu fecha de compra. Si no, usa el periodo por defecto.
         if fecha_inicio:
             df_hist = t.history(start=fecha_inicio)
         else:
@@ -184,7 +182,6 @@ def generar_grafico_evolucion_activo(ticker: str, periodo_default: str = "6mo"):
         if df_hist.empty:
             return None
 
-        # Si compró hace menos de 2 días y hay pocas velas diarias, ajustamos la escala
         plt.figure(figsize=(9, 5))
         color_linea = "#2b5c8f"
         plt.plot(df_hist.index, df_hist['Close'], label=f"{ticker} (USD)", color=color_linea, linewidth=2.2)
@@ -194,9 +191,9 @@ def generar_grafico_evolucion_activo(ticker: str, periodo_default: str = "6mo"):
             plt.axhline(y=ppc_referencia, color="#d62728", linestyle="--", linewidth=1.5, label=f"Tu PPC (${ppc_referencia:,.2f})")
             subtitulo = f"Desde tu primera compra ({fecha_inicio})"
         else:
-            subtitulo = f"Últimos 6 meses"
+            subtitulo = "Últimos 6 meses"
 
-        plt.title(f"Evolución de {ticker}\n{subtitulo}", fontsize=12, fontweight='bold', pad=12)
+        plt.title(f"Evolución Histórica: {ticker}\n{subtitulo}", fontsize=12, fontweight='bold', pad=12)
         plt.xlabel("Fecha")
         plt.ylabel("Precio USD")
         plt.grid(True, linestyle="--", alpha=0.4)
@@ -220,7 +217,6 @@ def generar_grafico_evolucion_cartera():
         if df.empty:
             return None
         
-        # Fecha de la compra más antigua de toda tu cartera
         primera_fecha_global = df['primera_compra'].min().strftime('%Y-%m-%d')
         
         datos_cierre = {}
@@ -228,7 +224,6 @@ def generar_grafico_evolucion_cartera():
             tk = row['ticker']
             sym = f"{tk}-USD" if tk in ["BTC", "ETH", "SOL", "BNB", "ADA", "XRP"] else tk
             try:
-                # Descargar datos desde la fecha en que empezaste a invertir en la cartera
                 h = yf.Ticker(sym).history(start=primera_fecha_global)
                 if not h.empty and h['Close'].iloc[0] > 0:
                     datos_cierre[tk] = (h['Close'] / h['Close'].iloc[0]) * 100
@@ -260,42 +255,8 @@ def generar_grafico_evolucion_cartera():
         logger.error(f"Error generando evolución de cartera: {e}")
         return None
 
-def generar_grafico_evolucion_cartera(periodo: str = "6mo"):
-    with get_db_connection() as conn:
-        df = pd.read_sql("SELECT DISTINCT ticker FROM portafolio_inversiones;", conn)
-    if df.empty:
-        return None
-    tickers = df['ticker'].tolist()
-    datos_cierre = {}
-    for tk in tickers:
-        sym = f"{tk}-USD" if tk in ["BTC", "ETH", "SOL", "BNB", "ADA", "XRP"] else tk
-        try:
-            h = yf.Ticker(sym).history(period=periodo)
-            if not h.empty and h['Close'].iloc[0] > 0:
-                datos_cierre[tk] = (h['Close'] / h['Close'].iloc[0]) * 100
-        except Exception:
-            pass
-    if not datos_cierre:
-        return None
-    df_comp = pd.DataFrame(datos_cierre)
-    plt.figure(figsize=(9, 5))
-    for col in df_comp.columns:
-        plt.plot(df_comp.index, df_comp[col], label=col, linewidth=2)
-    plt.axhline(y=100, color="gray", linestyle=":", alpha=0.7)
-    plt.title(f"Evolución de Rendimiento de Cartera (Base 100) - {periodo}", fontsize=13, fontweight='bold', pad=15)
-    plt.xlabel("Fecha")
-    plt.ylabel("Rendimiento Relativo (%)")
-    plt.grid(True, linestyle="--", alpha=0.4)
-    plt.legend(loc="upper left")
-    plt.tight_layout()
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png', dpi=200)
-    buf.seek(0)
-    plt.close()
-    return buf
-
 # ==================== INVERSIONES (USD) ====================
-def registrar_operacion_inversion(ticker: str, monto_usd: float, precio_compra: float = None, cantidad: float = None):
+def registrar_operacion_inversion(ticker: str, monto_usd: float, precio_compra: float = None, cantidad: float = None, fecha_compra: str = None):
     ticker = ticker.strip().upper()
     if (not precio_compra or precio_compra <= 0) and (not cantidad or cantidad <= 0):
         precio_mercado, _ = obtener_precio_actual(ticker)
@@ -306,15 +267,31 @@ def registrar_operacion_inversion(ticker: str, monto_usd: float, precio_compra: 
     elif monto_usd is None or monto_usd <= 0:
         monto_usd = cantidad * precio_compra
 
+    sql_fecha = "NOW()"
+    params = [ticker, float(cantidad), float(precio_compra), float(monto_usd)]
+    
+    if fecha_compra and fecha_compra.strip() != "":
+        sql_fecha = "%s"
+        params.insert(0, fecha_compra.strip())
+    else:
+        params.insert(0, None)
+
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
-            cursor.execute(
-                """INSERT INTO portafolio_inversiones (fecha, ticker, cantidad, precio_compra, monto_total_usd)
-                   VALUES (NOW(), %s, %s, %s, %s);""",
-                (ticker, float(cantidad), float(precio_compra), float(monto_usd))
-            )
+            if params[0] is not None:
+                cursor.execute(
+                    """INSERT INTO portafolio_inversiones (fecha, ticker, cantidad, precio_compra, monto_total_usd)
+                       VALUES (%s, %s, %s, %s, %s);""",
+                    (params[0], params[1], params[2], params[3], params[4])
+                )
+            else:
+                cursor.execute(
+                    """INSERT INTO portafolio_inversiones (fecha, ticker, cantidad, precio_compra, monto_total_usd)
+                       VALUES (NOW(), %s, %s, %s, %s);""",
+                    (params[1], params[2], params[3], params[4])
+                )
             conn.commit()
-    return ticker, cantidad, precio_compra, monto_usd
+    return ticker, cantidad, precio_compra, monto_usd, fecha_compra
 
 def obtener_resumen_portafolio():
     with get_db_connection() as conn:
@@ -529,18 +506,19 @@ REGLAS DE PRECIO Y MERCADO:
 REGLAS DE GRÁFICO DE EVOLUCIÓN:
 - Si el usuario pide evolución o histórico de un activo específico (ej: "gráfico de evolución de MELI", "evolución de BTC"):
   ACCION: GRAFICO_EVOLUCION_ACTIVO|[TICKER]
-- Si pide la evolución, histórico o curva de rendimiento de TODA SU CARTERA o de sus inversiones en general (ej: "evolución de toda mi cartera", "gráfico con la evolución del rendimiento de mi cartera", "cómo viene la evolución de mis inversiones"):
+- Si pide la evolución, histórico o curva de rendimiento de TODA SU CARTERA o de sus inversiones en general (ej: "evolución de toda mi cartera", "gráfico con la evolución del rendimiento de mi cartera"):
   ACCION: GRAFICO_EVOLUCION_CARTERA
 
 REGLAS DE COMPRA / APORTE A CARTERA:
-- Si el usuario indica compra de activos (ej: "compre 1000 usd de MELI", "compre 0.5 BTC a 62000"):
+- Si el usuario indica compra de activos (ej: "compre 1000 usd de MELI", "el 27/6 compre 100 usd de btc a ppc de 60k", "compre 0.5 BTC a 62000"):
+  Identifica TICKER, MONTO_USD, PRECIO_COMPRA, CANTIDAD y FECHA (si la menciona, formateala a YYYY-MM-DD. Asume el año corriente si no lo dice. Si no dice fecha, pon VACÍO).
   Agrega al final:
-  REGISTRO_INV: [TICKER]|[MONTO_USD]|[PRECIO_COMPRA]|[CANTIDAD]
+  REGISTRO_INV: [TICKER]|[MONTO_USD]|[PRECIO_COMPRA]|[CANTIDAD]|[FECHA_YYYY-MM-DD]
 
 REGLAS DE SEGUIMIENTO DE CARTERA:
 - Si pregunta por el resumen, estado actual o balance de su cartera propia:
   ACCION: VER_CARTERA
-- Si pide gráfico de distribución (torta) de cartera de inversión (ej: "distribución de mis activos", "gráfico de torta de mi cartera"):
+- Si pide gráfico de distribución (torta) de cartera de inversión:
   ACCION: GRAFICO_INVERSIONES
 
 REGLAS DE GASTOS ARS:
@@ -558,7 +536,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• 'gráfico de evolución de MELI' (Línea histórica 📈)\n"
         "• 'evolución del rendimiento de mi cartera' (Líneas comparativas)\n\n"
         "📈 Cartera (USD):\n"
-        "• 'compré 1000 usd de MELI'\n"
+        "• 'el 27/6 compré 100 usd de BTC a ppc de 60k'\n"
         "• '¿cómo viene mi cartera?'\n"
         "• 'distribución de mis activos' (Torta)\n\n"
         "💸 Gastos y Análisis (ARS):\n"
@@ -636,7 +614,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         texto_limpio = texto_limpio.strip()
 
-        # Registro Inversión USD
+        # Registro Inversión USD (soporta fecha personalizada)
         if registro_inv:
             partes = texto_limpio.split("REGISTRO_INV:")
             texto_usuario = partes[0].strip()
@@ -645,9 +623,11 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             monto = float(datos[1]) if len(datos) > 1 and datos[1] not in ["0", ""] else None
             p_compra = float(datos[2]) if len(datos) > 2 and datos[2] not in ["0", ""] else None
             cant = float(datos[3]) if len(datos) > 3 and datos[3] not in ["0", ""] else None
+            f_compra = datos[4] if len(datos) > 4 and datos[4] not in ["0", ""] else None
             
-            t, c, p, m = registrar_operacion_inversion(ticker, monto, p_compra, cant)
-            texto_limpio = f"{texto_usuario}\n\n💼 *(Guardado en Cartera: {c:,.4f} {t} a PPC ${p:,.2f} USD - Total: ${m:,.2f} USD)*"
+            t, c, p, m, f_reg = registrar_operacion_inversion(ticker, monto, p_compra, cant, f_compra)
+            fecha_str = f" | Fecha: {f_reg}" if f_reg else ""
+            texto_limpio = f"{texto_usuario}\n\n💼 *(Guardado en Cartera: {c:,.4f} {t} a PPC ${p:,.2f} USD - Total: ${m:,.2f} USD{fecha_str})*"
 
         # Registro Gasto/Ingreso ARS
         if registro_ars and not registro_inv and not necesita_precio:
@@ -702,7 +682,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if ticker_grafico_evol:
             buf_img = generar_grafico_evolucion_activo(ticker_grafico_evol)
             if buf_img:
-                await update.message.reply_photo(photo=buf_img, caption=f"📈 Evolución de {ticker_grafico_evol} en los últimos 6 meses.")
+                await update.message.reply_photo(photo=buf_img, caption=f"📈 Evolución de {ticker_grafico_evol} desde tu fecha de compra.")
             else:
                 await update.message.reply_text(f"⚠️ No pude generar la curva de evolución para {ticker_grafico_evol}.")
 
@@ -710,7 +690,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if necesita_grafico_evol_cartera:
             buf_img = generar_grafico_evolucion_cartera()
             if buf_img:
-                await update.message.reply_photo(photo=buf_img, caption="📈 Evolución de rendimiento de tu cartera en los últimos 6 meses (Base 100).")
+                await update.message.reply_photo(photo=buf_img, caption="📈 Evolución de rendimiento de tu cartera desde tu primera inversión (Base 100).")
             else:
                 await update.message.reply_text("No hay suficientes activos registrados en tu cartera para armar el gráfico comparativo.")
 
