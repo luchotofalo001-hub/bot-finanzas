@@ -138,6 +138,11 @@ def consultar_datos_mercado(ticker: str):
             pass
             
     return None
+def obtener_precio_actual(ticker: str):
+    datos = consultar_datos_mercado(ticker)
+    if datos:
+        return datos["precio"], datos["ticker"]
+    return None, ticker
 
 
 # ==================== INVERSIONES (USD) ====================
