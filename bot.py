@@ -408,6 +408,8 @@ def generar_grafico_evolucion_por_activos(user_id: int, periodo_solicitado: str 
         return None
 
 # ==================== EVOLUCIÓN ACTIVO INDIVIDUAL ====================
+
+generar_grafico_por_activos = generar_grafico_evolucion_por_activos
 def generar_grafico_evolucion_activo(user_id: int, ticker: str, periodo_solicitado: str = ""):
     ticker = ticker.strip().upper()
     simbolo = normalizar_ticker_yf(ticker)
@@ -1380,7 +1382,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # 3. Gráfico Por Activos (MÚLTIPLES LÍNEAS NORMALIZADAS AL PPC REAL)
         if necesita_grafico_por_activos:
-            buf_img = generar_grafico_por_activos(user_id, periodo_por_activos)
+            buf_img = generar_grafico_evolucion_por_activos(user_id, periodo_por_activos)
             if buf_img:
                 await update.message.reply_photo(photo=buf_img, caption="📊 Rendimiento relativo de cada activo respecto a tu PPC (Base 100).")
             else:
