@@ -664,6 +664,106 @@ def generar_grafico_analisis_tecnico(ticker: str, timeframe: str = "diario"):
         return None, str(e)
 
 
+
+# ==================== ESCÁNER DE SEÑALES EN CARTERA ====================
+def escanear_cartera_senales(user_id: int):
+    """
+    Escanea todos los activos en cartera en Diario y Semanal.
+    Genera un diagnóstico conciso por activo y adjunta gráficos ÚNICAMENTE si hay señal de RSI clara (Divergencia, Sobrecompra o Sobreventa).
+    """
+    with get_db_connection() as conn:
+        df_inv = pd.read_sql(
+            "SELECT DISTINCT ticker FROM portafolio_inversiones WHERE user_id = %s;",
+            conn, params=(user_id,)
+        )
+    if df_inv.empty:
+        return "No tienes activos cargados en cartera para analizar.", []
+
+    tickers = [t.strip().upper() for t in df_inv['ticker'].unique() if t.strip().upper() not in ["USDT", "USDC", "DAI", "USD"]]
+    if not tickers:
+        return "No tienes activos volátiles en cartera (solo liquidez/stablecoins).", []
+
+    diagnosticos = []
+    imagenes_senales = []
+
+    for tk in tickers:
+        simbolo = normalizar_ticker_yf(tk)
+        
+        # 1. Análisis Diario
+        buf_d, info_d = generar_grafico_analisis_tecnico(tk, "diario")
+        # 2. Análisis Semanal
+        buf_w, info_w = generar_grafico_analisis_tecnico(tk, "semanal")
+
+        if not info_d or isinstance(info_d, str):
+            continue
+
+        rsi_d = info_d['rsi']
+        diag_d = info_d['diagnostico_rsi']
+        precio = info_d['precio_actual']
+        ema20_d = info_d['ema20']
+        ema50_d = info_d['ema50']
+        ema200_d = info_d.get('ema200')
+
+        rsi_w = info_w['rsi'] if (info_w and not isinstance(info_w, str)) else None
+        diag_w = info_w['diagnostico_rsi'] if (info_w and not isinstance(info_w, str)) else "N/A"
+
+        # Evaluar si hay señal clara de RSI (Divergencia, Sobrecompra >= 70, Sobreventa <= 30) en D o W
+        tiene_senal_d = ("DIVERGENCIA" in diag_d.upper()) or (rsi_d >= 70) or (rsi_d <= 30)
+        tiene_senal_w = ("DIVERGENCIA" in diag_w.upper()) or (rsi_w and (rsi_w >= 70 or rsi_w <= 30))
+
+        # Diagnóstico de movimiento y probabilidad
+        movimiento = []
+        if precio > ema20_d > ema50_d:
+            movimiento.append("Estructura alcista sólida sobre EMA 20 y 50")
+            probabilidad = "Continuidad alcista o consolidación sana antes del próximo impulso."
+        elif precio < ema20_d < ema50_d:
+            movimiento.append("Estructura bajista / corrección activa bajo EMAs")
+            probabilidad = "Presión vendedora; probable búsqueda de soportes previos o EMA 200."
+        elif precio > ema20_d:
+            movimiento.append("Rebote táctico sobre EMA 20")
+            probabilidad = "Testeo de resistencia en EMA 50/máximos anteriores."
+        else:
+            movimiento.append("Lateral / comprimiendo entre EMAs")
+            probabilidad = "Ruptura inminente de rango al definir sobre medias móviles."
+
+        # Redacción concisa por activo
+        diag_texto = [f"📌 *{tk}* (${precio:,.2f} USD):"]
+        diag_texto.append(f"• *Movimiento:* {', '.join(movimiento)}.")
+        diag_texto.append(f"• *Escenario más probable:* {probabilidad}")
+        
+        avisos_rsi = []
+        if "DIVERGENCIA" in diag_d.upper():
+            avisos_rsi.append(f"⚡ *Diario:* {diag_d}")
+        elif rsi_d >= 70 or rsi_d <= 30:
+            avisos_rsi.append(f"⚠️ *Diario:* RSI en {rsi_d:.1f} ({'Sobrecompra' if rsi_d>=70 else 'Sobreventa'})")
+        else:
+            avisos_rsi.append(f"RSI Diario en {rsi_d:.1f} (Zona neutra)")
+
+        if rsi_w:
+            if "DIVERGENCIA" in diag_w.upper():
+                avisos_rsi.append(f"⚡ *Semanal:* {diag_w}")
+            elif rsi_w >= 70 or rsi_w <= 30:
+                avisos_rsi.append(f"⚠️ *Semanal:* RSI en {rsi_w:.1f} ({'Sobrecompra' if rsi_w>=70 else 'Sobreventa'})")
+
+        diag_texto.append(f"• *Aviso RSI:* {' | '.join(avisos_rsi)}")
+
+        # Si hay señal clara, adjuntar imagen para enviar
+        if tiene_senal_d and buf_d:
+            imagenes_senales.append((buf_d, f"🚨 {tk} (Diario): Señal activa detectada en RSI ({diag_d})"))
+        elif tiene_senal_w and buf_w:
+            imagenes_senales.append((buf_w, f"🚨 {tk} (Semanal): Señal activa detectada en RSI ({diag_w})"))
+
+        diagnosticos.append("\n".join(diag_texto))
+
+    resumen_final = "🔍 *ESCÁNER DE CARTERA (DIARIO & SEMANAL)*\n\n" + "\n\n".join(diagnosticos)
+    if not imagenes_senales:
+        resumen_final += "\n\n*(ℹ️ No se detectaron divergencias extremas ni sobrecompra/sobreventa crítica en ningún activo; no se requirió envío de gráficos)*."
+    else:
+        resumen_final += f"\n\n*(📊 Se detectaron {len(imagenes_senales)} activos con señales claras de RSI; te adjunto los gráficos a continuación)*."
+
+    return resumen_final, imagenes_senales
+
+
 # ==================== OPERACIONES BANCARIAS Y CARTERA ====================
 def registrar_operacion_inversion(user_id: int, ticker: str, monto_usd: float, precio_compra: float = None, cantidad: float = None, fecha_compra: str = None, tipo_posicion: str = "SPOT", apalancamiento: float = 1.0, precio_liq: float = None):
     ticker = ticker.strip().upper()
@@ -1246,6 +1346,10 @@ Eres un analista y asesor financiero cuantitativo institucional. Manejas tres mu
 TODOS LOS REGISTROS QUE APARECEN EN "POSICIONES / TRADES ABIERTOS" REPRESENTAN OPERACIONES QUE EL USUARIO TIENE ABIERTAS HOY EN DÍA.
 
 REGLAS DE ANÁLISIS TÉCNICO PERSONALIZADO (MUY IMPORTANTE):
+- Si el usuario pide escanear o analizar todos sus activos (ej: "Analizame todos mis activos", "analizá toda mi cartera", "escanear activos", "cómo están mis activos"):
+  DEBES EMITIR OBLIGATORIAMENTE: ACCION: ESCANEAR_CARTERA
+  Tu respuesta textual debe ser brevísima y concisa anunciando el reporte.
+
 - Si el usuario pide analizar técnicamente un activo (ej: "analizá BTC", "analizame MELI", "análisis técnico de ETH en 4h", "cómo ves NVDA en semanal", "haceme un análisis de SOL"):
   DEBES EMITIR: ACCION: ANALIZAR_ACTIVO|[TICKER]|[TIMEFRAME_DETECTADO]
   Donde TIMEFRAME_DETECTADO puede ser: "diario", "semanal" o "4h" (por defecto "diario").
@@ -1369,6 +1473,13 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             texto_limpio = texto_limpio.replace(tag, "")
 
                 # Análisis Técnico Autónomo (TradingView Style con EMAs, Fibo y RSI Divergencias)
+                # Escáner General de Activos de la Cartera
+        necesita_escanear_cartera = "ACCION: ESCANEAR_CARTERA" in reply
+        if not necesita_escanear_cartera and re.search(r"(?:analiza(?:me)?\s+todos?\s+(?:mis\s+)?activos?|escanear?\s+(?:mi\s+)?cartera|revisa(?:me)?\s+mis\s+activos)", user_msg, re.IGNORECASE):
+            necesita_escanear_cartera = True
+
+        texto_limpio = texto_limpio.replace("ACCION: ESCANEAR_CARTERA", "")
+
         ticker_at = None
         tf_at = "diario"
         m_at = re.search(r"ACCION:\s*ANALIZAR_ACTIVO\|([^\n\r|]+)(?:\|([^\n\r]+))?", texto_limpio)
@@ -1630,7 +1741,17 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 await update.message.reply_text(texto_limpio)
 
-                # Ejecución Análisis Técnico Personalizado
+                        # Ejecución Escáner de Cartera
+        if necesita_escanear_cartera:
+            resumen_escaner, fotos_senales = escanear_cartera_senales(user_id)
+            try:
+                await update.message.reply_text(resumen_escaner, parse_mode="Markdown")
+            except Exception:
+                await update.message.reply_text(resumen_escaner)
+            for buf_foto, cap_foto in fotos_senales:
+                await update.message.reply_photo(photo=buf_foto, caption=cap_foto)
+
+        # Ejecución Análisis Técnico Personalizado
         if ticker_at:
             buf_img, info_at = generar_grafico_analisis_tecnico(ticker_at, tf_at)
             if buf_img:
