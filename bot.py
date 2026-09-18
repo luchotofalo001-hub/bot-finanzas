@@ -319,7 +319,7 @@ def generar_grafico_evolucion_cartera_consolidada(user_id: int, periodo_solicita
 
 # ==================== GRÁFICO POR ACTIVOS (MÚLTIPLES LÍNEAS NORMALIZADAS AL PPC REAL) ====================
 def generar_grafico_evolucion_por_activos(user_id: int, periodo_solicitado: str = "", tickers_filtro: list = None):
-    """Genera la comparativa multi-línea dividida por activo, indexada al PPC y ROE real (soporta filtro de activos específicos)"""
+    """Genera la comparativa multi-línea dividida por activo, indexada matemáticamente en Base 100 en su inicio"""
     try:
         with get_db_connection() as conn:
             df = pd.read_sql(
@@ -354,7 +354,6 @@ def generar_grafico_evolucion_por_activos(user_id: int, periodo_solicitado: str 
                 continue
             
             f_compra = pd.to_datetime(row['primera_compra']).tz_localize(None).floor('D')
-            ppc = float(row['ppc_real']) if row['ppc_real'] else 1.0
             tipo_pos = str(row['tipo_pos']).upper() if row['tipo_pos'] else "SPOT"
             lev = float(row['lev']) if row['lev'] else 1.0
 
@@ -366,22 +365,31 @@ def generar_grafico_evolucion_por_activos(user_id: int, periodo_solicitado: str 
                     s.index = pd.to_datetime(s.index).tz_localize(None)
                     s = s.reindex(fechas_rango).ffill().bfill()
                     
+                    # Cortar fechas antes de la compra para activos adquiridos después de fecha_start
+                    if f_compra > fechas_rango[0]:
+                        s[fechas_rango < f_compra] = np.nan
+                    
+                    s_valida = s.dropna()
+                    if s_valida.empty:
+                        continue
+                    
+                    # BASE 100 REAL: el primer valor de la serie válida es exactamente 100.0
+                    precio_inicial_serie = s_valida.iloc[0]
+                    
                     if tipo_pos == "SHORT":
-                        serie_rend = 100.0 + ((ppc - s) / ppc) * lev * 100.0
+                        serie_rend = 100.0 + ((precio_inicial_serie - s) / precio_inicial_serie) * lev * 100.0
                     elif tipo_pos == "LONG":
-                        serie_rend = 100.0 + ((s - ppc) / ppc) * lev * 100.0
+                        serie_rend = 100.0 + ((s - precio_inicial_serie) / precio_inicial_serie) * lev * 100.0
                     else: # SPOT
-                        serie_rend = (s / ppc) * 100.0
+                        serie_rend = (s / precio_inicial_serie) * 100.0
                     
-                    serie_rend[fechas_rango < f_compra] = np.nan
-                    
-                    ultimo_val = serie_rend.dropna().iloc[-1] if not serie_rend.dropna().empty else 100.0
-                    pnl_pct = ultimo_val - 100.0
-                    signo = "+" if pnl_pct >= 0 else ""
+                    ultimo_val = serie_rend.dropna().iloc[-1]
+                    rend_pct = ultimo_val - 100.0
+                    signo = "+" if rend_pct >= 0 else ""
                     tag_lev = f" [{lev:.0f}x]" if lev > 1 else ""
                     
                     c = colores[idx_color % len(colores)]
-                    ax.plot(fechas_rango, serie_rend, label=f"{tk}{tag_lev} ({signo}{pnl_pct:.1f}%)", linewidth=2.2, color=c)
+                    ax.plot(fechas_rango, serie_rend, label=f"{tk}{tag_lev} ({signo}{rend_pct:.1f}%)", linewidth=2.2, color=c)
                     idx_color += 1
                     hay_series = True
             except Exception as e:
@@ -390,11 +398,11 @@ def generar_grafico_evolucion_por_activos(user_id: int, periodo_solicitado: str 
         if not hay_series:
             return None
 
-        ax.axhline(y=100, color="gray", linestyle=":", linewidth=1.4, alpha=0.8, label="Tu PPC / Entrada (Base 100)")
+        ax.axhline(y=100, color="gray", linestyle=":", linewidth=1.4, alpha=0.8, label="Base 100 (Inicio)")
         filtro_sub = f" ({', '.join(df['ticker'].tolist())})" if tickers_filtro else ""
-        ax.set_title(f"Rendimiento Real de tus Activos vs PPC (Base 100 = Costo){filtro_sub}\n{desc_periodo}", fontsize=12, fontweight='bold', pad=12)
+        ax.set_title(f"Rendimiento Relativo de tus Activos (Base 100 = Inicio){filtro_sub}\n{desc_periodo}", fontsize=12, fontweight='bold', pad=12)
         ax.set_xlabel("Fecha")
-        ax.set_ylabel("Rendimiento vs PPC (%)")
+        ax.set_ylabel("Rendimiento Relativo (Base 100)")
         ax.grid(True, linestyle="--", alpha=0.35)
         ax.legend(loc="upper left", frameon=True)
         ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
@@ -470,6 +478,191 @@ def generar_grafico_evolucion_activo(user_id: int, ticker: str, periodo_solicita
     except Exception as e:
         logger.error(f"Error graficando activo {ticker}: {e}")
         return None
+
+
+# ==================== MOTOR DE ANÁLISIS TÉCNICO PERSONALIZADO ====================
+def calcular_rsi_serie(series, period=14):
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+def detectar_divergencia_rsi(df, window=25):
+    """Detecta divergencias regulares alcistas y bajistas en la ventana reciente"""
+    if len(df) < window:
+        return "Sin datos suficientes"
+    
+    sub = df.iloc[-window:].copy()
+    precios = sub['Close'].values
+    rsis = sub['RSI'].values
+    
+    min_idx_1 = np.argmin(precios[:window//2])
+    min_idx_2 = window//2 + np.argmin(precios[window//2:])
+    
+    # Divergencia Alcista: Precio hace Lower Low pero RSI hace Higher Low
+    if precios[min_idx_2] < precios[min_idx_1] and rsis[min_idx_2] > rsis[min_idx_1] and rsis[min_idx_2] < 45:
+        return f"🟢 Posible DIVERGENCIA ALCISTA (Precio formando mínimos más bajos con RSI en recuperación: {rsis[min_idx_2]:.1f} vs {rsis[min_idx_1]:.1f})"
+        
+    max_idx_1 = np.argmax(precios[:window//2])
+    max_idx_2 = window//2 + np.argmax(precios[window//2:])
+    
+    # Divergencia Bajista: Precio hace Higher High pero RSI hace Lower High
+    if precios[max_idx_2] > precios[max_idx_1] and rsis[max_idx_2] < rsis[max_idx_1] and rsis[max_idx_2] > 55:
+        return f"🔴 Posible DIVERGENCIA BAJISTA (Precio marcando nuevo máximo pero RSI perdiendo fuerza: {rsis[max_idx_2]:.1f} vs {rsis[max_idx_1]:.1f})"
+        
+    if rsis[-1] >= 70:
+        return f"⚠️ RSI en SOBRECOMPRA ({rsis[-1]:.1f})"
+    elif rsis[-1] <= 30:
+        return f"⚠️ RSI en SOBREVENTA ({rsis[-1]:.1f})"
+    
+    return f"Neutral ({rsis[-1]:.1f})"
+
+def generar_grafico_analisis_tecnico(ticker: str, timeframe: str = "diario"):
+    """
+    Genera el gráfico institucional y las métricas exactas:
+    - Velas / Precio
+    - EMAs 20, 50, 200
+    - Niveles Fibo (0.382, 0.50, 0.618 / Extensiones 1.618)
+    - RSI con bandas 70/30 y detección de divergencias
+    """
+    ticker = ticker.strip().upper()
+    simbolo = normalizar_ticker_yf(ticker)
+    
+    tf_str = timeframe.strip().lower() if timeframe else "diario"
+    if "4h" in tf_str or "4 hs" in tf_str or "4 horas" in tf_str or "corto" in tf_str:
+        periodo = "60d"
+        intervalo = "1h"
+        tf_label = "4 Horas"
+    elif "sem" in tf_str or "1w" in tf_str:
+        periodo = "3y"
+        intervalo = "1wk"
+        tf_label = "Semanal"
+    else:
+        periodo = "1y"
+        intervalo = "1d"
+        tf_label = "Diario"
+
+    try:
+        t = yf.Ticker(simbolo)
+        df = t.history(period=periodo, interval=intervalo)
+        if df.empty and not simbolo.endswith("-USD"):
+            simbolo = f"{simbolo}-USD"
+            t = yf.Ticker(simbolo)
+            df = t.history(period=periodo, interval=intervalo)
+            
+        if df.empty:
+            return None, f"No se encontraron datos para {ticker} en {tf_label}"
+
+        if tf_label == "4 Horas":
+            df = df.resample('4h').agg({
+                'Open': 'first',
+                'High': 'max',
+                'Low': 'min',
+                'Close': 'last',
+                'Volume': 'sum'
+            }).dropna()
+
+        df.index = pd.to_datetime(df.index).tz_localize(None)
+        
+        df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
+        df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
+        df['EMA200'] = df['Close'].ewm(span=200, adjust=False).mean()
+        
+        df['RSI'] = calcular_rsi_serie(df['Close'], period=14)
+        
+        ult_velas = min(120, len(df))
+        sub_df = df.iloc[-ult_velas:].copy()
+        
+        swing_high = sub_df['High'].max()
+        swing_low = sub_df['Low'].min()
+        high_idx = sub_df['High'].idxmax()
+        low_idx = sub_df['Low'].idxmin()
+        
+        diff = swing_high - swing_low
+        fibo_niveles = {}
+        if diff > 0:
+            if high_idx > low_idx:
+                fibo_niveles["0.382"] = swing_high - 0.382 * diff
+                fibo_niveles["0.500"] = swing_high - 0.500 * diff
+                fibo_niveles["0.618"] = swing_high - 0.618 * diff
+                fibo_niveles["1.000"] = swing_low
+                fibo_niveles["Ext 1.618"] = swing_high + 0.618 * diff
+                fibo_niveles["Ext 2.618"] = swing_high + 1.618 * diff
+            else:
+                fibo_niveles["0.382"] = swing_low + 0.382 * diff
+                fibo_niveles["0.500"] = swing_low + 0.500 * diff
+                fibo_niveles["0.618"] = swing_low + 0.618 * diff
+                fibo_niveles["1.000"] = swing_high
+                fibo_niveles["Ext 1.618"] = swing_low - 0.618 * diff
+                fibo_niveles["Ext 2.618"] = swing_low - 1.618 * diff
+
+        estado_rsi_div = detectar_divergencia_rsi(df)
+
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(11, 7), gridspec_kw={'height_ratios': [3.2, 1.2]}, sharex=True)
+        
+        ax1.plot(df.index, df['Close'], label="Precio", color="#ffffff", linewidth=1.5, alpha=0.9)
+        ax1.plot(df.index, df['EMA20'], label="EMA 20", color="#29b6f6", linewidth=1.4)
+        ax1.plot(df.index, df['EMA50'], label="EMA 50", color="#ffa726", linewidth=1.4)
+        if len(df) >= 150:
+            ax1.plot(df.index, df['EMA200'], label="EMA 200", color="#ef5350", linewidth=1.8)
+            
+        colores_fibo = {"0.382": "#ab47bc", "0.500": "#26a69a", "0.618": "#ffca28", "Ext 1.618": "#ff7043", "Ext 2.618": "#e91e63"}
+        for k, v in fibo_niveles.items():
+            if k in colores_fibo:
+                ax1.axhline(v, color=colores_fibo[k], linestyle="--", linewidth=1.1, alpha=0.75, label=f"Fibo {k} (${v:,.2f})")
+
+        ax1.set_facecolor("#131722")
+        fig.patch.set_facecolor("#131722")
+        ax1.grid(True, linestyle="--", alpha=0.15, color="#787b86")
+        ax1.set_title(f"{ticker} | Analisis Tecnico ({tf_label})\nEMAs (20, 50, 200), Fibonacci y RSI", color="#ffffff", fontsize=12, fontweight='bold', pad=10)
+        ax1.tick_params(colors="#787b86")
+        ax1.legend(loc="upper left", facecolor="#1e222d", edgecolor="#2a2e39", labelcolor="#d1d4dc", fontsize=8)
+
+        ax2.set_facecolor("#131722")
+        ax2.plot(df.index, df['RSI'], color="#ba68c8", linewidth=1.6, label="RSI 14")
+        ax2.axhline(70, color="#ef5350", linestyle=":", linewidth=1.1, alpha=0.8)
+        ax2.axhline(30, color="#26a69a", linestyle=":", linewidth=1.1, alpha=0.8)
+        ax2.axhline(50, color="#787b86", linestyle="--", linewidth=0.8, alpha=0.5)
+        ax2.fill_between(df.index, df['RSI'], 70, where=(df['RSI'] >= 70), color="#ef5350", alpha=0.25)
+        ax2.fill_between(df.index, df['RSI'], 30, where=(df['RSI'] <= 30), color="#26a69a", alpha=0.25)
+        ax2.set_ylim(10, 90)
+        ax2.grid(True, linestyle="--", alpha=0.15, color="#787b86")
+        ax2.tick_params(colors="#787b86")
+        ax2.legend(loc="upper left", facecolor="#1e222d", edgecolor="#2a2e39", labelcolor="#d1d4dc", fontsize=8)
+        
+        plt.tight_layout()
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', dpi=200, facecolor=fig.get_facecolor())
+        buf.seek(0)
+        plt.close()
+
+        precio_actual = float(df['Close'].iloc[-1])
+        ema20_val = float(df['EMA20'].iloc[-1])
+        ema50_val = float(df['EMA50'].iloc[-1])
+        ema200_val = float(df['EMA200'].iloc[-1]) if 'EMA200' in df else None
+        rsi_val = float(df['RSI'].iloc[-1])
+
+        datos_analisis = {
+            "ticker": ticker,
+            "timeframe": tf_label,
+            "precio_actual": precio_actual,
+            "ema20": ema20_val,
+            "ema50": ema50_val,
+            "ema200": ema200_val,
+            "rsi": rsi_val,
+            "diagnostico_rsi": estado_rsi_div,
+            "swing_high": swing_high,
+            "swing_low": swing_low,
+            "fibo_niveles": fibo_niveles
+        }
+        return buf, datos_analisis
+    except Exception as e:
+        logger.error(f"Error generando analisis tecnico de {ticker}: {e}", exc_info=True)
+        return None, str(e)
+
 
 # ==================== OPERACIONES BANCARIAS Y CARTERA ====================
 def registrar_operacion_inversion(user_id: int, ticker: str, monto_usd: float, precio_compra: float = None, cantidad: float = None, fecha_compra: str = None, tipo_posicion: str = "SPOT", apalancamiento: float = 1.0, precio_liq: float = None):
@@ -1052,6 +1245,21 @@ Eres un analista y asesor financiero cuantitativo institucional. Manejas tres mu
 
 TODOS LOS REGISTROS QUE APARECEN EN "POSICIONES / TRADES ABIERTOS" REPRESENTAN OPERACIONES QUE EL USUARIO TIENE ABIERTAS HOY EN DÍA.
 
+REGLAS DE ANÁLISIS TÉCNICO PERSONALIZADO (MUY IMPORTANTE):
+- Si el usuario pide analizar técnicamente un activo (ej: "analizá BTC", "analizame MELI", "análisis técnico de ETH en 4h", "cómo ves NVDA en semanal", "haceme un análisis de SOL"):
+  DEBES EMITIR: ACCION: ANALIZAR_ACTIVO|[TICKER]|[TIMEFRAME_DETECTADO]
+  Donde TIMEFRAME_DETECTADO puede ser: "diario", "semanal" o "4h" (por defecto "diario").
+  Al recibir esta acción, el bot trazará automáticamente el gráfico con tema oscuro institucional de TradingView con:
+  1. EMAs 20, 50 y 200
+  2. Retroceso y Extensión de Fibonacci (0.382, 0.50, 0.618, 1.0, 1.618, 2.618)
+  3. RSI 14 con bandas de sobrecompra (70) y sobreventa (30)
+  4. Detección de divergencias regulares alcistas y bajistas
+  En tu respuesta escrita debes diagnosticar:
+  - Estructura y relación del precio contra las EMAs 20, 50 y 200 (como soportes/resistencias dinámicos).
+  - Estado del RSI (sobrecompra/sobreventa y presencia o no de divergencias).
+  - Nivel de Fibonacci relevante donde se encuentra o hacia dónde apunta (especialmente 0.618 o extensión 1.618).
+  - Zonas clave de soporte y resistencia (máximos y mínimos previos).
+
 REGLAS DE GRÁFICOS (MUY ESTRICTAS Y OBLIGATORIAS):
 1. COMPARATIVA DE DOS O MÁS ACTIVOS:
    Si el usuario pide ver el gráfico o la evolución de DOS O MÁS ACTIVOS (ej: "Haceme la evolucion de Meli y Nu", "Comparame MELI y NU", "gráfico de BTC y SOL", "comparativa de MELI, GGAL y SUPV"):
@@ -1160,7 +1368,26 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for tag in ["ACCION: VER_CARTERA", "ACCION: GRAFICO_INVERSIONES", "ACCION: GRAFICO_GASTOS", "ACCION: EXCEL", "ACCION: BORRAR_TODO", "ACCION: BORRAR_ULTIMO"]:
             texto_limpio = texto_limpio.replace(tag, "")
 
-        # Cotización
+                # Análisis Técnico Autónomo (TradingView Style con EMAs, Fibo y RSI Divergencias)
+        ticker_at = None
+        tf_at = "diario"
+        m_at = re.search(r"ACCION:\s*ANALIZAR_ACTIVO\|([^\n\r|]+)(?:\|([^\n\r]+))?", texto_limpio)
+        if m_at:
+            ticker_at = m_at.group(1).strip()
+            tf_at = m_at.group(2).strip() if m_at.group(2) else "diario"
+            texto_limpio = texto_limpio.replace(m_at.group(0), "")
+
+        if not ticker_at and re.search(r"(?:analiza|analizame|analisis\s+tecnico)\s+([a-zA-Z0-9]+)", user_msg, re.IGNORECASE):
+            m_fall = re.search(r"(?:analiza|analizame|analisis\s+tecnico)\s+([a-zA-Z0-9]+)", user_msg, re.IGNORECASE)
+            ticker_at = m_fall.group(1).strip().upper()
+            if "4h" in user_msg.lower():
+                tf_at = "4h"
+            elif "sem" in user_msg.lower():
+                tf_at = "semanal"
+            else:
+                tf_at = "diario"
+
+# Cotización
         ticker_a_cotizar = None
         m_precio = re.search(r"ACCION: CONSULTA_PRECIO\|([^\n\r]+)", texto_limpio)
         if m_precio:
@@ -1403,7 +1630,16 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 await update.message.reply_text(texto_limpio)
 
-        # 1. Gráfico Por Activos (MÚLTIPLES LÍNEAS NORMALIZADAS AL PPC REAL - Con o sin filtro)
+                # Ejecución Análisis Técnico Personalizado
+        if ticker_at:
+            buf_img, info_at = generar_grafico_analisis_tecnico(ticker_at, tf_at)
+            if buf_img:
+                cap_txt = f"📈 Gráfico Técnico: {ticker_at} ({tf_at.capitalize()})\n• EMAs 20, 50, 200\n• Fibonacci (0.382, 0.5, 0.618, 1.618)\n• RSI 14 & Divergencias"
+                await update.message.reply_photo(photo=buf_img, caption=cap_txt)
+            else:
+                await update.message.reply_text(f"⚠️ No se pudo generar el gráfico técnico para {ticker_at}.")
+
+# 1. Gráfico Por Activos (MÚLTIPLES LÍNEAS NORMALIZADAS AL PPC REAL - Con o sin filtro)
         if necesita_grafico_por_activos:
             buf_img = generar_grafico_evolucion_por_activos(user_id, periodo_por_activos, tickers_filtro_activos)
             if buf_img:
@@ -1514,4 +1750,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
