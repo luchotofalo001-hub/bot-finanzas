@@ -560,33 +560,102 @@ def calcular_rsi_serie(series, period=14):
     return 100 - (100 / (1 + rs))
 
 def detectar_divergencia_rsi(df, window=25):
+    """
+    Detecta sobrecompra/sobreventa (activas o tempranas) y divergencias (confirmadas o en formación).
+    """
     if len(df) < window:
         return "Sin datos suficientes"
     
     sub = df.iloc[-window:].copy()
     precios = sub['Close'].values
     rsis = sub['RSI'].values
+    rsi_act = float(rsis[-1])
+    precio_act = float(precios[-1])
     
+    # Alerta temprana de umbrales
+    alerta_nivel = f"Neutral ({rsi_act:.1f})"
+    if rsi_act >= 70:
+        alerta_nivel = f"🔥 SOBRECOMPRA ACTIVA ({rsi_act:.1f})"
+    elif rsi_act >= 65:
+        alerta_nivel = f"⚠️ Por entrar en SOBRECOMPRA ({rsi_act:.1f} - cerca de techo)"
+    elif rsi_act <= 30:
+        alerta_nivel = f"❄️ SOBREVENTA ACTIVA ({rsi_act:.1f})"
+    elif rsi_act <= 36:
+        alerta_nivel = f"⚠️ Por entrar en SOBREVENTA ({rsi_act:.1f} - cerca de piso)"
+
     min_idx_1 = np.argmin(precios[:window//2])
     min_idx_2 = window//2 + np.argmin(precios[window//2:])
     
-    if precios[min_idx_2] < precios[min_idx_1] and rsis[min_idx_2] > rsis[min_idx_1] and rsis[min_idx_2] < 45:
-        return f"Posible DIVERGENCIA ALCISTA (RSI {rsis[min_idx_2]:.1f} vs {rsis[min_idx_1]:.1f})"
-        
     max_idx_1 = np.argmax(precios[:window//2])
     max_idx_2 = window//2 + np.argmax(precios[window//2:])
-    
-    if precios[max_idx_2] > precios[max_idx_1] and rsis[max_idx_2] < rsis[max_idx_1] and rsis[max_idx_2] > 55:
-        return f"Posible DIVERGENCIA BAJISTA (RSI {rsis[max_idx_2]:.1f} vs {rsis[max_idx_1]:.1f})"
-        
-    if rsis[-1] >= 70:
-        return f"RSI en SOBRECOMPRA ({rsis[-1]:.1f})"
-    elif rsis[-1] <= 30:
-        return f"RSI en SOBREVENTA ({rsis[-1]:.1f})"
-    
-    return f"Neutral ({rsis[-1]:.1f})"
 
-def generar_grafico_analisis_tecnico(ticker: str, timeframe: str = "diario"):
+    # Divergencias Alcistas
+    if precios[min_idx_2] < precios[min_idx_1] and rsis[min_idx_2] > rsis[min_idx_1] and rsis[min_idx_2] < 45:
+        return f"🟢 DIVERGENCIA ALCISTA CONFIRMADA (Mínimo menor en precio con RSI en subida: {rsis[min_idx_2]:.1f} vs {rsis[min_idx_1]:.1f})"
+    elif precio_act <= precios[min_idx_1] * 1.015 and rsi_act > rsis[min_idx_1] + 2.5 and rsi_act < 42:
+        return f"👀 DIVERGENCIA ALCISTA EN FORMACIÓN (Precio testeando mínimos previos con RSI aguantando en {rsi_act:.1f} vs {rsis[min_idx_1]:.1f})"
+
+    # Divergencias Bajistas
+    if precios[max_idx_2] > precios[max_idx_1] and rsis[max_idx_2] < rsis[max_idx_1] and rsis[max_idx_2] > 55:
+        return f"🔴 DIVERGENCIA BAJISTA CONFIRMADA (Máximo mayor en precio con RSI perdiendo fuerza: {rsis[max_idx_2]:.1f} vs {rsis[max_idx_1]:.1f})"
+    elif precio_act >= precios[max_idx_1] * 0.985 and rsi_act < rsis[max_idx_1] - 3.0 and rsi_act > 58:
+        return f"👀 DIVERGENCIA BAJISTA EN FORMACIÓN (Precio en zona de máximos pero RSI agotándose en {rsi_act:.1f} vs {rsis[max_idx_1]:.1f})"
+
+    return alerta_nivel
+
+def formatear_reporte_tecnico(info):
+    tk = info['ticker']
+    tf = info['timeframe']
+    p = info['precio_actual']
+    e20 = info['ema20']
+    e50 = info['ema50']
+    e200 = info['ema200']
+    rsi = info['rsi']
+    diag_rsi = info['diagnostico_rsi']
+    fibo = info['fibo_niveles']
+    
+    lineas = [f"📊 REPORTE TÉCNICO: {tk} ({tf})", f"• Precio actual: ${p:,.2f} USD", ""]
+    
+    lineas.append("📈 Medias Móviles (EMAs):")
+    if p > e20 and e20 > e50:
+        lineas.append(f"• Estructura alcista: Precio sobre EMA 20 (${e20:,.2f}) y EMA 50 (${e50:,.2f})")
+    elif p < e20 and e20 < e50:
+        lineas.append(f"• Estructura correctiva: Precio bajo EMA 20 (${e20:,.2f}) y EMA 50 (${e50:,.2f})")
+    else:
+        lineas.append(f"• En compresión: Precio oscilando entre EMA 20 (${e20:,.2f}) y EMA 50 (${e50:,.2f})")
+    if e200:
+        pos_200 = "soporte mayor dinámico" if p > e200 else "resistencia dinámica clave"
+        lineas.append(f"• EMA 200 periodos: ${e200:,.2f} USD ({pos_200})")
+    
+    lineas.append("")
+    lineas.append("⚡ RSI 14 & Alertas Tempranas:")
+    lineas.append(f"• Lectura actual: {rsi:.1f} puntos")
+    lineas.append(f"• Estado: {diag_rsi}")
+    
+    if fibo:
+        lineas.append("")
+        lineas.append("🎯 Niveles Fibonacci & Zonas Clave:")
+        if "0.618" in fibo:
+            lineas.append(f"• Golden Pocket (0.618): ${fibo['0.618']:,.2f} USD")
+        if "0.500" in fibo:
+            lineas.append(f"• Nivel 50%: ${fibo['0.500']:,.2f} USD")
+        if "Ext 1.618" in fibo:
+            lineas.append(f"• Proyección Extensión 1.618: ${fibo['Ext 1.618']:,.2f} USD")
+        
+    lineas.append("")
+    lineas.append("💡 Conclusión y Probabilidad:")
+    if "DIVERGENCIA ALCISTA" in diag_rsi.upper() or rsi <= 35:
+        lineas.append("• Alta probabilidad de rebote o agotamiento de ventas. Buscar confirmación sobre EMA 20.")
+    elif "DIVERGENCIA BAJISTA" in diag_rsi.upper() or rsi >= 65:
+        lineas.append("• Alerta de techo o toma de ganancias. Precaución con nuevas compras en esta zona.")
+    elif p > e20:
+        lineas.append("• Sesgo favorable a la continuidad alcista mientras sostenga el soporte de la EMA 20.")
+    else:
+        lineas.append("• Presión bajista activa. Esperar confirmación o divergencia clara antes de ingresar.")
+        
+    return "\n".join(lineas)
+
+def generar_grafico_analisis_tecnico(ticker: str, timeframe: str = "diario", con_fibo: bool = False, con_ext: bool = False):
     ticker = ticker.strip().upper()
     simbolo = normalizar_ticker_yf(ticker)
     
@@ -642,21 +711,25 @@ def generar_grafico_analisis_tecnico(ticker: str, timeframe: str = "diario"):
         
         diff = swing_high - swing_low
         fibo_niveles = {}
-        if diff > 0:
+        if (con_fibo or con_ext) and diff > 0:
             if high_idx > low_idx:
-                fibo_niveles["0.382"] = swing_high - 0.382 * diff
-                fibo_niveles["0.500"] = swing_high - 0.500 * diff
-                fibo_niveles["0.618"] = swing_high - 0.618 * diff
-                fibo_niveles["1.000"] = swing_low
-                fibo_niveles["Ext 1.618"] = swing_high + 0.618 * diff
-                fibo_niveles["Ext 2.618"] = swing_high + 1.618 * diff
+                if con_fibo:
+                    fibo_niveles["0.382"] = swing_high - 0.382 * diff
+                    fibo_niveles["0.500"] = swing_high - 0.500 * diff
+                    fibo_niveles["0.618"] = swing_high - 0.618 * diff
+                    fibo_niveles["1.000"] = swing_low
+                if con_ext:
+                    fibo_niveles["Ext 1.618"] = swing_high + 0.618 * diff
+                    fibo_niveles["Ext 2.618"] = swing_high + 1.618 * diff
             else:
-                fibo_niveles["0.382"] = swing_low + 0.382 * diff
-                fibo_niveles["0.500"] = swing_low + 0.500 * diff
-                fibo_niveles["0.618"] = swing_low + 0.618 * diff
-                fibo_niveles["1.000"] = swing_high
-                fibo_niveles["Ext 1.618"] = swing_low - 0.618 * diff
-                fibo_niveles["Ext 2.618"] = swing_low - 1.618 * diff
+                if con_fibo:
+                    fibo_niveles["0.382"] = swing_low + 0.382 * diff
+                    fibo_niveles["0.500"] = swing_low + 0.500 * diff
+                    fibo_niveles["0.618"] = swing_low + 0.618 * diff
+                    fibo_niveles["1.000"] = swing_high
+                if con_ext:
+                    fibo_niveles["Ext 1.618"] = swing_low - 0.618 * diff
+                    fibo_niveles["Ext 2.618"] = swing_low - 1.618 * diff
 
         estado_rsi_div = detectar_divergencia_rsi(df)
 
@@ -676,7 +749,8 @@ def generar_grafico_analisis_tecnico(ticker: str, timeframe: str = "diario"):
         ax1.set_facecolor("#131722")
         fig.patch.set_facecolor("#131722")
         ax1.grid(True, linestyle="--", alpha=0.15, color="#787b86")
-        ax1.set_title(f"{ticker} | Analisis Tecnico ({tf_label})\nEMAs (20, 50, 200), Fibonacci y RSI", color="#ffffff", fontsize=12, fontweight='bold', pad=10)
+        tit_fibo = ", Fibonacci" if (con_fibo or con_ext) else ""
+        ax1.set_title(f"{ticker} | Analisis Tecnico ({tf_label})\nEMAs (20, 50, 200){tit_fibo} y RSI", color="#ffffff", fontsize=12, fontweight='bold', pad=10)
         ax1.tick_params(colors="#787b86")
         ax1.legend(loc="upper left", facecolor="#1e222d", edgecolor="#2a2e39", labelcolor="#d1d4dc", fontsize=8)
 
