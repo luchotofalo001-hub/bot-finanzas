@@ -561,7 +561,7 @@ def calcular_rsi_serie(series, period=14):
 
 def detectar_divergencia_rsi(df, window=25):
     """
-    Detecta sobrecompra/sobreventa (activas o tempranas) y divergencias (confirmadas o en formación).
+    Detecta sobrecompra/sobreventa y divergencias REALES, PREDICTIVAS Y FRESCAS (no viejas ni agotadas).
     """
     if len(df) < window:
         return "Sin datos suficientes"
@@ -571,8 +571,9 @@ def detectar_divergencia_rsi(df, window=25):
     rsis = sub['RSI'].values
     rsi_act = float(rsis[-1])
     precio_act = float(precios[-1])
+    n = len(precios)
     
-    # Alerta temprana de umbrales
+    # 1. Alerta de nivel / proximidad en tiempo real
     alerta_nivel = f"Neutral ({rsi_act:.1f})"
     if rsi_act >= 70:
         alerta_nivel = f"🔥 SOBRECOMPRA ACTIVA ({rsi_act:.1f})"
@@ -583,23 +584,42 @@ def detectar_divergencia_rsi(df, window=25):
     elif rsi_act <= 36:
         alerta_nivel = f"⚠️ Por entrar en SOBREVENTA ({rsi_act:.1f} - cerca de piso)"
 
-    min_idx_1 = np.argmin(precios[:window//2])
-    min_idx_2 = window//2 + np.argmin(precios[window//2:])
+    # 2. Búsqueda de pivotes en la ventana
+    mitad = n // 2
+    min_idx_1 = np.argmin(precios[:mitad])
+    min_idx_2 = mitad + np.argmin(precios[mitad:])
     
-    max_idx_1 = np.argmax(precios[:window//2])
-    max_idx_2 = window//2 + np.argmax(precios[window//2:])
+    max_idx_1 = np.argmax(precios[:mitad])
+    max_idx_2 = mitad + np.argmax(precios[mitad:])
 
-    # Divergencias Alcistas
-    if precios[min_idx_2] < precios[min_idx_1] and rsis[min_idx_2] > rsis[min_idx_1] and rsis[min_idx_2] < 45:
-        return f"🟢 DIVERGENCIA ALCISTA CONFIRMADA (Mínimo menor en precio con RSI en subida: {rsis[min_idx_2]:.1f} vs {rsis[min_idx_1]:.1f})"
-    elif precio_act <= precios[min_idx_1] * 1.015 and rsi_act > rsis[min_idx_1] + 2.5 and rsi_act < 42:
-        return f"👀 DIVERGENCIA ALCISTA EN FORMACIÓN (Precio testeando mínimos previos con RSI aguantando en {rsi_act:.1f} vs {rsis[min_idx_1]:.1f})"
+    p1_min, r1_min = precios[min_idx_1], rsis[min_idx_1]
+    p2_min, r2_min = precios[min_idx_2], rsis[min_idx_2]
 
-    # Divergencias Bajistas
-    if precios[max_idx_2] > precios[max_idx_1] and rsis[max_idx_2] < rsis[max_idx_1] and rsis[max_idx_2] > 55:
-        return f"🔴 DIVERGENCIA BAJISTA CONFIRMADA (Máximo mayor en precio con RSI perdiendo fuerza: {rsis[max_idx_2]:.1f} vs {rsis[max_idx_1]:.1f})"
-    elif precio_act >= precios[max_idx_1] * 0.985 and rsi_act < rsis[max_idx_1] - 3.0 and rsi_act > 58:
-        return f"👀 DIVERGENCIA BAJISTA EN FORMACIÓN (Precio en zona de máximos pero RSI agotándose en {rsi_act:.1f} vs {rsis[max_idx_1]:.1f})"
+    p1_max, r1_max = precios[max_idx_1], rsis[max_idx_1]
+    p2_max, r2_max = precios[max_idx_2], rsis[max_idx_2]
+
+    barras_desde_max2 = (n - 1) - max_idx_2
+    barras_desde_min2 = (n - 1) - min_idx_2
+
+    # A) DIVERGENCIAS BAJISTAS
+    # 1. PREDICTIVA: En formación activa ahora mismo
+    if precio_act >= p1_max * 0.985 and rsi_act < r1_max - 2.5 and rsi_act > 58:
+        return f"🔮 SE ESTÁ FORMANDO UNA POSIBLE DIVERGENCIA BAJISTA (Precio testeando zona de máximos en ${precio_act:,.2f} pero el RSI pierde fuerza en {rsi_act:.1f} vs {r1_max:.1f} previo)"
+
+    # 2. CONFIRMADA FRESCA (segundo pico en las últimas 3 velas)
+    if barras_desde_max2 <= 3 and rsi_act >= 50:
+        if p2_max > p1_max and r2_max < r1_max - 1.5 and r2_max > 55:
+            return f"🔴 DIVERGENCIA BAJISTA CONFIRMADA (Máximo mayor en precio con RSI perdiendo fuerza: {r2_max:.1f} vs {r1_max:.1f})"
+
+    # B) DIVERGENCIAS ALCISTAS
+    # 1. PREDICTIVA: En formación activa ahora mismo
+    if precio_act <= p1_min * 1.015 and rsi_act > r1_min + 2.0 and rsi_act < 44:
+        return f"🔮 SE ESTÁ FORMANDO UNA POSIBLE DIVERGENCIA ALCISTA (Precio testeando mínimos en ${precio_act:,.2f} con RSI aguantando más arriba en {rsi_act:.1f} vs {r1_min:.1f} previo)"
+
+    # 2. CONFIRMADA FRESCA (segundo valle en las últimas 3 velas)
+    if barras_desde_min2 <= 3 and rsi_act <= 50:
+        if p2_min < p1_min and r2_min > r1_min + 1.5 and r2_min < 45:
+            return f"🟢 DIVERGENCIA ALCISTA CONFIRMADA (Mínimo menor en precio con RSI en subida: {r2_min:.1f} vs {r1_min:.1f})"
 
     return alerta_nivel
 
@@ -1498,9 +1518,8 @@ def generar_alertas_para_usuario(user_id: int) -> list:
             dist = p.get("dist_liq_pct")
             if dist is not None and dist < UMBRAL_LIQUIDACION_PCT:
                 clave = f"{p['ticker']}_{p['id']}"
-                detalle = f"{dist:.1f}"
-                h = _hash_alerta("liquidacion", clave, detalle)
-                if not alerta_ya_enviada(user_id, h, horas_ventana=8):
+                h = _hash_alerta("liquidacion", clave, "")
+                if not alerta_ya_enviada(user_id, h, horas_ventana=12):
                     alertas.append({
                         "texto": f"⚠️ LIQUIDACIÓN CERCANA\n{p['ticker']} [{p['tipo_pos']} {p['lev']:.0f}x]\nDistancia actual: {dist:.1f}%\nPrecio liq: ${p['precio_liq']:,.2f} | Spot: ${p['spot']:,.2f}",
                         "tipo": "liquidacion",
@@ -1516,14 +1535,27 @@ def generar_alertas_para_usuario(user_id: int) -> list:
                 if info and not isinstance(info, str):
                     rsi = info.get("rsi", 50)
                     diag = info.get("diagnostico_rsi", "")
-                    if rsi >= 75 or rsi <= 25 or "DIVERGENCIA" in diag.upper():
-                        clave = f"{tk}_rsi"
-                        detalle = f"{rsi:.0f}"
-                        h = _hash_alerta("rsi_extremo", clave, detalle)
-                        if not alerta_ya_enviada(user_id, h, horas_ventana=10):
+                    
+                    # Detección predictiva y confirmada para alertas
+                    tipo_senal = None
+                    if "SE ESTÁ FORMANDO" in diag.upper() or "EN FORMACIÓN" in diag.upper():
+                        tipo_senal = "div_predictiva"
+                    elif "DIVERGENCIA ALCISTA" in diag.upper():
+                        tipo_senal = "div_alcista"
+                    elif "DIVERGENCIA BAJISTA" in diag.upper():
+                        tipo_senal = "div_bajista"
+                    elif rsi >= 70:
+                        tipo_senal = "sobrecompra"
+                    elif rsi <= 30:
+                        tipo_senal = "sobreventa"
+
+                    if tipo_senal:
+                        clave = f"{tk}_{tipo_senal}"
+                        h = _hash_alerta("rsi_senal", clave, "")
+                        if not alerta_ya_enviada(user_id, h, horas_ventana=18):
                             alertas.append({
-                                "texto": f"📡 SEÑAL TÉCNICA\n{tk} — RSI {rsi:.1f}\n{diag}",
-                                "tipo": "rsi_extremo",
+                                "texto": f"📡 SEÑAL TÉCNICA (Diario)\n{tk} — RSI {rsi:.1f}\n{diag}",
+                                "tipo": "rsi_senal",
                                 "clave": clave,
                                 "hash": h
                             })
@@ -1552,7 +1584,7 @@ def generar_alertas_para_usuario(user_id: int) -> list:
         prom = float(df_prom['promedio'].iloc[0]) if not df_prom.empty and pd.notnull(df_prom['promedio'].iloc[0]) else 0.0
         if prom > 0 and total_hoy > prom * UMBRAL_GASTO_INUSUAL:
             clave = f"gasto_{ahora_argentina().strftime('%Y%m%d')}"
-            h = _hash_alerta("gasto_inusual", clave, f"{total_hoy:.0f}")
+            h = _hash_alerta("gasto_inusual", clave, "")
             if not alerta_ya_enviada(user_id, h, horas_ventana=20):
                 alertas.append({
                     "texto": f"💸 GASTO INUSUAL HOY\nGastaste ${total_hoy:,.0f} ARS\nPromedio diario (30d): ${prom:,.0f} ARS\n({total_hoy/prom:.1f}x el promedio)",
