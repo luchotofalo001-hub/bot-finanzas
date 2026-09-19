@@ -170,6 +170,27 @@ def en_horario_alertas():
     h = ahora_argentina().hour
     return ALERTA_HORA_INICIO <= h < ALERTA_HORA_FIN
 
+
+# ==================== FORMATEO LIMPIO TELEGRAM ====================
+def limpiar_estilo_telegram(texto: str) -> str:
+    """Limpia markdown crudo, encabezados con hashtags y viñetas feas para que se vea impecable en Telegram."""
+    if not texto:
+        return ""
+    # Quitar encabezados tipo ### o ##
+    texto = re.sub(r"#{2,6}\s*", "", texto)
+    # Convertir viñetas feas `* **Campo:**` -> `• Campo:`
+    texto = re.sub(r"^\s*[*•-]\s*\*\*(.*?)(?:\*\*:?|\*\*)\s*", r"• \1: ", texto, flags=re.MULTILINE)
+    texto = re.sub(r"::\s*", ": ", texto)
+    # Viñetas con asterisco suelto `* Texto` -> `• Texto`
+    texto = re.sub(r"^\s*[*]\s+", r"• ", texto, flags=re.MULTILINE)
+    # Quitar asteriscos dobles residuales
+    texto = texto.replace("**", "")
+    # Quitar separadores de guiones largos feos `---`
+    texto = re.sub(r"\n\s*---\s*\n", "\n\n", texto)
+    # Quitar saltos de línea excesivos
+    texto = re.sub(r"\n{3,}", "\n\n", texto)
+    return texto.strip()
+
 # ==================== CONSULTAS DE MERCADO EN VIVO ====================
 def normalizar_ticker_yf(ticker: str):
     ticker = ticker.strip().upper()
@@ -1265,7 +1286,7 @@ def obtener_progreso_presupuestos(user_id: int, mes: int = None, anio: int = Non
         pct = (gastado / limite * 100) if limite > 0 else 0.0
         restante = limite - gastado
         emoji = "🟢" if pct < 70 else ("🟡" if pct < 95 else "🔴")
-        barra = "█" * int(min(pct, 100) / 10) + "░" * (10 - int(min(pct, 100) / 10))
+        barra = "▰" * int(min(pct, 100) // 10) + "▱" * (10 - int(min(pct, 100) // 10))
         lineas.append(f"{emoji} {cat}")
         lineas.append(f"   {barra} {pct:.0f}%")
         lineas.append(f"   Gastado: ${gastado:,.0f} / ${limite:,.0f}  →  Resta: ${restante:,.0f}")
@@ -1323,7 +1344,7 @@ def obtener_progreso_objetivos(user_id: int):
 
         pct = min(100.0, (actual / objetivo * 100) if objetivo > 0 else 0.0)
         emoji = "🟢" if pct >= 100 else ("🟡" if pct >= 50 else "🔵")
-        barra = "█" * int(pct / 10) + "░" * (10 - int(pct / 10))
+        barra = "▰" * int(min(pct, 100) // 10) + "▱" * (10 - int(min(pct, 100) // 10))
         lineas.append(f"{emoji} {desc}")
         lineas.append(f"   {barra} {pct:.0f}%")
         lineas.append(f"   Actual: ${actual:,.0f} / Objetivo: ${objetivo:,.0f}")
@@ -1745,6 +1766,13 @@ Eres un analista y asesor financiero cuantitativo institucional. Manejas tres mu
 3. TRADES CERRADOS / GANANCIAS REALIZADAS: Operaciones que YA SE CERRARON y cuyo dinero ya está en el bolsillo.
 
 TODOS LOS REGISTROS QUE APARECEN EN "POSICIONES / TRADES ABIERTOS" REPRESENTAN OPERACIONES QUE EL USUARIO TIENE ABIERTAS HOY EN DÍA.
+
+REGLAS DE FORMATO Y ESTILO VISUAL (OBLIGATORIO Y ESTRICTO):
+- PROHIBIDO usar hashtags para títulos como '###' o '##'. Usa emojis temáticos al inicio de cada sección.
+- PROHIBIDO usar viñetas como '* **Texto:**'. Usa siempre viñetas limpias con '• ' seguidas del concepto.
+- PROHIBIDO escribir textos excesivamente largos. Sé conciso, directo, cuantitativo y estructurado.
+- Evita líneas divisorias '---' innecesarias.
+- Diseña respuestas prolijas, elegantes y scannables para la pantalla de un celular.
 
 REGLAS DE ANÁLISIS TÉCNICO PERSONALIZADO (MUY IMPORTANTE):
 - Si el usuario pide escanear o analizar todos sus activos (ej: "Analizame todos mis activos", "analizá toda mi cartera", "escanear activos", "cómo están mis activos"):
@@ -2231,7 +2259,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Limpiar tags residuales
         texto_limpio = re.sub(r"ACCION:\s*[^\n\r]+", "", texto_limpio)
         texto_limpio = re.sub(r"REGISTRO_[^\n\r]+", "", texto_limpio)
-        texto_limpio = texto_limpio.strip()
+        texto_limpio = limpiar_estilo_telegram(texto_limpio)
 
         # Cotización puntual
         if ticker_a_cotizar:
@@ -2395,3 +2423,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
