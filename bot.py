@@ -1039,42 +1039,64 @@ def obtener_resumen_portafolio(user_id: int):
 
     for _, fila in df.iterrows():
         inv_id = int(fila['id'])
-        ticker = fila['ticker']
-        cant = float(fila['cantidad'])
-        costo_margen = float(fila['monto_total_usd'])
-        ppc = float(fila['precio_compra']) if fila['precio_compra'] else (costo_margen / cant if cant > 0 else 0.0)
-        tipo_pos = str(fila['tipo_posicion']).upper() if fila['tipo_posicion'] else "SPOT"
-        lev = float(fila['apalancamiento']) if fila['apalancamiento'] else 1.0
-        p_liq = float(fila['precio_liquidacion']) if fila['precio_liquidacion'] else None
-
-        spot, _ = obtener_precio_actual(ticker)
-        if spot is None:
-            spot = ppc
-
-        if tipo_pos == "SHORT":
-            var_precio_pct = (ppc - spot) / ppc if ppc > 0 else 0.0
-            pnl_pct = var_precio_pct * lev * 100
-            pnl_usd = costo_margen * (var_precio_pct * lev)
-            valor_actual = max(0.0, costo_margen + pnl_usd)
-        elif tipo_pos == "LONG":
-            var_precio_pct = (spot - ppc) / ppc if ppc > 0 else 0.0
-            pnl_pct = var_precio_pct * lev * 100
-            pnl_usd = costo_margen * (var_precio_pct * lev)
-            valor_actual = max(0.0, costo_margen + pnl_usd)
+        ticker = str(fila['ticker']).strip().upper()
+        cant = float(fila['cantidad']) if pd.notnull(fila['cantidad']) else 0.0
+        costo_margen = float(fila['monto_total_usd']) if pd.notnull(fila['monto_total_usd']) else 0.0
+        
+        if pd.notnull(fila['precio_compra']) and float(fila['precio_compra']) > 0:
+            ppc = float(fila['precio_compra'])
+        elif cant > 0:
+            ppc = costo_margen / cant
         else:
-            valor_actual = cant * spot
-            pnl_usd = valor_actual - costo_margen
-            pnl_pct = (pnl_usd / costo_margen * 100) if costo_margen > 0 else 0.0
+            ppc = 1.0
+
+        tipo_pos = str(fila['tipo_posicion']).upper() if pd.notnull(fila['tipo_posicion']) else "SPOT"
+        lev = float(fila['apalancamiento']) if pd.notnull(fila['apalancamiento']) and float(fila['apalancamiento']) > 0 else 1.0
+        p_liq = float(fila['precio_liquidacion']) if pd.notnull(fila['precio_liquidacion']) else None
+
+        if ticker in ["USDT", "USDC", "DAI", "USD"]:
+            spot = 1.0
+            valor_actual = costo_margen if costo_margen > 0 else cant
+            pnl_usd = 0.0
+            pnl_pct = 0.0
+        else:
+            spot, _ = obtener_precio_actual(ticker)
+            if spot is None or np.isnan(spot) or spot <= 0:
+                spot = ppc
+
+            if tipo_pos == "SHORT":
+                var_precio_pct = (ppc - spot) / ppc if ppc > 0 else 0.0
+                pnl_pct = var_precio_pct * lev * 100
+                pnl_usd = costo_margen * (var_precio_pct * lev)
+                valor_actual = max(0.0, costo_margen + pnl_usd)
+            elif tipo_pos == "LONG":
+                var_precio_pct = (spot - ppc) / ppc if ppc > 0 else 0.0
+                pnl_pct = var_precio_pct * lev * 100
+                pnl_usd = costo_margen * (var_precio_pct * lev)
+                valor_actual = max(0.0, costo_margen + pnl_usd)
+            else: # SPOT
+                valor_actual = cant * spot
+                pnl_usd = valor_actual - costo_margen
+                pnl_pct = (pnl_usd / costo_margen * 100) if costo_margen > 0 else 0.0
+
+        if np.isnan(valor_actual):
+            valor_actual = costo_margen
+        if np.isnan(pnl_usd):
+            pnl_usd = 0.0
+        if np.isnan(pnl_pct):
+            pnl_pct = 0.0
 
         total_margen_invertido += costo_margen
         total_valor_actual += valor_actual
 
         dist_liq_pct = None
-        if p_liq and tipo_pos in ["LONG", "SHORT"] and lev > 1:
+        if p_liq and tipo_pos in ["LONG", "SHORT"] and lev > 1 and spot > 0:
             if tipo_pos == "LONG":
-                dist_liq_pct = ((spot - p_liq) / spot * 100) if spot > 0 else None
+                dist_liq_pct = ((spot - p_liq) / spot * 100)
             else:
-                dist_liq_pct = ((p_liq - spot) / spot * 100) if spot > 0 else None
+                dist_liq_pct = ((p_liq - spot) / spot * 100)
+            if np.isnan(dist_liq_pct):
+                dist_liq_pct = None
 
         posiciones.append({
             "id": inv_id,
@@ -1322,32 +1344,41 @@ def obtener_progreso_objetivos(user_id: int):
         return "No tenés objetivos activos. Podés crear uno diciendo por ejemplo:\n• 'Quiero llegar a 5000 usd de capital'\n• 'Objetivo: ganar 1000 usd este año'"
 
     resumen = obtener_resumen_portafolio(user_id)
-    capital_actual = resumen['total_actual'] if resumen else 0.0
+    capital_actual = float(resumen['total_actual']) if (resumen and pd.notnull(resumen.get('total_actual')) and not np.isnan(resumen.get('total_actual'))) else 0.0
+
     with get_db_connection() as conn:
-        df_tc = pd.read_sql("SELECT COALESCE(SUM(pnl_usd),0) as pnl FROM trades_cerrados WHERE user_id = %s;", conn, params=(user_id,))
-    pnl_realizado = float(df_tc['pnl'].iloc[0]) if not df_tc.empty else 0.0
+        df_tc = pd.read_sql("SELECT COALESCE(SUM(pnl_usd), 0) as pnl FROM trades_cerrados WHERE user_id = %s;", conn, params=(user_id,))
+    pnl_realizado = float(df_tc['pnl'].iloc[0]) if (not df_tc.empty and pd.notnull(df_tc['pnl'].iloc[0]) and not np.isnan(df_tc['pnl'].iloc[0])) else 0.0
 
     lineas = ["🎯 TUS OBJETIVOS FINANCIEROS", ""]
     for _, row in df.iterrows():
         oid = int(row['id'])
         desc = row['descripcion']
-        tipo = row['tipo']
-        objetivo = float(row['monto_objetivo'])
+        tipo = str(row['tipo']).strip().upper() if pd.notnull(row['tipo']) else "CAPITAL"
+        objetivo = float(row['monto_objetivo']) if (pd.notnull(row['monto_objetivo']) and float(row['monto_objetivo']) > 0) else 1.0
         f_lim = row['fecha_limite'].strftime('%Y-%m-%d') if pd.notnull(row['fecha_limite']) else "Sin fecha"
 
-        if tipo in ["CAPITAL", "PATRIMONIO"]:
-            actual = capital_actual
-        elif tipo in ["PNL", "GANANCIA"]:
+        if tipo in ["PNL", "GANANCIA", "TRADES"]:
             actual = pnl_realizado
         else:
             actual = capital_actual
 
-        pct = min(100.0, (actual / objetivo * 100) if objetivo > 0 else 0.0)
-        emoji = "🟢" if pct >= 100 else ("🟡" if pct >= 50 else "🔵")
-        barra = "▰" * int(min(pct, 100) // 10) + "▱" * (10 - int(min(pct, 100) // 10))
+        if actual is None or np.isnan(actual):
+            actual = 0.0
+
+        pct = (actual / objetivo * 100) if objetivo > 0 else 0.0
+        if np.isnan(pct):
+            pct = 0.0
+        pct_clamped = max(0.0, min(100.0, pct))
+
+        emoji = "🟢" if pct_clamped >= 100 else ("🟡" if pct_clamped >= 50 else "🔵")
+        bloques_llenos = int(round(pct_clamped / 10))
+        bloques_vacios = 10 - bloques_llenos
+        barra = "▰" * bloques_llenos + "▱" * bloques_vacios
+
         lineas.append(f"{emoji} {desc}")
-        lineas.append(f"   {barra} {pct:.0f}%")
-        lineas.append(f"   Actual: ${actual:,.0f} / Objetivo: ${objetivo:,.0f}")
+        lineas.append(f"   {barra} {pct:.1f}%")
+        lineas.append(f"   Actual: ${actual:,.2f} / Objetivo: ${objetivo:,.2f}")
         lineas.append(f"   Fecha límite: {f_lim}  (ID {oid})")
         lineas.append("")
 
