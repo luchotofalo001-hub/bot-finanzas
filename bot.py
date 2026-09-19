@@ -2411,12 +2411,21 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_photo(photo=buf_foto, caption=cap_foto)
 
         if ticker_at:
-            buf_img, info_at = generar_grafico_analisis_tecnico(ticker_at, tf_at)
-            if buf_img:
-                cap_txt = f"📈 {ticker_at} ({tf_at.capitalize()})\nEMAs 20/50/200 + Fibonacci + RSI"
+            con_fibo = bool(re.search(r'\bfibo\b|\bfibonacci\b|\bretroceso\b', user_msg, re.IGNORECASE))
+            con_ext = bool(re.search(r'\bextensi[oó]n\b|\bext\b', user_msg, re.IGNORECASE))
+            
+            buf_img, info_at = generar_grafico_analisis_tecnico(ticker_at, tf_at, con_fibo, con_ext)
+            if buf_img and info_at and not isinstance(info_at, str):
+                tags = "EMAs + RSI"
+                if con_fibo or con_ext:
+                    tags += " + Fibo"
+                cap_txt = f"📈 {ticker_at} ({tf_at.capitalize()}) | {tags}"
                 await update.message.reply_photo(photo=buf_img, caption=cap_txt)
+                
+                reporte_txt = formatear_reporte_tecnico(info_at)
+                await update.message.reply_text(reporte_txt)
             else:
-                await update.message.reply_text(f"⚠️ No se pudo generar el gráfico técnico de {ticker_at}.")
+                await update.message.reply_text(f"⚠️ No se pudo generar el análisis técnico de {ticker_at}.")
 
         if necesita_grafico_por_activos:
             buf_img = generar_grafico_evolucion_por_activos(user_id, periodo_por_activos, tickers_filtro_activos)
