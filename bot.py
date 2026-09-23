@@ -48,6 +48,7 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 LUCHO_TELEGRAM_ID = 8429535344
+# El usuario confirmó que solo gemini-3.6-flash responde en su cuenta.
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
 
 # Horario de alertas (hora local Argentina ≈ UTC-3)
@@ -107,6 +108,7 @@ def init_db():
                         fecha_apertura TIMESTAMP DEFAULT NULL
                     );
                 """)
+                # Nuevas tablas
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS presupuestos (
                         id SERIAL PRIMARY KEY,
@@ -165,22 +167,31 @@ init_db()
 
 # ==================== UTILIDADES DE TIEMPO (Argentina UTC-3) ====================
 def ahora_argentina():
+    """Devuelve datetime actual en zona horaria de Argentina (UTC-3) sin usar APIs deprecadas."""
     return datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=3)
 
 def en_horario_alertas():
     h = ahora_argentina().hour
     return ALERTA_HORA_INICIO <= h < ALERTA_HORA_FIN
 
+
 # ==================== FORMATEO LIMPIO TELEGRAM ====================
 def limpiar_estilo_telegram(texto: str) -> str:
+    """Limpia markdown crudo, encabezados con hashtags y viñetas feas para que se vea impecable en Telegram."""
     if not texto:
         return ""
+    # Quitar encabezados tipo ### o ##
     texto = re.sub(r"#{2,6}\s*", "", texto)
+    # Convertir viñetas feas `* **Campo:**` -> `• Campo:`
     texto = re.sub(r"^\s*[*•-]\s*\*\*(.*?)(?:\*\*:?|\*\*)\s*", r"• \1: ", texto, flags=re.MULTILINE)
     texto = re.sub(r"::\s*", ": ", texto)
+    # Viñetas con asterisco suelto `* Texto` -> `• Texto`
     texto = re.sub(r"^\s*[*]\s+", r"• ", texto, flags=re.MULTILINE)
+    # Quitar asteriscos dobles residuales
     texto = texto.replace("**", "")
+    # Quitar separadores de guiones largos feos `---`
     texto = re.sub(r"\n\s*---\s*\n", "\n\n", texto)
+    # Quitar saltos de línea excesivos
     texto = re.sub(r"\n{3,}", "\n\n", texto)
     return texto.strip()
 
@@ -341,6 +352,7 @@ def generar_grafico_evolucion_cartera_consolidada(user_id: int, periodo_solicita
                 df_tc['fecha_a'] = pd.to_datetime(df_tc['fecha_apertura']).dt.tz_localize(None).dt.floor('D')
             else:
                 df_tc['fecha_a'] = df_tc['fecha_d']
+            # PnL realizado se acredita linealmente entre apertura y cierre (evita saltos)
             incr = pd.Series(0.0, index=fechas_rango)
             for _, tr in df_tc.iterrows():
                 pnl = float(tr['pnl_usd'] or 0)
@@ -388,6 +400,7 @@ def generar_grafico_evolucion_cartera_consolidada(user_id: int, periodo_solicita
 
         pnl_final_usd = serie_pnl_total_usd.iloc[-1]
 
+        # Benchmark SPY en USD, reescalado al capital invertido inicial del período
         serie_spy = None
         spy_label = None
         try:
@@ -453,6 +466,7 @@ def generar_grafico_evolucion_por_activos(user_id: int, periodo_solicitado: str 
         fecha_start, desc_periodo = resolver_fecha_inicio(periodo_solicitado, primera_fecha_db)
         
         fechas_rango = pd.date_range(start=fecha_start, end=datetime.now().strftime('%Y-%m-%d'), freq='D')
+        
         colores = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#17becf', '#bcbd22']
         idx_color = 0
         
@@ -532,6 +546,7 @@ generar_grafico_por_activos = generar_grafico_evolucion_por_activos
 def generar_grafico_evolucion_activo(user_id: int, ticker: str, periodo_solicitado: str = ""):
     ticker = ticker.strip().upper()
     simbolo = normalizar_ticker_yf(ticker)
+    
     fecha_compra_db = None
     ppc_referencia = None
     
@@ -627,6 +642,9 @@ def describir_estructura(df, lookback=40):
     return "Rango / compresión", "lateral"
 
 def detectar_divergencia_rsi(df, window=25):
+    """
+    Detecta sobrecompra/sobreventa y divergencias REALES, PREDICTIVAS Y FRESCAS (no viejas ni agotadas).
+    """
     if len(df) < window:
         return "Sin datos suficientes"
     
@@ -637,6 +655,7 @@ def detectar_divergencia_rsi(df, window=25):
     precio_act = float(precios[-1])
     n = len(precios)
     
+    # 1. Alerta de nivel / proximidad en tiempo real
     alerta_nivel = f"Neutral ({rsi_act:.1f})"
     if rsi_act >= 70:
         alerta_nivel = f"🔥 SOBRECOMPRA ACTIVA ({rsi_act:.1f})"
@@ -647,30 +666,39 @@ def detectar_divergencia_rsi(df, window=25):
     elif rsi_act <= 36:
         alerta_nivel = f"⚠️ Por entrar en SOBREVENTA ({rsi_act:.1f} - cerca de piso)"
 
+    # 2. Búsqueda de pivotes en la ventana
     mitad = n // 2
     min_idx_1 = np.argmin(precios[:mitad])
     min_idx_2 = mitad + np.argmin(precios[mitad:])
+    
     max_idx_1 = np.argmax(precios[:mitad])
     max_idx_2 = mitad + np.argmax(precios[mitad:])
 
     p1_min, r1_min = precios[min_idx_1], rsis[min_idx_1]
     p2_min, r2_min = precios[min_idx_2], rsis[min_idx_2]
+
     p1_max, r1_max = precios[max_idx_1], rsis[max_idx_1]
     p2_max, r2_max = precios[max_idx_2], rsis[max_idx_2]
 
     barras_desde_max2 = (n - 1) - max_idx_2
     barras_desde_min2 = (n - 1) - min_idx_2
 
+    # A) DIVERGENCIAS BAJISTAS
+    # 1. PREDICTIVA: En formación activa ahora mismo
     if precio_act >= p1_max * 0.985 and rsi_act < r1_max - 2.5 and rsi_act > 58:
         return f"🔮 SE ESTÁ FORMANDO UNA POSIBLE DIVERGENCIA BAJISTA (Precio testeando zona de máximos en ${precio_act:,.2f} pero el RSI pierde fuerza en {rsi_act:.1f} vs {r1_max:.1f} previo)"
 
+    # 2. CONFIRMADA FRESCA (segundo pico en las últimas 3 velas)
     if barras_desde_max2 <= 3 and rsi_act >= 50:
         if p2_max > p1_max and r2_max < r1_max - 1.5 and r2_max > 55:
             return f"🔴 DIVERGENCIA BAJISTA CONFIRMADA (Máximo mayor en precio con RSI perdiendo fuerza: {r2_max:.1f} vs {r1_max:.1f})"
 
+    # B) DIVERGENCIAS ALCISTAS
+    # 1. PREDICTIVA: En formación activa ahora mismo
     if precio_act <= p1_min * 1.015 and rsi_act > r1_min + 2.0 and rsi_act < 44:
         return f"🔮 SE ESTÁ FORMANDO UNA POSIBLE DIVERGENCIA ALCISTA (Precio testeando mínimos en ${precio_act:,.2f} con RSI aguantando más arriba en {rsi_act:.1f} vs {r1_min:.1f} previo)"
 
+    # 2. CONFIRMADA FRESCA (segundo valle en las últimas 3 velas)
     if barras_desde_min2 <= 3 and rsi_act <= 50:
         if p2_min < p1_min and r2_min > r1_min + 1.5 and r2_min < 45:
             return f"🟢 DIVERGENCIA ALCISTA CONFIRMADA (Mínimo menor en precio con RSI en subida: {r2_min:.1f} vs {r1_min:.1f})"
@@ -1481,57 +1509,111 @@ def calcular_metricas_riesgo_completas(user_id: int):
         resultado["texto"] = "No se pudieron calcular las métricas de riesgo en este momento."
         return resultado
 
+
 def _serie_spy_ret(fecha_start: str):
-    try:
-        h = yf.Ticker("SPY").history(start=fecha_start)
-        if h.empty:
-            return None
-        s = h["Close"]
-        return float(s.iloc[-1] / s.iloc[0] - 1.0)
-    except Exception:
-        return None
+    """Retorno simple de SPY. None si no hay datos válidos (nunca NaN)."""
+    for sym in ("SPY", "SPY.US", "^GSPC"):
+        try:
+            h = yf.Ticker(sym).history(start=fecha_start, auto_adjust=True)
+            if h is None or h.empty or "Close" not in h.columns:
+                continue
+            s = h["Close"].replace([np.inf, -np.inf], np.nan).dropna()
+            if len(s) < 2:
+                continue
+            base = float(s.iloc[0])
+            last = float(s.iloc[-1])
+            if not np.isfinite(base) or not np.isfinite(last) or base <= 0:
+                continue
+            ret = last / base - 1.0
+            if not np.isfinite(ret):
+                continue
+            return ret
+        except Exception as e:
+            logger.warning(f"SPY {sym} falló: {e}")
+            continue
+    return None
+
+
+def _serie_capital_desplegado(df_inv, df_tc, fecha_start, fecha_end):
+    """Capital en juego por día (márgenes simultáneos). No suma trades reciclados."""
+    fechas = pd.date_range(start=fecha_start, end=fecha_end, freq="D")
+    cap = pd.Series(0.0, index=fechas)
+    if df_inv is not None and not df_inv.empty:
+        for _, row in df_inv.iterrows():
+            f0 = pd.to_datetime(row["fecha"]).tz_localize(None).floor("D")
+            margen = float(row["monto_total_usd"] or 0)
+            if margen == 0:
+                continue
+            mask = fechas >= f0
+            cap.loc[mask] += margen
+    if df_tc is not None and not df_tc.empty:
+        for _, row in df_tc.iterrows():
+            margen = float(row["monto_invertido"] or 0) if "monto_invertido" in row else 0.0
+            if margen <= 0:
+                continue
+            f_c = pd.to_datetime(row["fecha"]).tz_localize(None).floor("D")
+            f_a = row["fecha_apertura"] if "fecha_apertura" in row else None
+            f_a = pd.to_datetime(f_a).tz_localize(None).floor("D") if pd.notnull(f_a) else f_c
+            if f_a > f_c:
+                f_a = f_c
+            mask = (fechas >= f_a) & (fechas <= f_c)
+            cap.loc[mask] += margen
+    return cap
+
 
 def calcular_rendimiento_periodo(user_id: int, periodo: str = "ytd"):
+    """YTD / período: PnL + capital promedio real vs SPY."""
     hoy = datetime.now()
     fecha_start, desc = resolver_fecha_inicio(periodo, datetime(hoy.year, 1, 1).strftime("%Y-%m-%d"))
     start_dt = pd.to_datetime(fecha_start)
+    end_dt = pd.to_datetime(hoy.strftime("%Y-%m-%d"))
 
     with get_db_connection() as conn:
         df_tc = pd.read_sql(
             "SELECT fecha, fecha_apertura, pnl_usd, monto_invertido FROM trades_cerrados WHERE user_id = %s;",
             conn, params=(user_id,),
         )
+        df_inv = pd.read_sql(
+            "SELECT fecha, monto_total_usd FROM portafolio_inversiones WHERE user_id = %s;",
+            conn, params=(user_id,),
+        )
 
     pnl_realizado = 0.0
-    capital_cerrado = 0.0
     if not df_tc.empty:
         df_tc["fecha"] = pd.to_datetime(df_tc["fecha"])
-        mask = df_tc["fecha"] >= start_dt
-        sub = df_tc.loc[mask]
+        sub = df_tc.loc[df_tc["fecha"] >= start_dt]
         pnl_realizado = float(sub["pnl_usd"].sum()) if not sub.empty else 0.0
-        if "monto_invertido" in sub.columns and not sub.empty:
-            capital_cerrado = float(sub["monto_invertido"].fillna(0).sum())
 
     resumen = obtener_resumen_portafolio(user_id)
     pnl_flot = float(resumen["pnl_total_usd"]) if resumen else 0.0
     cap_abierto = float(resumen["total_invertido"]) if resumen else 0.0
     valor_actual = float(resumen["total_actual"]) if resumen else 0.0
-
     pnl_total = pnl_realizado + pnl_flot
-    capital_ref = cap_abierto + capital_cerrado
-    if capital_ref <= 0:
-        capital_ref = cap_abierto if cap_abierto > 0 else max(abs(pnl_total), 1.0)
-    ret_pct = (pnl_total / capital_ref * 100.0) if capital_ref else 0.0
 
+    cap_serie = _serie_capital_desplegado(df_inv, df_tc, start_dt, end_dt)
+    cap_positivo = cap_serie[cap_serie > 0]
+    capital_prom = float(cap_positivo.mean()) if not cap_positivo.empty else cap_abierto
+    capital_pico = float(cap_serie.max()) if len(cap_serie) else cap_abierto
+    if not np.isfinite(capital_prom) or capital_prom <= 0:
+        capital_prom = cap_abierto if cap_abierto > 0 else max(abs(pnl_total), 1.0)
+    if not np.isfinite(capital_pico) or capital_pico <= 0:
+        capital_pico = capital_prom
+
+    ret_pct = (pnl_total / capital_prom * 100.0) if capital_prom else 0.0
     dias = max(1, (hoy - start_dt.to_pydatetime()).days)
     años = dias / 365.25
-    if años > 0 and capital_ref > 0 and (1 + pnl_total / capital_ref) > 0:
-        cagr = ((1 + pnl_total / capital_ref) ** (1 / años) - 1) * 100.0
+    base = 1.0 + pnl_total / capital_prom if capital_prom else 1.0
+    if años > 0 and np.isfinite(base) and base > 0:
+        cagr = (base ** (1 / años) - 1) * 100.0
     else:
+        cagr = ret_pct
+    if not np.isfinite(ret_pct):
+        ret_pct = 0.0
+    if not np.isfinite(cagr):
         cagr = ret_pct
 
     spy_ret = _serie_spy_ret(fecha_start)
-    spy_pct = (spy_ret * 100.0) if spy_ret is not None else None
+    spy_pct = (spy_ret * 100.0) if spy_ret is not None and np.isfinite(spy_ret) else None
     alpha = (ret_pct - spy_pct) if spy_pct is not None else None
 
     lineas = [
@@ -1540,17 +1622,25 @@ def calcular_rendimiento_periodo(user_id: int, periodo: str = "ytd"):
         f"• PnL realizado en el período: ${pnl_realizado:+,.2f} USD",
         f"• PnL flotante actual: ${pnl_flot:+,.2f} USD",
         f"• PnL total (realizado + flotante): ${pnl_total:+,.2f} USD",
-        f"• Capital de referencia: ${capital_ref:,.2f} USD",
-        f"• Retorno del período: {ret_pct:+.2f}%",
+        f"• Capital abierto ahora: ${cap_abierto:,.2f} USD",
+        f"• Capital promedio en juego: ${capital_prom:,.2f} USD",
+        f"• Capital pico simultáneo: ${capital_pico:,.2f} USD",
+        f"• Retorno sobre capital promedio: {ret_pct:+.2f}%",
         f"• CAGR aprox.: {cagr:+.2f}%",
     ]
     if spy_pct is not None:
         lineas.append(f"• SPY en el mismo período: {spy_pct:+.2f}%")
         lineas.append(f"• Alpha vs SPY: {alpha:+.2f} pp")
+    else:
+        lineas.append("• SPY: sin dato válido en este período")
     lineas.append(f"• Valor actual abierto: ${valor_actual:,.2f} USD")
+    lineas.append("")
+    lineas.append("Nota: el % usa capital promedio simultáneo, no la suma de todos los trades (eso inflaba el número porque el mismo dinero se reutilizó). No incluye efectivo fuera del bot.")
     return "\n".join(lineas)
 
+
 def resumen_compacto_para_ia(user_id: int) -> str:
+    """Contexto corto para Gemini. Evita mandar 196 trades en cada mensaje."""
     resumen = obtener_resumen_portafolio(user_id)
     with get_db_connection() as conn:
         df_tc = pd.read_sql(
@@ -1586,6 +1676,7 @@ def resumen_compacto_para_ia(user_id: int) -> str:
             lineas.append(f"Movimientos {r['tipo']}: {int(r['n'])} / ${float(r['tot']):,.0f} ARS")
     return "\n".join(lineas)
 
+
 def llamar_gemini(prompt: str, system_instruction: str) -> str:
     response = ai_client.models.generate_content(
         model=GEMINI_MODEL,
@@ -1593,6 +1684,7 @@ def llamar_gemini(prompt: str, system_instruction: str) -> str:
         config={"system_instruction": system_instruction},
     )
     return response.text or ""
+
 
 # ==================== PRESUPUESTOS ====================
 def set_presupuesto(user_id: int, categoria: str, monto_limite: float, mes: int = None, anio: int = None):
@@ -1780,6 +1872,7 @@ def generar_alertas_para_usuario(user_id: int) -> list:
                     rsi = info.get("rsi", 50)
                     diag = info.get("diagnostico_rsi", "")
                     
+                    # Detección predictiva y confirmada para alertas
                     tipo_senal = None
                     if "SE ESTÁ FORMANDO" in diag.upper() or "EN FORMACIÓN" in diag.upper():
                         tipo_senal = "div_predictiva"
@@ -1841,6 +1934,7 @@ def generar_alertas_para_usuario(user_id: int) -> list:
     return alertas
 
 async def tarea_alertas_periodicas(app):
+    """Corre cada 3 horas. Ejecuta tareas síncronas bloqueantes en un worker thread para no congelar Telegram."""
     await asyncio.sleep(60)
     while True:
         try:
@@ -1885,6 +1979,7 @@ async def tarea_alertas_periodicas(app):
 # ==================== MOTOR DE MÉTRICAS ANALÍTICAS ====================
 def calcular_super_metricas_totales(user_id: int):
     metricas = []
+    
     pnl_realizado_total = 0.0
     cant_trades_cerrados = 0
     try:
@@ -2254,6 +2349,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Gemini solo entra si registrás un gasto/trade o preguntás algo que no sea comando."
     )
 
+
 def extraer_periodo(texto: str) -> str:
     tlow = (texto or "").lower()
     for key in ["ytd", "mtd", "wtd", "1y", "1a", "3m", "6m", "1m", "2m"]:
@@ -2266,6 +2362,7 @@ def extraer_periodo(texto: str) -> str:
         return "ytd"
     return ""
 
+
 async def enviar_grafico_cartera(update: Update, user_id: int, periodo: str = ""):
     buf = generar_grafico_evolucion_cartera_consolidada(user_id, periodo)
     if buf:
@@ -2276,6 +2373,7 @@ async def enviar_grafico_cartera(update: Update, user_id: int, periodo: str = ""
     else:
         await update.message.reply_text("No hay datos suficientes para la curva.")
 
+
 async def enviar_grafico_activos(update: Update, user_id: int, periodo: str = "", tickers=None):
     buf = generar_grafico_evolucion_por_activos(user_id, periodo, tickers)
     if buf:
@@ -2284,13 +2382,16 @@ async def enviar_grafico_activos(update: Update, user_id: int, periodo: str = ""
     else:
         await update.message.reply_text("No hay suficientes activos que coincidan.")
 
+
 async def intentar_comando_local(update: Update, user_id: int, user_msg: str) -> bool:
+    """True si se resolvió sin Gemini."""
     raw = (user_msg or "").strip()
     low = raw.lower().strip()
     if low.startswith("/"):
         low = low[1:]
         raw = raw[1:] if raw.startswith("/") else raw
 
+    # slash-like first token
     partes = raw.split()
     cmd = partes[0].lower() if partes else ""
     args = " ".join(partes[1:]) if len(partes) > 1 else ""
@@ -2379,6 +2480,7 @@ async def intentar_comando_local(update: Update, user_id: int, user_msg: str) ->
             await update.message.reply_text(f"No pude analizar {tk}.")
         return True
 
+    # Frases naturales frecuentes (sin Gemini)
     if re.search(r"\b(ytd|year to date|este año|este ano)\b", low) and not re.search(r"registr|anot|guarde|gan[eé]|gast[eé]", low):
         if re.search(r"graf|curva|evoluc|vs|spy", low):
             await enviar_grafico_cartera(update, user_id, "ytd")
@@ -2502,16 +2604,6 @@ async def cmd_objetivos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     texto = obtener_progreso_objetivos(user_id)
     await update.message.reply_text(texto)
 
-async def cmd_ytd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    per = extraer_periodo(update.message.text or "ytd") or "ytd"
-    await update.message.reply_text(calcular_rendimiento_periodo(user_id, per))
-
-async def cmd_cagr(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    per = extraer_periodo(update.message.text or "ytd") or "ytd"
-    await update.message.reply_text(calcular_rendimiento_periodo(user_id, per))
-
 async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_msg = update.message.text
@@ -2547,11 +2639,13 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "ACCION: VER_RIESGO", "ACCION: VER_PRESUPUESTOS", "ACCION: VER_OBJETIVOS"]:
             texto_limpio = texto_limpio.replace(tag, "")
 
+        # Escáner de cartera
         necesita_escanear_cartera = "ACCION: ESCANEAR_CARTERA" in reply
         if not necesita_escanear_cartera and re.search(r"(?:analiza(?:me)?\s+todos?\s+(?:mis\s+)?activos?|escanear?\s+(?:mi\s+)?cartera|revisa(?:me)?\s+mis\s+activos)", user_msg, re.IGNORECASE):
             necesita_escanear_cartera = True
         texto_limpio = texto_limpio.replace("ACCION: ESCANEAR_CARTERA", "")
 
+        # Análisis técnico individual
         ticker_at = None
         tf_at = "diario"
         m_at = re.search(r"ACCION:\s*ANALIZAR_ACTIVO\|([^\n\r|]+)(?:\|([^\n\r]+))?", texto_limpio)
@@ -2570,12 +2664,14 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 tf_at = "diario"
 
+        # Cotización
         ticker_a_cotizar = None
         m_precio = re.search(r"ACCION: CONSULTA_PRECIO\|([^\n\r]+)", texto_limpio)
         if m_precio:
             ticker_a_cotizar = m_precio.group(1).strip()
             texto_limpio = texto_limpio.replace(m_precio.group(0), "")
 
+        # Gráfico por activos
         necesita_grafico_por_activos = False
         periodo_por_activos = ""
         tickers_filtro_activos = []
@@ -2588,6 +2684,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 tickers_filtro_activos = [t.strip().upper() for t in raw_tks.split(",") if t.strip()]
             texto_limpio = texto_limpio.replace(m_gpa.group(0), "")
 
+        # Gráfico consolidado
         necesita_grafico_consolidado = False
         periodo_consolidado = ""
         m_gc = re.search(r"ACCION: GRAFICO_EVOLUCION_CARTERA_CONSOLIDADA(?:\|([^\n\r]+))?", texto_limpio)
@@ -2603,6 +2700,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 periodo_consolidado = m_gc_old.group(1).strip() if m_gc_old.group(1) else ""
                 texto_limpio = texto_limpio.replace(m_gc_old.group(0), "")
 
+        # Gráfico activo individual
         ticker_grafico_evol = None
         periodo_activo = ""
         m_ga = re.search(r"ACCION: GRAFICO_EVOLUCION_ACTIVO\|([^\n\r|]+)(?:\|([^\n\r]+))?", texto_limpio)
@@ -2611,6 +2709,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             periodo_activo = m_ga.group(2).strip() if m_ga.group(2) else ""
             texto_limpio = texto_limpio.replace(m_ga.group(0), "")
 
+        # Fallback inteligente multi-ticker
         es_pedido_grafico_o_comparativa = bool(re.search(r"(?:grafico|grafica|evolucion|compara|comparame|comparar|vs|versus)", user_msg, re.IGNORECASE))
         if es_pedido_grafico_o_comparativa and not necesita_grafico_consolidado:
             tickers_posibles = ["MELI", "NU", "GGAL", "SUPV", "NVDA", "BTC", "SOL", "YPF", "VIST", "MSFT", "META", "AMD", "TSLA", "GOOGL", "LOMA", "ETH", "BNB"]
@@ -2626,6 +2725,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if not periodo_por_activos:
                     periodo_por_activos = periodo_activo
 
+        # Cierre de posición
         m_close_pos = re.search(r"ACCION: CERRAR_POSICION\|(\d+)(?:\|([^|\n\r]*))?(?:\|([^\n\r]*))?", texto_limpio)
         if m_close_pos:
             c_inv_id = int(m_close_pos.group(1))
@@ -2641,6 +2741,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 texto_limpio += f"\n\n⚠️ No se pudo cerrar: {msg_cierre}"
 
+        # Agregar margen
         m_add_m = re.search(r"ACCION: AGREGAR_MARGEN\|(\d+)\|([^\n\r]+)", texto_limpio)
         if m_add_m:
             inv_id_m = int(m_add_m.group(1))
@@ -2652,6 +2753,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 texto_limpio += f"\n\n⚠️ No se encontró la posición ID {inv_id_m}."
 
+        # Modificaciones
         m_mod_inv = re.search(r"ACCION: MODIFICAR_INVERSION\|(\d+)\|([^|\n\r]+)\|([^\n\r]+)", texto_limpio)
         if m_mod_inv:
             inv_id = int(m_mod_inv.group(1))
@@ -2670,6 +2772,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             prev, info = modificar_movimiento_por_id(user_id, mov_id, campo, val)
             texto_limpio += f"\n\n✏️ Movimiento ID {mov_id}: {info}"
 
+        # Presupuestos
         m_set_pres = re.search(r"ACCION: SET_PRESUPUESTO\|([^|\n\r]+)\|([^\n\r]+)", texto_limpio)
         if m_set_pres:
             cat = m_set_pres.group(1).strip()
@@ -2678,6 +2781,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             c, m, mes, anio = set_presupuesto(user_id, cat, monto)
             texto_limpio += f"\n\n📅 Presupuesto guardado: {c} → ${m:,.0f} ARS ({mes:02d}/{anio})"
 
+        # Objetivos
         m_obj = re.search(r"ACCION: CREAR_OBJETIVO\|([^|\n\r]+)\|([^|\n\r]+)\|([^|\n\r]+)(?:\|([^\n\r]*))?", texto_limpio)
         if m_obj:
             desc = m_obj.group(1).strip()
@@ -2688,6 +2792,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             oid = crear_objetivo(user_id, desc, tipo, monto, fecha)
             texto_limpio += f"\n\n🎯 Objetivo creado (ID {oid}): {desc} → ${monto:,.0f}"
 
+        # Borrados
         m_btk = re.search(r"ACCION: BORRAR_INVERSION_TICKER\|([^\n\r]+)", texto_limpio)
         if m_btk:
             tk_b = m_btk.group(1).strip()
@@ -2719,6 +2824,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if r_del:
                 texto_limpio += f"\n\n🗑️ Eliminado gasto/ingreso ID {mid_b}"
 
+        # Registro Trade Cerrado
         match_tc = re.search(r"REGISTRO_TRADE_CERRADO:\s*([^\n\r]+)", texto_limpio)
         if match_tc:
             linea_tc = match_tc.group(1).strip()
@@ -2738,6 +2844,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f_txt = f" — {f}" if f else ""
             texto_limpio = f"{texto_limpio}\n\n🏆 Trade cerrado registrado: {t} [{tp}] | PnL {signo_p}${p:,.2f} USD{roi_s}{f_txt} (ID {tid})".strip()
 
+        # Registro Inversión
         match_inv = re.search(r"REGISTRO_INV:\s*([^\n\r]+)", texto_limpio)
         if match_inv:
             linea_inv = match_inv.group(1).strip()
@@ -2760,6 +2867,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             liq_str = f" | Liq est: ${liq_t:,.2f}" if liq_t else ""
             texto_limpio = f"{texto_limpio}\n\n💼 Guardado como abierto: {t}{lev_str} | Margen ${m:,.2f} | PPC ${p:,.2f} | Cant {c:,.4f}{liq_str}{fecha_str}".strip()
 
+        # Registro ARS
         match_ars = re.search(r"REGISTRO_ARS:\s*([^\n\r]+)", texto_limpio)
         if match_ars:
             linea_ars = match_ars.group(1).strip()
@@ -2786,10 +2894,12 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 texto_limpio += "\n\n⚠️ No había registros para borrar."
 
+        # Limpiar tags residuales
         texto_limpio = re.sub(r"ACCION:\s*[^\n\r]+", "", texto_limpio)
         texto_limpio = re.sub(r"REGISTRO_[^\n\r]+", "", texto_limpio)
         texto_limpio = limpiar_estilo_telegram(texto_limpio)
 
+        # Cotización puntual
         if ticker_a_cotizar:
             datos_mkt = consultar_datos_mercado(ticker_a_cotizar)
             if datos_mkt:
@@ -2805,12 +2915,14 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 texto_limpio = f"{texto_limpio}\n\n{msg_mkt}".strip()
 
+        # Envío del texto principal
         if texto_limpio:
             try:
                 await update.message.reply_text(texto_limpio)
             except Exception:
                 await update.message.reply_text(texto_limpio)
 
+        # Acciones especiales
         if necesita_ver_riesgo:
             metricas = calcular_metricas_riesgo_completas(user_id)
             await update.message.reply_text(metricas["texto"])
@@ -2872,6 +2984,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if necesita_cartera:
             resumen = obtener_resumen_portafolio(user_id)
+            
             with get_db_connection() as conn:
                 df_tc = pd.read_sql("SELECT SUM(pnl_usd) as pnl_tot, COUNT(id) as total_c FROM trades_cerrados WHERE user_id = %s;", conn, params=(user_id,))
             pnl_realizado = float(df_tc['pnl_tot'].iloc[0]) if not df_tc.empty and pd.notnull(df_tc['pnl_tot'].iloc[0]) else 0.0
@@ -2953,7 +3066,9 @@ async def cmd_excel_alias(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_analisis_alias(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await intentar_comando_local(update, update.effective_user.id, update.message.text or "/analisis")
 
+
 async def main():
+
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", cmd_borrar_todo))
@@ -2964,14 +3079,15 @@ async def main():
     app.add_handler(CommandHandler("help", start))
     app.add_handler(CommandHandler("ayuda", start))
     app.add_handler(CommandHandler("cartera", cmd_resumen))
-    app.add_handler(CommandHandler("ytd", cmd_ytd))
-    app.add_handler(CommandHandler("cagr", cmd_cagr))
+    app.add_handler(CommandHandler("ytd", lambda u, c: u.message.reply_text(calcular_rendimiento_periodo(u.effective_user.id, extraer_periodo(u.message.text or "ytd") or "ytd"))))
+    app.add_handler(CommandHandler("cagr", lambda u, c: u.message.reply_text(calcular_rendimiento_periodo(u.effective_user.id, extraer_periodo(u.message.text or "ytd") or "ytd"))))
     app.add_handler(CommandHandler("spy", cmd_spy_alias))
     app.add_handler(CommandHandler("grafico", cmd_grafico_alias))
     app.add_handler(CommandHandler("activos", cmd_activos_alias))
     app.add_handler(CommandHandler("precio", cmd_precio_alias))
     app.add_handler(CommandHandler("excel", cmd_excel_alias))
     app.add_handler(CommandHandler("analisis", cmd_analisis_alias))
+    app.add_handler(CommandHandler("análisis", cmd_analisis_alias))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, responder))
     
     await app.initialize()
