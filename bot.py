@@ -150,7 +150,7 @@ def init_db():
                 cursor.execute("ALTER TABLE trades_cerrados ADD COLUMN IF NOT EXISTS fecha_apertura TIMESTAMP;")
 
                 cursor.execute("UPDATE movimientos SET user_id = %s WHERE user_id IS NULL;", (LUCHO_TELEGRAM_ID,))
-                cursor.execute("UPDATE portafolio_inversiones SET user_id = %s WHERE user_id IS NULL;", (LUCHO_TELEGRAM_ID,))
+                cursor.execute("UPDATE portafolio_inversIONES SET user_id = %s WHERE user_id IS NULL;", (LUCHO_TELEGRAM_ID,))
                 cursor.execute("UPDATE trades_cerrados SET user_id = %s WHERE user_id IS NULL;", (LUCHO_TELEGRAM_ID,))
 
                 cursor.execute("UPDATE portafolio_inversiones SET tipo_posicion = 'SPOT' WHERE tipo_posicion IS NULL OR TRIM(tipo_posicion) = '';")
@@ -281,7 +281,7 @@ def resolver_fecha_inicio(periodo_str: str, fecha_compra_db: str = None):
     
     return (hoy - timedelta(days=180)).strftime('%Y-%m-%d'), "Últimos 6 meses"
 
-# ==================== GRÁFICO CONSOLIDADO: UNA SOLA LÍNEA DE CARTERA ====================
+# ==================== GRÁFICO CONSOLIDADO: TWR VS SPY Y USD ====================
 def generar_grafico_evolucion_cartera_consolidada(user_id: int, periodo_solicitado: str = "", modo: str = "usd"):
     try:
         with get_db_connection() as conn:
@@ -335,6 +335,7 @@ def generar_grafico_evolucion_cartera_consolidada(user_id: int, periodo_solicita
         serie_valor_mercado = pd.Series(0.0, index=fechas_rango)
         serie_pnl_cerrado_acum = pd.Series(0.0, index=fechas_rango)
 
+        # 1. Procesar trades cerrados sumando PnL prorrateado y margen a capital invertido
         if not df_tc.empty:
             df_tc['fecha_d'] = pd.to_datetime(df_tc['fecha']).dt.tz_localize(None).dt.floor('D')
             if 'fecha_apertura' in df_tc.columns:
@@ -344,6 +345,7 @@ def generar_grafico_evolucion_cartera_consolidada(user_id: int, periodo_solicita
             incr = pd.Series(0.0, index=fechas_rango)
             for _, tr in df_tc.iterrows():
                 pnl = float(tr['pnl_usd'] or 0)
+                margen_c = float(tr['monto_invertido'] or 0) if 'monto_invertido' in tr and pd.notnull(tr['monto_invertido']) else 0.0
                 f_c = tr['fecha_d']
                 f_a = tr['fecha_a'] if pd.notnull(tr['fecha_a']) else f_c
                 if pd.isnull(f_a) or pd.isnull(f_c):
@@ -357,8 +359,14 @@ def generar_grafico_evolucion_cartera_consolidada(user_id: int, periodo_solicita
                         incr.loc[f_c] += pnl
                 else:
                     incr.loc[mask] += pnl / n
+                
+                # Sumar margen solo mientras el trade estuvo abierto
+                if margen_c > 0:
+                    serie_capital_invertido.loc[mask] += margen_c
+                    
             serie_pnl_cerrado_acum = incr.cumsum()
 
+        # 2. Procesar posiciones abiertas
         for _, pos in df_inv.iterrows():
             pos_fecha = pd.to_datetime(pos['fecha']).tz_localize(None).floor('D')
             tk = pos['ticker']
@@ -385,7 +393,6 @@ def generar_grafico_evolucion_cartera_consolidada(user_id: int, periodo_solicita
 
         serie_pnl_flotante = serie_valor_mercado - serie_capital_invertido
         serie_pnl_total_usd = serie_pnl_flotante + serie_pnl_cerrado_acum
-
         pnl_final_usd = serie_pnl_total_usd.iloc[-1]
 
         sspy = None
@@ -398,31 +405,43 @@ def generar_grafico_evolucion_cartera_consolidada(user_id: int, periodo_solicita
         except Exception:
             sspy = None
 
-        cap_pos = serie_capital_invertido.replace(0, np.nan).dropna()
-        cap0 = float(cap_pos.iloc[0]) if not cap_pos.empty else None
         modo = (modo or "usd").lower()
-
         fig, ax = plt.subplots(figsize=(10, 5.2))
+
         if modo in ("pct", "percent", "%", "spy"):
-            if cap0 and cap0 > 0:
-                serie_cartera_pct = (serie_pnl_total_usd / cap0) * 100.0
-            else:
-                serie_cartera_pct = serie_pnl_total_usd * 0.0
+            # === CÁLCULO TWR (TIME-WEIGHTED RETURN) REALISTA ===
+            serie_nav = serie_capital_invertido + serie_pnl_total_usd
+            # Establecer un piso mínimo para evitar división por cero si no hay trades abiertos en alguna fecha
+            cap_validos = serie_capital_invertido[serie_capital_invertido > 0]
+            nav_floor = float(cap_validos.min()) if not cap_validos.empty else 100.0
+            nav_sano = serie_nav.clip(lower=nav_floor)
+            nav_prev = nav_sano.shift(1).bfill()
+
+            dpnl = serie_pnl_total_usd.diff().fillna(0.0)
+            r = dpnl / nav_prev
+            r = r.replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(-0.5, 0.5)
+
+            twr_cum = (1.0 + r).cumprod() - 1.0
+            serie_cartera_pct = twr_cum * 100.0
+
             ret_c = float(serie_cartera_pct.iloc[-1]) if len(serie_cartera_pct) else 0.0
             if not np.isfinite(ret_c):
                 ret_c = 0.0
+
             color_linea = "#00b06f" if ret_c >= 0 else "#e04050"
-            ax.plot(fechas_rango, serie_cartera_pct, label=f"Tu cartera ({ret_c:+.1f}%)", color=color_linea, linewidth=2.4)
+            ax.plot(fechas_rango, serie_cartera_pct, label=f"Tu cartera TWR ({ret_c:+.1f}%)", color=color_linea, linewidth=2.4)
             ax.fill_between(fechas_rango, serie_cartera_pct, 0, where=(serie_cartera_pct >= 0), alpha=0.15, color="#00b06f")
             ax.fill_between(fechas_rango, serie_cartera_pct, 0, where=(serie_cartera_pct < 0), alpha=0.15, color="#e04050")
+
             if sspy is not None and float(sspy.dropna().iloc[0]) > 0:
                 base = float(sspy.dropna().iloc[0])
                 serie_spy_pct = (sspy / base - 1.0) * 100.0
                 spy_ret = float(serie_spy_pct.dropna().iloc[-1])
                 if np.isfinite(spy_ret):
                     ax.plot(fechas_rango, serie_spy_pct, label=f"SPY ({spy_ret:+.1f}%)", color="#5b8def", linewidth=1.8, linestyle="--")
+
             ax.axhline(0, color="gray", linestyle="--", linewidth=1.1, alpha=0.7)
-            ax.set_title(f"Rendimiento %: tu cartera vs SPY\n{desc_periodo}", fontsize=12, fontweight='bold', pad=12)
+            ax.set_title(f"Rendimiento TWR %: tu cartera vs SPY\n{desc_periodo}", fontsize=12, fontweight='bold', pad=12)
             ax.set_ylabel("Rendimiento acumulado (%)")
         else:
             color_linea = "#00b06f" if pnl_final_usd >= 0 else "#e04050"
@@ -432,6 +451,7 @@ def generar_grafico_evolucion_cartera_consolidada(user_id: int, periodo_solicita
             ax.axhline(0, color="gray", linestyle="--", linewidth=1.1, alpha=0.7)
             ax.set_title(f"Evolución de cartera en USD (PnL realizado + flotante)\n{desc_periodo}", fontsize=12, fontweight='bold', pad=12)
             ax.set_ylabel("Ganancia / Pérdida acumulada (USD)")
+
         ax.grid(True, linestyle="--", alpha=0.35)
         ax.legend(loc="upper left", frameon=True)
         ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
@@ -1532,7 +1552,7 @@ def _serie_capital_desplegado(df_inv, df_tc, fecha_start, fecha_end):
             cap.loc[mask] += margen
     if df_tc is not None and not df_tc.empty:
         for _, row in df_tc.iterrows():
-            margen = float(row["monto_invertido"] or 0) if "monto_invertido" in row else 0.0
+            margen = float(row["monto_invertido"] or 0) if "monto_invertido" in row and pd.notnull(row["monto_invertido"]) else 0.0
             if margen <= 0:
                 continue
             f_c = pd.to_datetime(row["fecha"]).tz_localize(None).floor("D")
@@ -1581,25 +1601,74 @@ def calcular_rendimiento_periodo(user_id: int, periodo: str = "ytd"):
     if not np.isfinite(capital_pico) or capital_pico <= 0:
         capital_pico = capital_prom
 
-    ret_pct = (pnl_total / capital_prom * 100.0) if capital_prom else 0.0
+    # === CÁLCULO TWR (TIME-WEIGHTED RETURN) DIARIO ===
+    pnl_proxy = cap_serie.copy() * 0.0
+    if not df_tc.empty:
+        for _, tr in df_tc.iterrows():
+            pnl = float(tr["pnl_usd"] or 0)
+            f_c = pd.to_datetime(tr["fecha"]).tz_localize(None).floor("D")
+            f_a = tr["fecha_apertura"] if "fecha_apertura" in tr else None
+            f_a = pd.to_datetime(f_a).tz_localize(None).floor("D") if pd.notnull(f_a) else f_c
+            if pd.isnull(f_a) or pd.isnull(f_c):
+                continue
+            if f_a > f_c:
+                f_a = f_c
+            mask = (pnl_proxy.index >= f_a) & (pnl_proxy.index <= f_c)
+            n = int(mask.sum())
+            if n <= 0:
+                continue
+            pnl_proxy.loc[mask] += pnl / n
+        pnl_proxy = pnl_proxy.cumsum()
+        
+    if len(pnl_proxy):
+        pnl_proxy.iloc[-1] = float(pnl_proxy.iloc[-1]) + pnl_flot
+
+    # NAV con floor de seguridad para evitar saltos infinitos en cash cero
+    nav_raw = cap_serie + pnl_proxy
+    nav_sano = nav_raw.clip(lower=max(capital_prom * 0.25, 50.0))
+    nav_prev = nav_sano.shift(1).bfill()
+    dpnl = pnl_proxy.diff().fillna(0.0)
+    
+    r = dpnl / nav_prev
+    r = r.replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(-0.5, 0.5)
+    twr = float((1.0 + r).prod() - 1.0) if len(r) else 0.0
+    twr_pct = twr * 100.0
+
+    dietz_pct = (pnl_total / capital_prom * 100.0) if capital_prom else 0.0
+    if not np.isfinite(twr_pct):
+        twr_pct = 0.0
+    if not np.isfinite(dietz_pct):
+        dietz_pct = 0.0
+
     dias = max(1, (hoy - start_dt.to_pydatetime()).days)
     años = dias / 365.25
-    base = 1.0 + pnl_total / capital_prom if capital_prom else 1.0
-    if años > 0 and np.isfinite(base) and base > 0:
-        cagr = (base ** (1 / años) - 1) * 100.0
+    base_cagr = 1.0 + twr
+    if años > 0 and np.isfinite(base_cagr) and base_cagr > 0:
+        cagr = (base_cagr ** (1 / años) - 1) * 100.0
     else:
-        cagr = ret_pct
-    if not np.isfinite(ret_pct):
-        ret_pct = 0.0
+        cagr = twr_pct
     if not np.isfinite(cagr):
-        cagr = ret_pct
+        cagr = twr_pct
 
     spy_ret = _serie_spy_ret(fecha_start)
     spy_pct = (spy_ret * 100.0) if spy_ret is not None and np.isfinite(spy_ret) else None
-    alpha = (ret_pct - spy_pct) if spy_pct is not None else None
+    alpha = (twr_pct - spy_pct) if spy_pct is not None else None
 
     lineas = [
         f"📈 RENDIMIENTO — {desc}",
+        "",
+        f"• Retorno TWR (Ponderado en Tiempo): {twr_pct:+.2f}%",
+        f"• Retorno Dietz (Sobre Capital Promedio): {dietz_pct:+.2f}%",
+        f"• CAGR aprox.: {cagr:+.2f}%",
+    ]
+    if spy_pct is not None:
+        signo_alpha = "+" if alpha >= 0 else ""
+        lineas.append(f"• SPY (Benchmark): {spy_pct:+.2f}%")
+        lineas.append(f"• Alpha vs SPY: {signo_alpha}{alpha:.2f} pp")
+    else:
+        lineas.append("• SPY: sin dato válido en este período")
+
+    lineas.extend([
         "",
         f"• PnL realizado en el período: ${pnl_realizado:+,.2f} USD",
         f"• PnL flotante actual: ${pnl_flot:+,.2f} USD",
@@ -1607,17 +1676,10 @@ def calcular_rendimiento_periodo(user_id: int, periodo: str = "ytd"):
         f"• Capital abierto ahora: ${cap_abierto:,.2f} USD",
         f"• Capital promedio en juego: ${capital_prom:,.2f} USD",
         f"• Capital pico simultáneo: ${capital_pico:,.2f} USD",
-        f"• Retorno sobre capital promedio: {ret_pct:+.2f}%",
-        f"• CAGR aprox.: {cagr:+.2f}%",
-    ]
-    if spy_pct is not None:
-        lineas.append(f"• SPY en el mismo período: {spy_pct:+.2f}%")
-        lineas.append(f"• Alpha vs SPY: {alpha:+.2f} pp")
-    else:
-        lineas.append("• SPY: sin dato válido en este período")
-    lineas.append(f"• Valor actual abierto: ${valor_actual:,.2f} USD")
-    lineas.append("")
-    lineas.append("Nota: el % usa capital promedio simultáneo, no la suma de todos los trades. No incluye efectivo fuera del bot.")
+        f"• Valor actual abierto: ${valor_actual:,.2f} USD",
+        "",
+        "Nota: TWR mide la habilidad pura aislando flujos de capital. Dietz mide el retorno sobre el capital promedio que tuviste en riesgo."
+    ])
     return "\n".join(lineas)
 
 def resumen_compacto_para_ia(user_id: int) -> str:
@@ -1911,7 +1973,6 @@ def generar_alertas_para_usuario(user_id: int) -> list:
     return alertas
 
 async def tarea_alertas_periodicas(app):
-    """Corre cada 3 horas. Ejecuta tareas síncronas bloqueantes en un worker thread para no congelar Telegram."""
     await asyncio.sleep(60)
     while True:
         try:
@@ -1956,7 +2017,6 @@ async def tarea_alertas_periodicas(app):
 # ==================== MOTOR DE MÉTRICAS ANALÍTICAS ====================
 def calcular_super_metricas_totales(user_id: int):
     metricas = []
-    
     pnl_realizado_total = 0.0
     cant_trades_cerrados = 0
     try:
@@ -2238,7 +2298,6 @@ REGLAS DE GRÁFICOS (MUY ESTRICTAS Y OBLIGATORIAS):
    Si el usuario pide ver el gráfico o la evolución de DOS O MÁS ACTIVOS:
    DEBES EMITIR OBLIGATORIAMENTE AL FINAL DE TU MENSAJE:
    ACCION: GRAFICO_EVOLUCION_POR_ACTIVOS|[PERIODO_DETECTADO]|[TICKERS_SEPARADOS_POR_COMA]
-   Ejemplo: ACCION: GRAFICO_EVOLUCION_POR_ACTIVOS||MELI,NU
 
 2. TODOS LOS ACTIVOS DE LA CARTERA:
    Si el usuario pide ver todos los activos juntos:
@@ -2278,26 +2337,17 @@ REGLAS DE BORRADO:
 - Resetear todo: ACCION: BORRAR_TODO
 
 REGLAS DE PRESUPUESTOS:
-- Si el usuario quiere definir o cambiar un presupuesto:
-  ACCION: SET_PRESUPUESTO|[CATEGORIA]|[MONTO]
-  Ejemplo: ACCION: SET_PRESUPUESTO|Comida|180000
-
-- Si pide ver el progreso de presupuestos:
-  ACCION: VER_PRESUPUESTOS
+- Definir o cambiar un presupuesto: ACCION: SET_PRESUPUESTO|[CATEGORIA]|[MONTO]
+- Ver progreso de presupuestos: ACCION: VER_PRESUPUESTOS
 
 REGLAS DE OBJETIVOS:
-- Si el usuario define un objetivo (ej: "quiero llegar a 5000 usd de capital", "objetivo ganar 2000 este año"):
-  ACCION: CREAR_OBJETIVO|[DESCRIPCION]|[TIPO]|[MONTO]|[FECHA_YYYY-MM-DD_O_VACIO]
-  TIPO puede ser: CAPITAL o PNL
-
-- Si pide ver objetivos:
-  ACCION: VER_OBJETIVOS
+- Definir un objetivo: ACCION: CREAR_OBJETIVO|[DESCRIPCION]|[TIPO]|[MONTO]|[FECHA_YYYY-MM-DD_O_VACIO]
+- Ver objetivos: ACCION: VER_OBJETIVOS
 
 REGLAS DE MÉTRICAS DE RIESGO:
-- Si pide métricas de riesgo, performance, drawdown, sharpe, win rate, etc.:
-  ACCION: VER_RIESGO
+- Si pide métricas de riesgo o performance: ACCION: VER_RIESGO
 
-REGLAS GENERALes:
+REGLAS GENERALES:
 - Registro ARS: REGISTRO_ARS: [TIPO]|[MONTO]|[CATEGORIA]|[DESCRIPCION]|[FECHA_YYYY-MM-DD]
 - Ver cartera y balance: ACCION: VER_CARTERA
 - Cotización en vivo: ACCION: CONSULTA_PRECIO|[TICKER]
@@ -2311,16 +2361,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 ¡Hola! Soy tu asistente financiero cuantitativo.\n\n"
         "📈 Gráficos\n"
-        "• Evolución de MELI y NU\n"
-        "• Evolución de mi cartera\n"
-        "• Evolución dividida por activo\n\n"
+        "• /spy        →  Rendimiento TWR vs S&P 500\n"
+        "• /grafico    →  Curva de PnL en USD\n"
+        "• /activos    →  Comparativa relativa de activos\n\n"
         "🟢 Posiciones abiertas\n"
         "• ¿Cómo vienen mis posiciones?\n"
         "• Cerré la posición ID 2 con 150 usd de ganancia\n\n"
         "🏆 Trades cerrados\n"
         "• Gané 450 usd en un trade de SOL\n\n"
-        "💼 Resumen rápido (sin IA)\n"
+        "💼 Resumen rápido\n"
         "/resumen  →  balance consolidado\n"
+        "/ytd      →  rendimiento TWR + Dietz + Alpha SPY\n"
         "/riesgo   →  métricas de riesgo + liquidaciones\n"
         "/mes      →  gastos del mes + presupuestos\n"
         "/objetivos →  progreso de metas\n\n"
@@ -2343,7 +2394,7 @@ async def enviar_grafico_cartera(update: Update, user_id: int, periodo: str = ""
     buf = generar_grafico_evolucion_cartera_consolidada(user_id, periodo, modo=modo)
     if buf:
         if modo in ("pct", "percent", "%", "spy"):
-            cap = f"📊 Cartera vs SPY en % ({periodo or 'histórico'})"
+            cap = f"📊 Cartera vs SPY en TWR % ({periodo or 'histórico'})"
         else:
             cap = f"📈 Cartera en USD ({periodo or 'histórico'}) — PnL realizado + flotante"
         await update.message.reply_photo(photo=buf, caption=cap)
@@ -2376,7 +2427,7 @@ async def intentar_comando_local(update: Update, user_id: int, user_msg: str) ->
     if cmd in ("resumen", "cartera", "balance"):
         await cmd_resumen(update, None)
         return True
-    if cmd in ("ytd", "rendimiento"):
+    if cmd in ("ytd", "rendimiento", "twr"):
         await update.message.reply_text(calcular_rendimiento_periodo(user_id, periodo or "ytd"))
         return True
     if cmd in ("cagr", "alpha"):
@@ -2392,7 +2443,7 @@ async def intentar_comando_local(update: Update, user_id: int, user_msg: str) ->
             tks = [x.strip().upper() for x in re.split(r"[\s,]+", args) if x.strip() and x.lower() not in ("ytd","mtd","1y","3m","6m","1m")]
             tks = [x for x in tks if re.match(r"^[A-Z0-9]{1,12}$", x)]
             await enviar_grafico_activos(update, user_id, periodo, tks or None)
-        elif re.search(r"spy|%|porcent", low):
+        elif re.search(r"spy|%|porcent|twr", low):
             await enviar_grafico_cartera(update, user_id, periodo or "ytd", modo="pct")
         else:
             await enviar_grafico_cartera(update, user_id, periodo, modo="usd")
@@ -2455,9 +2506,9 @@ async def intentar_comando_local(update: Update, user_id: int, user_msg: str) ->
             await update.message.reply_text(f"No pude analizar {tk}.")
         return True
 
-    if re.search(r"\b(ytd|year to date|este año|este ano)\b", low) and not re.search(r"registr|anot|guarde|gan[eé]|gast[eé]", low):
+    if re.search(r"\b(ytd|year to date|este año|este ano|twr)\b", low) and not re.search(r"registr|anot|guarde|gan[eé]|gast[eé]", low):
         if re.search(r"graf|curva|evoluc|vs|spy", low):
-            await enviar_grafico_cartera(update, user_id, "ytd")
+            await enviar_grafico_cartera(update, user_id, "ytd", modo="pct")
         await update.message.reply_text(calcular_rendimiento_periodo(user_id, "ytd"))
         return True
     if re.search(r"\b(cagr|alpha)\b", low):
@@ -2868,12 +2919,10 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 texto_limpio += "\n\n⚠️ No había registros para borrar."
 
-        # Limpiar tags residuales
         texto_limpio = re.sub(r"ACCION:\s*[^\n\r]+", "", texto_limpio)
         texto_limpio = re.sub(r"REGISTRO_[^\n\r]+", "", texto_limpio)
         texto_limpio = limpiar_estilo_telegram(texto_limpio)
 
-        # Cotización puntual
         if ticker_a_cotizar:
             datos_mkt = consultar_datos_mercado(ticker_a_cotizar)
             if datos_mkt:
@@ -2889,14 +2938,9 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 texto_limpio = f"{texto_limpio}\n\n{msg_mkt}".strip()
 
-        # Envío del texto principal
         if texto_limpio:
-            try:
-                await update.message.reply_text(texto_limpio)
-            except Exception:
-                await update.message.reply_text(texto_limpio)
+            await update.message.reply_text(texto_limpio)
 
-        # Acciones especiales
         if necesita_ver_riesgo:
             metricas = calcular_metricas_riesgo_completas(user_id)
             await update.message.reply_text(metricas["texto"])
@@ -2910,17 +2954,13 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if necesita_escanear_cartera:
             resumen_escaner, fotos_senales = escanear_cartera_senales(user_id)
-            try:
-                await update.message.reply_text(resumen_escaner)
-            except Exception:
-                await update.message.reply_text(resumen_escaner)
+            await update.message.reply_text(resumen_escaner)
             for buf_foto, cap_foto in fotos_senales:
                 await update.message.reply_photo(photo=buf_foto, caption=cap_foto)
 
         if ticker_at:
             con_fibo = bool(re.search(r'\bfibo\b|\bfibonacci\b|\bretroceso\b', user_msg, re.IGNORECASE))
             con_ext = bool(re.search(r'\bextensi[oó]n\b|\bext\b', user_msg, re.IGNORECASE))
-            
             buf_img, info_at = generar_grafico_analisis_tecnico(ticker_at, tf_at, con_fibo, con_ext)
             if buf_img and info_at and not isinstance(info_at, str):
                 tags = "EMAs + RSI"
@@ -2928,7 +2968,6 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     tags += " + Fibo"
                 cap_txt = f"📈 {ticker_at} ({tf_at.capitalize()}) | {tags}"
                 await update.message.reply_photo(photo=buf_img, caption=cap_txt)
-                
                 reporte_txt = formatear_reporte_tecnico(info_at)
                 await update.message.reply_text(reporte_txt)
             else:
@@ -2958,7 +2997,6 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if necesita_cartera:
             resumen = obtener_resumen_portafolio(user_id)
-            
             with get_db_connection() as conn:
                 df_tc = pd.read_sql("SELECT SUM(pnl_usd) as pnl_tot, COUNT(id) as total_c FROM trades_cerrados WHERE user_id = %s;", conn, params=(user_id,))
             pnl_realizado = float(df_tc['pnl_tot'].iloc[0]) if not df_tc.empty and pd.notnull(df_tc['pnl_tot'].iloc[0]) else 0.0
@@ -3062,6 +3100,7 @@ async def main():
     app.add_handler(CommandHandler("ayuda", start))
     app.add_handler(CommandHandler("cartera", cmd_resumen))
     app.add_handler(CommandHandler("ytd", cmd_ytd))
+    app.add_handler(CommandHandler("twr", cmd_ytd))
     app.add_handler(CommandHandler("cagr", cmd_cagr))
     app.add_handler(CommandHandler("spy", cmd_spy_alias))
     app.add_handler(CommandHandler("grafico", cmd_grafico_alias))
