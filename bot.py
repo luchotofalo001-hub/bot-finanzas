@@ -286,7 +286,7 @@ def generar_grafico_evolucion_cartera_consolidada(user_id: int, periodo_solicita
     try:
         with get_db_connection() as conn:
             df_inv = pd.read_sql(
-                "SELECT fecha, ticker, cantidad, precio_compra, monto_total_usd, tipo_posicion, apalancamiento FROM portafolio_inversIONES WHERE user_id = %s ORDER BY fecha ASC;",
+                "SELECT fecha, ticker, cantidad, precio_compra, monto_total_usd, tipo_posicion, apalancamiento FROM portafolio_inversiones WHERE user_id = %s ORDER BY fecha ASC;",
                 conn, params=(user_id,)
             )
             df_tc = pd.read_sql(
@@ -468,6 +468,7 @@ def generar_grafico_evolucion_por_activos(user_id: int, periodo_solicitado: str 
         fecha_start, desc_periodo = resolver_fecha_inicio(periodo_solicitado, primera_fecha_db)
         
         fechas_rango = pd.date_range(start=fecha_start, end=datetime.now().strftime('%Y-%m-%d'), freq='D')
+        
         colores = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#17becf', '#bcbd22']
         idx_color = 0
         
@@ -1078,7 +1079,7 @@ def registrar_operacion_inversion(user_id: int, ticker: str, monto_usd: float, p
                 )
             else:
                 cursor.execute(
-                    """INSERT INTO portafolio_inversIONES (user_id, fecha, ticker, cantidad, precio_compra, monto_total_usd, tipo_posicion, apalancamiento, precio_liquidacion)
+                    """INSERT INTO portafolio_inversiones (user_id, fecha, ticker, cantidad, precio_compra, monto_total_usd, tipo_posicion, apalancamiento, precio_liquidacion)
                        VALUES (%s, NOW(), %s, %s, %s, %s, %s, %s, %s);""",
                     (user_id, ticker, float(cantidad), float(precio_compra), float(monto_usd), tipo_pos, float(lev), float(precio_liq) if precio_liq else None)
                 )
@@ -1910,6 +1911,7 @@ def generar_alertas_para_usuario(user_id: int) -> list:
     return alertas
 
 async def tarea_alertas_periodicas(app):
+    """Corre cada 3 horas. Ejecuta tareas síncronas bloqueantes en un worker thread para no congelar Telegram."""
     await asyncio.sleep(60)
     while True:
         try:
@@ -1954,6 +1956,7 @@ async def tarea_alertas_periodicas(app):
 # ==================== MOTOR DE MÉTRICAS ANALÍTICAS ====================
 def calcular_super_metricas_totales(user_id: int):
     metricas = []
+    
     pnl_realizado_total = 0.0
     cant_trades_cerrados = 0
     try:
@@ -2294,7 +2297,7 @@ REGLAS DE MÉTRICAS DE RIESGO:
 - Si pide métricas de riesgo, performance, drawdown, sharpe, win rate, etc.:
   ACCION: VER_RIESGO
 
-REGLAS GENERALES:
+REGLAS GENERALes:
 - Registro ARS: REGISTRO_ARS: [TIPO]|[MONTO]|[CATEGORIA]|[DESCRIPCION]|[FECHA_YYYY-MM-DD]
 - Ver cartera y balance: ACCION: VER_CARTERA
 - Cotización en vivo: ACCION: CONSULTA_PRECIO|[TICKER]
@@ -2304,6 +2307,721 @@ REGLAS GENERALES:
 """
 
 # ==================== COMANDOS RÁPIDOS ====================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 ¡Hola! Soy tu asistente financiero cuantitativo.\n\n"
+        "📈 Gráficos\n"
+        "• Evolución de MELI y NU\n"
+        "• Evolución de mi cartera\n"
+        "• Evolución dividida por activo\n\n"
+        "🟢 Posiciones abiertas\n"
+        "• ¿Cómo vienen mis posiciones?\n"
+        "• Cerré la posición ID 2 con 150 usd de ganancia\n\n"
+        "🏆 Trades cerrados\n"
+        "• Gané 450 usd en un trade de SOL\n\n"
+        "💼 Resumen rápido (sin IA)\n"
+        "/resumen  →  balance consolidado\n"
+        "/riesgo   →  métricas de riesgo + liquidaciones\n"
+        "/mes      →  gastos del mes + presupuestos\n"
+        "/objetivos →  progreso de metas\n\n"
+        "También podés hablarme en lenguaje natural."
+    )
+
+def extraer_periodo(texto: str) -> str:
+    tlow = (texto or "").lower()
+    for key in ["ytd", "mtd", "wtd", "1y", "1a", "3m", "6m", "1m", "2m"]:
+        if re.search(r"\b" + re.escape(key) + r"\b", tlow):
+            return key
+    m = re.search(r"(\d+)\s*(mes|meses|dia|dias|año|anos|ano|años)", tlow)
+    if m:
+        return m.group(0)
+    if "este año" in tlow or "este ano" in tlow:
+        return "ytd"
+    return ""
+
+async def enviar_grafico_cartera(update: Update, user_id: int, periodo: str = "", modo: str = "usd"):
+    buf = generar_grafico_evolucion_cartera_consolidada(user_id, periodo, modo=modo)
+    if buf:
+        if modo in ("pct", "percent", "%", "spy"):
+            cap = f"📊 Cartera vs SPY en % ({periodo or 'histórico'})"
+        else:
+            cap = f"📈 Cartera en USD ({periodo or 'histórico'}) — PnL realizado + flotante"
+        await update.message.reply_photo(photo=buf, caption=cap)
+    else:
+        await update.message.reply_text("No hay datos suficientes para la curva.")
+
+async def enviar_grafico_activos(update: Update, user_id: int, periodo: str = "", tickers=None):
+    buf = generar_grafico_evolucion_por_activos(user_id, periodo, tickers)
+    if buf:
+        extra = f" ({', '.join(tickers)})" if tickers else ""
+        await update.message.reply_photo(photo=buf, caption=f"📊 Rendimiento relativo base 100{extra}")
+    else:
+        await update.message.reply_text("No hay suficientes activos que coincidan.")
+
+async def intentar_comando_local(update: Update, user_id: int, user_msg: str) -> bool:
+    raw = (user_msg or "").strip()
+    low = raw.lower().strip()
+    if low.startswith("/"):
+        low = low[1:]
+        raw = raw[1:] if raw.startswith("/") else raw
+
+    partes = raw.split()
+    cmd = partes[0].lower() if partes else ""
+    args = " ".join(partes[1:]) if len(partes) > 1 else ""
+    periodo = extraer_periodo(raw)
+
+    if cmd in ("help", "ayuda", "comandos"):
+        await start(update, None)
+        return True
+    if cmd in ("resumen", "cartera", "balance"):
+        await cmd_resumen(update, None)
+        return True
+    if cmd in ("ytd", "rendimiento"):
+        await update.message.reply_text(calcular_rendimiento_periodo(user_id, periodo or "ytd"))
+        return True
+    if cmd in ("cagr", "alpha"):
+        per = periodo or "ytd"
+        await update.message.reply_text(calcular_rendimiento_periodo(user_id, per))
+        return True
+    if cmd in ("spy", "benchmark"):
+        await enviar_grafico_cartera(update, user_id, periodo or "ytd", modo="pct")
+        await update.message.reply_text(calcular_rendimiento_periodo(user_id, periodo or "ytd"))
+        return True
+    if cmd in ("grafico", "gráfico", "curva", "evolucion", "evolución"):
+        if re.search(r"activo", low):
+            tks = [x.strip().upper() for x in re.split(r"[\s,]+", args) if x.strip() and x.lower() not in ("ytd","mtd","1y","3m","6m","1m")]
+            tks = [x for x in tks if re.match(r"^[A-Z0-9]{1,12}$", x)]
+            await enviar_grafico_activos(update, user_id, periodo, tks or None)
+        elif re.search(r"spy|%|porcent", low):
+            await enviar_grafico_cartera(update, user_id, periodo or "ytd", modo="pct")
+        else:
+            await enviar_grafico_cartera(update, user_id, periodo, modo="usd")
+        return True
+    if cmd in ("activos", "comparar"):
+        tks = [x.strip().upper() for x in re.split(r"[\s,]+", args) if x.strip()]
+        tks = [x for x in tks if re.match(r"^[A-Z0-9]{1,12}$", x) and x.lower() not in ("YTD",)]
+        await enviar_grafico_activos(update, user_id, periodo, tks or None)
+        return True
+    if cmd in ("precio", "coti", "cotizacion", "cotización"):
+        tk = args.split()[0].upper() if args else ""
+        if not tk:
+            await update.message.reply_text("Usá: /precio BTC")
+            return True
+        datos = consultar_datos_mercado(tk)
+        if not datos:
+            await update.message.reply_text(f"No encontré precio para {tk}.")
+            return True
+        signo = "+" if datos["var_pct"] >= 0 else ""
+        em = "🟢" if datos["var_pct"] >= 0 else "🔴"
+        await update.message.reply_text(
+            f"📈 {datos['ticker']}\n• ${datos['precio']:,.2f}  {em} {signo}{datos['var_pct']:.2f}%"
+        )
+        return True
+    if cmd == "excel":
+        excel_buf = generar_excel_completo(user_id)
+        if excel_buf:
+            await update.message.reply_document(document=excel_buf, filename="Finanzas_Consolidadas.xlsx")
+        else:
+            await update.message.reply_text("No hay datos para exportar.")
+        return True
+    if cmd == "torta":
+        buf = generar_grafico_distribucion_inversiones(user_id)
+        if buf:
+            await update.message.reply_photo(photo=buf, caption="Distribución abierta")
+        return True
+    if cmd in ("analisis", "análisis", "at", "tecnico", "técnico"):
+        tk = ""
+        tf_at = "diario"
+        if "4h" in low:
+            tf_at = "4h"
+        elif "sem" in low:
+            tf_at = "semanal"
+        for tok in args.split():
+            u = tok.upper().replace(",", "")
+            if u in ("DIARIO", "SEMANAL", "4H", "FIBO", "FIBONACCI"):
+                continue
+            if re.match(r"^[A-Z0-9]{1,12}$", u):
+                tk = u
+                break
+        if not tk:
+            await update.message.reply_text("Usá: /analisis BTC  o  /analisis MELI semanal")
+            return True
+        con_fibo = "fibo" in low
+        buf_img, info_at = generar_grafico_analisis_tecnico(tk, tf_at, con_fibo, con_fibo)
+        if buf_img and info_at and not isinstance(info_at, str):
+            await update.message.reply_photo(photo=buf_img, caption=f"📈 {tk} ({tf_at}) EMA+MACD+RSI")
+            await update.message.reply_text(formatear_reporte_tecnico(info_at))
+        else:
+            await update.message.reply_text(f"No pude analizar {tk}.")
+        return True
+
+    if re.search(r"\b(ytd|year to date|este año|este ano)\b", low) and not re.search(r"registr|anot|guarde|gan[eé]|gast[eé]", low):
+        if re.search(r"graf|curva|evoluc|vs|spy", low):
+            await enviar_grafico_cartera(update, user_id, "ytd")
+        await update.message.reply_text(calcular_rendimiento_periodo(user_id, "ytd"))
+        return True
+    if re.search(r"\b(cagr|alpha)\b", low):
+        await update.message.reply_text(calcular_rendimiento_periodo(user_id, periodo or "ytd"))
+        return True
+    if re.search(r"(vs\s*spy|contra el spy|compar(a|ame|ar).*spy|benchmark)", low):
+        await enviar_grafico_cartera(update, user_id, periodo or "ytd", modo="pct")
+        await update.message.reply_text(calcular_rendimiento_periodo(user_id, periodo or "ytd"))
+        return True
+    if re.search(r"(grafico|gráfico|curva|evoluci[oó]n).*(cartera|consolidat|total)", low) or low in ("grafico", "gráfico", "curva cartera"):
+        await enviar_grafico_cartera(update, user_id, periodo)
+        return True
+    if re.search(r"(grafico|gráfico|curva|evoluci[oó]n|compar).*(activo|activos|meli|nvda|ggal)", low):
+        tks = re.findall(r"\b(MELI|NU|GGAL|SUPV|NVDA|BTC|SOL|ETH|MSFT|META|YPF|VIST|AAPL|AMD|TSLA|NEXO)\b", raw, re.I)
+        await enviar_grafico_activos(update, user_id, periodo, [x.upper() for x in tks] or None)
+        return True
+    if re.search(r"^(c[oó]mo viene(n)? mi(s)? (cartera|posiciones)|estado de (la )?cartera)$", low):
+        await cmd_resumen(update, None)
+        return True
+    m_an = re.match(r"^(?:analiza(?:me)?|an[aá]lisis(?:\s+t[eé]cnico)?)\s+([a-zA-Z0-9]+)(?:\s+(diario|semanal|4h))?", low)
+    if m_an:
+        tk = m_an.group(1).upper()
+        tf_at = m_an.group(2) or "diario"
+        con_fibo = "fibo" in low
+        buf_img, info_at = generar_grafico_analisis_tecnico(tk, tf_at, con_fibo, con_fibo)
+        if buf_img and info_at and not isinstance(info_at, str):
+            await update.message.reply_photo(photo=buf_img, caption=f"📈 {tk} ({tf_at}) EMA+MACD+RSI")
+            await update.message.reply_text(formatear_reporte_tecnico(info_at))
+        else:
+            await update.message.reply_text(f"No pude analizar {tk}.")
+        return True
+    return False
+
+async def cmd_borrar_todo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    borrar_todos_los_movimientos(user_id)
+    await update.message.reply_text("🗑️ Tu base de datos, cartera y trades cerrados han sido reseteados.")
+
+async def cmd_resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    resumen = obtener_resumen_portafolio(user_id)
+    
+    with get_db_connection() as conn:
+        df_tc = pd.read_sql("SELECT SUM(pnl_usd) as pnl_tot, COUNT(id) as total_c FROM trades_cerrados WHERE user_id = %s;", conn, params=(user_id,))
+    pnl_realizado = float(df_tc['pnl_tot'].iloc[0]) if not df_tc.empty and pd.notnull(df_tc['pnl_tot'].iloc[0]) else 0.0
+    cant_c = int(df_tc['total_c'].iloc[0]) if not df_tc.empty and pd.notnull(df_tc['total_c'].iloc[0]) else 0
+    
+    if not resumen and cant_c == 0:
+        await update.message.reply_text("📉 No tienes activos ni trades cargados todavía.")
+        return
+
+    total_inv = resumen['total_invertido'] if resumen else 0.0
+    total_act = resumen['total_actual'] if resumen else 0.0
+    pnl_flot = resumen['pnl_total_usd'] if resumen else 0.0
+    pnl_global = pnl_flot + pnl_realizado
+
+    em_flot = "🟢" if pnl_flot >= 0 else "🔴"
+    em_real = "🟢" if pnl_realizado >= 0 else "🔴"
+    em_glob = "🟢" if pnl_global >= 0 else "🔴"
+
+    msg = (
+        f"💼 ESTADO DE TU CARTERA\n\n"
+        f"• Capital abierto: ${total_inv:,.2f} USD\n"
+        f"• Valor actual: ${total_act:,.2f} USD\n"
+        f"• PnL flotante: {em_flot} {pnl_flot:+,.2f} USD\n"
+        f"• PnL realizado: {em_real} {pnl_realizado:+,.2f} USD ({cant_c} ops)\n"
+        f"• RESULTADO NETO GLOBAL: {em_glob} {pnl_global:+,.2f} USD\n"
+    )
+
+    if resumen and resumen["posiciones"]:
+        msg += "\n📊 Posiciones abiertas:\n"
+        for pos in resumen["posiciones"]:
+            pnl_s = "+" if pos["pnl_usd"] >= 0 else ""
+            em = "🟢" if pos["pnl_usd"] >= 0 else "🔴"
+            lev_tag = f"[{pos['tipo_pos']} {pos['lev']:.0f}x]" if pos['tipo_pos'] != "SPOT" else "[SPOT]"
+            dist = f" | Dist. liq: {pos['dist_liq_pct']:.1f}%" if pos.get("dist_liq_pct") is not None else ""
+            msg += (
+                f"\n▪️ ID {pos['id']}  {pos['ticker']} {lev_tag}\n"
+                f"   Margen ${pos['costo_margen']:,.0f}  |  PPC ${pos['ppc']:,.2f}  |  Spot ${pos['spot']:,.2f}\n"
+                f"   PnL {em} {pnl_s}${pos['pnl_usd']:,.2f} ({pnl_s}{pos['pnl_pct']:.1f}%){dist}"
+            )
+    await update.message.reply_text(msg)
+
+async def cmd_riesgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    metricas = calcular_metricas_riesgo_completas(user_id)
+    await update.message.reply_text(metricas["texto"])
+
+async def cmd_mes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    texto, err = obtener_progreso_presupuestos(user_id)
+    if err:
+        ahora = ahora_argentina()
+        with get_db_connection() as conn:
+            df = pd.read_sql(
+                """SELECT categoria, SUM(monto) as total FROM movimientos 
+                   WHERE user_id = %s AND tipo = 'GASTO' 
+                   AND EXTRACT(MONTH FROM fecha) = %s AND EXTRACT(YEAR FROM fecha) = %s
+                   GROUP BY categoria ORDER BY total DESC;""",
+                conn, params=(user_id, ahora.month, ahora.year)
+            )
+        if df.empty:
+            await update.message.reply_text("No hay gastos registrados este mes ni presupuestos cargados.")
+        else:
+            lineas = [f"📅 GASTOS DEL MES {ahora.month:02d}/{ahora.year}", ""]
+            total = 0.0
+            for _, r in df.iterrows():
+                lineas.append(f"• {r['categoria']}: ${float(r['total']):,.0f}")
+                total += float(r['total'])
+            lineas.append(f"\nTotal: ${total:,.0f} ARS")
+            lineas.append("\n💡 Tip: definí presupuestos diciendo 'Presupuesto Comida 180000'")
+            await update.message.reply_text("\n".join(lineas))
+    else:
+        await update.message.reply_text(texto)
+
+async def cmd_objetivos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    texto = obtener_progreso_objetivos(user_id)
+    await update.message.reply_text(texto)
+
+async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user_msg = update.message.text
+
+    try:
+        if await intentar_comando_local(update, user_id, user_msg):
+            return
+    except Exception as e:
+        logger.error(f"Error comando local: {e}", exc_info=True)
+
+    try:
+        prompt = (
+            f"CONTEXTO COMPACTO:\n{resumen_compacto_para_ia(user_id)}\n\n"
+            f"MENSAJE: {user_msg}\n\n"
+            "Si es un pedido de gráfico, rendimiento, YTD, CAGR o vs SPY, NO inventes números: "
+            "emití solo el tag ACCION correspondiente. Sé breve."
+        )
+        reply = llamar_gemini(prompt, SYSTEM_INSTRUCTION)
+        
+        necesita_cartera = "ACCION: VER_CARTERA" in reply
+        necesita_grafico_inv = "ACCION: GRAFICO_INVERSIONES" in reply
+        necesita_grafico_gastos = "ACCION: GRAFICO_GASTOS" in reply
+        necesita_excel = "ACCION: EXCEL" in reply
+        necesita_borrar_todo = "ACCION: BORRAR_TODO" in reply
+        necesita_borrar_ultimo = "ACCION: BORRAR_ULTIMO" in reply
+        necesita_ver_riesgo = "ACCION: VER_RIESGO" in reply
+        necesita_ver_presupuestos = "ACCION: VER_PRESUPUESTOS" in reply
+        necesita_ver_objetivos = "ACCION: VER_OBJETIVOS" in reply
+        
+        texto_limpio = reply
+        for tag in ["ACCION: VER_CARTERA", "ACCION: GRAFICO_INVERSIONES", "ACCION: GRAFICO_GASTOS", 
+                    "ACCION: EXCEL", "ACCION: BORRAR_TODO", "ACCION: BORRAR_ULTIMO",
+                    "ACCION: VER_RIESGO", "ACCION: VER_PRESUPUESTOS", "ACCION: VER_OBJETIVOS"]:
+            texto_limpio = texto_limpio.replace(tag, "")
+
+        # Escáner de cartera
+        necesita_escanear_cartera = "ACCION: ESCANEAR_CARTERA" in reply
+        if not necesita_escanear_cartera and re.search(r"(?:analiza(?:me)?\s+todos?\s+(?:mis\s+)?activos?|escanear?\s+(?:mi\s+)?cartera|revisa(?:me)?\s+mis\s+activos)", user_msg, re.IGNORECASE):
+            necesita_escanear_cartera = True
+        texto_limpio = texto_limpio.replace("ACCION: ESCANEAR_CARTERA", "")
+
+        # Análisis técnico individual
+        ticker_at = None
+        tf_at = "diario"
+        m_at = re.search(r"ACCION:\s*ANALIZAR_ACTIVO\|([^\n\r|]+)(?:\|([^\n\r]+))?", texto_limpio)
+        if m_at:
+            ticker_at = m_at.group(1).strip()
+            tf_at = m_at.group(2).strip() if m_at.group(2) else "diario"
+            texto_limpio = texto_limpio.replace(m_at.group(0), "")
+
+        if not ticker_at and re.search(r"(?:analiza|analizame|analisis\s+tecnico)\s+([a-zA-Z0-9]+)", user_msg, re.IGNORECASE):
+            m_fall = re.search(r"(?:analiza|analizame|analisis\s+tecnico)\s+([a-zA-Z0-9]+)", user_msg, re.IGNORECASE)
+            ticker_at = m_fall.group(1).strip().upper()
+            if "4h" in user_msg.lower():
+                tf_at = "4h"
+            elif "sem" in user_msg.lower():
+                tf_at = "semanal"
+            else:
+                tf_at = "diario"
+
+        # Cotización
+        ticker_a_cotizar = None
+        m_precio = re.search(r"ACCION: CONSULTA_PRECIO\|([^\n\r]+)", texto_limpio)
+        if m_precio:
+            ticker_a_cotizar = m_precio.group(1).strip()
+            texto_limpio = texto_limpio.replace(m_precio.group(0), "")
+
+        # Gráfico por activos
+        necesita_grafico_por_activos = False
+        periodo_por_activos = ""
+        tickers_filtro_activos = []
+        m_gpa = re.search(r"ACCION: GRAFICO_EVOLUCION_POR_ACTIVOS(?:\|([^|\n\r]*))?(?:\|([^\n\r]*))?", texto_limpio)
+        if m_gpa:
+            necesita_grafico_por_activos = True
+            periodo_por_activos = m_gpa.group(1).strip() if m_gpa.group(1) else ""
+            raw_tks = m_gpa.group(2).strip() if m_gpa.group(2) else ""
+            if raw_tks:
+                tickers_filtro_activos = [t.strip().upper() for t in raw_tks.split(",") if t.strip()]
+            texto_limpio = texto_limpio.replace(m_gpa.group(0), "")
+
+        # Gráfico consolidado
+        necesita_grafico_consolidado = False
+        periodo_consolidado = ""
+        m_gc = re.search(r"ACCION: GRAFICO_EVOLUCION_CARTERA_CONSOLIDADA(?:\|([^\n\r]+))?", texto_limpio)
+        if m_gc:
+            necesita_grafico_consolidado = True
+            periodo_consolidado = m_gc.group(1).strip() if m_gc.group(1) else ""
+            texto_limpio = texto_limpio.replace(m_gc.group(0), "")
+
+        if not necesita_grafico_consolidado:
+            m_gc_old = re.search(r"ACCION: GRAFICO_EVOLUCION_CARTERA(?:\|([^\n\r]+))?", texto_limpio)
+            if m_gc_old:
+                necesita_grafico_consolidado = True
+                periodo_consolidado = m_gc_old.group(1).strip() if m_gc_old.group(1) else ""
+                texto_limpio = texto_limpio.replace(m_gc_old.group(0), "")
+
+        # Gráfico activo individual
+        ticker_grafico_evol = None
+        periodo_activo = ""
+        m_ga = re.search(r"ACCION: GRAFICO_EVOLUCION_ACTIVO\|([^\n\r|]+)(?:\|([^\n\r]+))?", texto_limpio)
+        if m_ga:
+            ticker_grafico_evol = m_ga.group(1).strip()
+            periodo_activo = m_ga.group(2).strip() if m_ga.group(2) else ""
+            texto_limpio = texto_limpio.replace(m_ga.group(0), "")
+
+        # Fallback inteligente multi-ticker
+        es_pedido_grafico_o_comparativa = bool(re.search(r"(?:grafico|grafica|evolucion|compara|comparame|comparar|vs|versus)", user_msg, re.IGNORECASE))
+        if es_pedido_grafico_o_comparativa and not necesita_grafico_consolidado:
+            tickers_posibles = ["MELI", "NU", "GGAL", "SUPV", "NVDA", "BTC", "SOL", "YPF", "VIST", "MSFT", "META", "AMD", "TSLA", "GOOGL", "LOMA", "ETH", "BNB"]
+            tickers_mencionados = []
+            for tk in tickers_posibles:
+                if re.search(r'\b' + re.escape(tk) + r'\b', user_msg, re.IGNORECASE):
+                    tickers_mencionados.append(tk)
+            
+            if len(tickers_mencionados) >= 2:
+                ticker_grafico_evol = None
+                necesita_grafico_por_activos = True
+                tickers_filtro_activos = tickers_mencionados
+                if not periodo_por_activos:
+                    periodo_por_activos = periodo_activo
+
+        # Cierre de posición
+        m_close_pos = re.search(r"ACCION: CERRAR_POSICION\|(\d+)(?:\|([^|\n\r]*))?(?:\|([^\n\r]*))?", texto_limpio)
+        if m_close_pos:
+            c_inv_id = int(m_close_pos.group(1))
+            c_pnl = float(m_close_pos.group(2).strip()) if m_close_pos.group(2) and m_close_pos.group(2).strip() not in ["", "None"] else None
+            c_spot = float(m_close_pos.group(3).strip()) if m_close_pos.group(3) and m_close_pos.group(3).strip() not in ["", "None"] else None
+            texto_limpio = texto_limpio.replace(m_close_pos.group(0), "")
+            
+            res_cierre, msg_cierre = cerrar_posicion_abierta_por_id(user_id, c_inv_id, c_pnl, c_spot)
+            if res_cierre:
+                signo_pnl = "+" if res_cierre["pnl_usd"] >= 0 else ""
+                roi_str = f" ({res_cierre['roi_pct']:+.2f}%)" if res_cierre['roi_pct'] else ""
+                texto_limpio += f"\n\n🎯 Trade cerrado: {res_cierre['ticker']} [{res_cierre['tipo_pos']}] | PnL {signo_pnl}${res_cierre['pnl_usd']:,.2f} USD{roi_str} → ID histórico {res_cierre['tc_id']}"
+            else:
+                texto_limpio += f"\n\n⚠️ No se pudo cerrar: {msg_cierre}"
+
+        # Agregar margen
+        m_add_m = re.search(r"ACCION: AGREGAR_MARGEN\|(\d+)\|([^\n\r]+)", texto_limpio)
+        if m_add_m:
+            inv_id_m = int(m_add_m.group(1))
+            m_extra = float(m_add_m.group(2).strip())
+            texto_limpio = texto_limpio.replace(m_add_m.group(0), "")
+            reg, info = agregar_margen_a_posicion(user_id, inv_id_m, m_extra)
+            if reg:
+                texto_limpio += f"\n\n🛡️ Margen extra en {reg[1]}: +${m_extra:,.2f} USD | {info}"
+            else:
+                texto_limpio += f"\n\n⚠️ No se encontró la posición ID {inv_id_m}."
+
+        # Modificaciones
+        m_mod_inv = re.search(r"ACCION: MODIFICAR_INVERSION\|(\d+)\|([^|\n\r]+)\|([^\n\r]+)", texto_limpio)
+        if m_mod_inv:
+            inv_id = int(m_mod_inv.group(1))
+            campo = m_mod_inv.group(2).strip()
+            val = m_mod_inv.group(3).strip()
+            texto_limpio = texto_limpio.replace(m_mod_inv.group(0), "")
+            prev, info = modificar_inversion_por_id(user_id, inv_id, campo, val)
+            texto_limpio += f"\n\n✏️ Inversión ID {inv_id}: {info}"
+
+        m_mod_mov = re.search(r"ACCION: MODIFICAR_MOVIMIENTO\|(\d+)\|([^|\n\r]+)\|([^\n\r]+)", texto_limpio)
+        if m_mod_mov:
+            mov_id = int(m_mod_mov.group(1))
+            campo = m_mod_mov.group(2).strip()
+            val = m_mod_mov.group(3).strip()
+            texto_limpio = texto_limpio.replace(m_mod_mov.group(0), "")
+            prev, info = modificar_movimiento_por_id(user_id, mov_id, campo, val)
+            texto_limpio += f"\n\n✏️ Movimiento ID {mov_id}: {info}"
+
+        # Presupuestos
+        m_set_pres = re.search(r"ACCION: SET_PRESUPUESTO\|([^|\n\r]+)\|([^\n\r]+)", texto_limpio)
+        if m_set_pres:
+            cat = m_set_pres.group(1).strip()
+            monto = float(m_set_pres.group(2).strip().replace(".", "").replace(",", "."))
+            texto_limpio = texto_limpio.replace(m_set_pres.group(0), "")
+            c, m, mes, anio = set_presupuesto(user_id, cat, monto)
+            texto_limpio += f"\n\n📅 Presupuesto guardado: {c} → ${m:,.0f} ARS ({mes:02d}/{anio})"
+
+        # Objetivos
+        m_obj = re.search(r"ACCION: CREAR_OBJETIVO\|([^|\n\r]+)\|([^|\n\r]+)\|([^|\n\r]+)(?:\|([^\n\r]*))?", texto_limpio)
+        if m_obj:
+            desc = m_obj.group(1).strip()
+            tipo = m_obj.group(2).strip()
+            monto = float(m_obj.group(3).strip().replace(".", "").replace(",", "."))
+            fecha = m_obj.group(4).strip() if m_obj.group(4) and m_obj.group(4).strip() not in ["", "None", "VACIO"] else None
+            texto_limpio = texto_limpio.replace(m_obj.group(0), "")
+            oid = crear_objetivo(user_id, desc, tipo, monto, fecha)
+            texto_limpio += f"\n\n🎯 Objetivo creado (ID {oid}): {desc} → ${monto:,.0f}"
+
+        # Borrados
+        m_btk = re.search(r"ACCION: BORRAR_INVERSION_TICKER\|([^\n\r]+)", texto_limpio)
+        if m_btk:
+            tk_b = m_btk.group(1).strip()
+            texto_limpio = texto_limpio.replace(m_btk.group(0), "")
+            c_del = borrar_inversion_por_ticker(user_id, tk_b)
+            texto_limpio += f"\n\n🗑️ Se eliminaron {c_del} registros de {tk_b}"
+
+        m_bid = re.search(r"ACCION: BORRAR_INVERSION_ID\|(\d+)", texto_limpio)
+        if m_bid:
+            iid_b = int(m_bid.group(1))
+            texto_limpio = texto_limpio.replace(m_bid.group(0), "")
+            r_del = borrar_inversion_por_id(user_id, iid_b)
+            if r_del:
+                texto_limpio += f"\n\n🗑️ Eliminada posición abierta ID {iid_b}: {r_del[1]}"
+
+        m_btc_id = re.search(r"ACCION: BORRAR_TRADE_CERRADO_ID\|(\d+)", texto_limpio)
+        if m_btc_id:
+            tcid_b = int(m_btc_id.group(1))
+            texto_limpio = texto_limpio.replace(m_btc_id.group(0), "")
+            r_del = borrar_trade_cerrado_por_id(user_id, tcid_b)
+            if r_del:
+                texto_limpio += f"\n\n🗑️ Eliminado trade cerrado ID {tcid_b}: {r_del[1]}"
+
+        m_bmid = re.search(r"ACCION: BORRAR_MOVIMIENTO_ID\|(\d+)", texto_limpio)
+        if m_bmid:
+            mid_b = int(m_bmid.group(1))
+            texto_limpio = texto_limpio.replace(m_bmid.group(0), "")
+            r_del = borrar_movimiento_por_id(user_id, mid_b)
+            if r_del:
+                texto_limpio += f"\n\n🗑️ Eliminado gasto/ingreso ID {mid_b}"
+
+        # Registro Trade Cerrado
+        match_tc = re.search(r"REGISTRO_TRADE_CERRADO:\s*([^\n\r]+)", texto_limpio)
+        if match_tc:
+            linea_tc = match_tc.group(1).strip()
+            texto_limpio = texto_limpio.replace(match_tc.group(0), "").strip()
+            partes = [p.strip() for p in linea_tc.split("|")]
+            tk_c = partes[0].upper()
+            pnl_c = float(partes[1])
+            tipo_c = partes[2].upper() if len(partes) > 2 and partes[2] not in ["", "None"] else "SPOT"
+            roi_c = float(partes[3]) if len(partes) > 3 and partes[3] not in ["", "None"] else None
+            monto_c = float(partes[4]) if len(partes) > 4 and partes[4] not in ["", "None"] else None
+            desc_c = partes[5] if len(partes) > 5 else "Trade cerrado"
+            f_c = partes[6].split()[0] if len(partes) > 6 and partes[6] not in ["", "None"] else None
+
+            tid, t, p, tp, r, f = registrar_trade_cerrado(user_id, tk_c, pnl_c, tipo_c, roi_c, monto_c, desc_c, f_c)
+            signo_p = "+" if p >= 0 else ""
+            roi_s = f" ({r:+.2f}%)" if r else ""
+            f_txt = f" — {f}" if f else ""
+            texto_limpio = f"{texto_limpio}\n\n🏆 Trade cerrado registrado: {t} [{tp}] | PnL {signo_p}${p:,.2f} USD{roi_s}{f_txt} (ID {tid})".strip()
+
+        # Registro Inversión
+        match_inv = re.search(r"REGISTRO_INV:\s*([^\n\r]+)", texto_limpio)
+        if match_inv:
+            linea_inv = match_inv.group(1).strip()
+            texto_limpio = texto_limpio.replace(match_inv.group(0), "").strip()
+            partes = [p.strip() for p in linea_inv.split("|")]
+            ticker = partes[0].upper()
+            monto = float(partes[1]) if len(partes) > 1 and partes[1] not in ["0", "", "None"] else None
+            p_compra = float(partes[2]) if len(partes) > 2 and partes[2] not in ["0", "", "None"] else None
+            cant = float(partes[3]) if len(partes) > 3 and partes[3] not in ["0", "", "None"] else None
+            f_compra = partes[4].split()[0] if len(partes) > 4 and partes[4] not in ["0", "", "None"] else None
+            tipo_pos = partes[5].upper() if len(partes) > 5 and partes[5] not in ["", "None"] else "SPOT"
+            lev = float(partes[6]) if len(partes) > 6 and partes[6] not in ["0", "", "None"] else 1.0
+            p_liq = float(partes[7]) if len(partes) > 7 and partes[7] not in ["0", "", "None"] else None
+            
+            t, c, p, m, f_reg, pos_t, lev_t, liq_t = registrar_operacion_inversion(
+                user_id, ticker, monto, p_compra, cant, f_compra, tipo_pos, lev, p_liq
+            )
+            fecha_str = f" — {f_reg}" if f_reg else ""
+            lev_str = f" [{pos_t} {lev_t:.0f}x]" if pos_t != "SPOT" else " [SPOT]"
+            liq_str = f" | Liq est: ${liq_t:,.2f}" if liq_t else ""
+            texto_limpio = f"{texto_limpio}\n\n💼 Guardado como abierto: {t}{lev_str} | Margen ${m:,.2f} | PPC ${p:,.2f} | Cant {c:,.4f}{liq_str}{fecha_str}".strip()
+
+        # Registro ARS
+        match_ars = re.search(r"REGISTRO_ARS:\s*([^\n\r]+)", texto_limpio)
+        if match_ars:
+            linea_ars = match_ars.group(1).strip()
+            texto_limpio = texto_limpio.replace(match_ars.group(0), "").strip()
+            partes = [p.strip() for p in linea_ars.split("|")]
+            tipo = partes[0]
+            monto = float(partes[1])
+            categoria = partes[2]
+            descripcion = partes[3]
+            f_gasto = partes[4].split()[0] if len(partes) > 4 and partes[4] not in ["0", "", "None"] else None
+            
+            guardar_movimiento(user_id, tipo, monto, categoria, descripcion, f_gasto)
+            fecha_str = f" — {f_gasto}" if f_gasto else ""
+            texto_limpio = f"{texto_limpio}\n\n✅ Guardado: {tipo} de ${monto:,.2f} ARS en {categoria}{fecha_str}".strip()
+
+        if necesita_borrar_todo:
+            borrar_todos_los_movimientos(user_id)
+            texto_limpio += "\n\n🗑️ Base de datos, cartera y trades reseteados."
+
+        if necesita_borrar_ultimo:
+            res_ultimo = borrar_ultimo_registro_general(user_id)
+            if res_ultimo:
+                texto_limpio += f"\n\n🗑️ Eliminado: {res_ultimo}"
+            else:
+                texto_limpio += "\n\n⚠️ No había registros para borrar."
+
+        # Limpiar tags residuales
+        texto_limpio = re.sub(r"ACCION:\s*[^\n\r]+", "", texto_limpio)
+        texto_limpio = re.sub(r"REGISTRO_[^\n\r]+", "", texto_limpio)
+        texto_limpio = limpiar_estilo_telegram(texto_limpio)
+
+        # Cotización puntual
+        if ticker_a_cotizar:
+            datos_mkt = consultar_datos_mercado(ticker_a_cotizar)
+            if datos_mkt:
+                signo = "+" if datos_mkt["var_pct"] >= 0 else ""
+                emoji = "🟢" if datos_mkt["var_pct"] >= 0 else "🔴"
+                rango_txt = f"\n• Rango del día: ${datos_mkt['day_low']:,.2f} – ${datos_mkt['day_high']:,.2f}" if datos_mkt["day_high"] else ""
+                msg_mkt = (
+                    f"📈 {datos_mkt['ticker']} en vivo\n\n"
+                    f"• Precio: ${datos_mkt['precio']:,.2f} USD\n"
+                    f"• Variación: {emoji} {signo}${datos_mkt['var_usd']:,.2f} ({signo}{datos_mkt['var_pct']:.2f}%)\n"
+                    f"• Cierre anterior: ${datos_mkt['prev_close']:,.2f}"
+                    f"{rango_txt}"
+                )
+                texto_limpio = f"{texto_limpio}\n\n{msg_mkt}".strip()
+
+        # Envío del texto principal
+        if texto_limpio:
+            try:
+                await update.message.reply_text(texto_limpio)
+            except Exception:
+                await update.message.reply_text(texto_limpio)
+
+        # Acciones especiales
+        if necesita_ver_riesgo:
+            metricas = calcular_metricas_riesgo_completas(user_id)
+            await update.message.reply_text(metricas["texto"])
+
+        if necesita_ver_presupuestos:
+            texto, err = obtener_progreso_presupuestos(user_id)
+            await update.message.reply_text(texto if texto else err)
+
+        if necesita_ver_objetivos:
+            await update.message.reply_text(obtener_progreso_objetivos(user_id))
+
+        if necesita_escanear_cartera:
+            resumen_escaner, fotos_senales = escanear_cartera_senales(user_id)
+            try:
+                await update.message.reply_text(resumen_escaner)
+            except Exception:
+                await update.message.reply_text(resumen_escaner)
+            for buf_foto, cap_foto in fotos_senales:
+                await update.message.reply_photo(photo=buf_foto, caption=cap_foto)
+
+        if ticker_at:
+            con_fibo = bool(re.search(r'\bfibo\b|\bfibonacci\b|\bretroceso\b', user_msg, re.IGNORECASE))
+            con_ext = bool(re.search(r'\bextensi[oó]n\b|\bext\b', user_msg, re.IGNORECASE))
+            
+            buf_img, info_at = generar_grafico_analisis_tecnico(ticker_at, tf_at, con_fibo, con_ext)
+            if buf_img and info_at and not isinstance(info_at, str):
+                tags = "EMAs + RSI"
+                if con_fibo or con_ext:
+                    tags += " + Fibo"
+                cap_txt = f"📈 {ticker_at} ({tf_at.capitalize()}) | {tags}"
+                await update.message.reply_photo(photo=buf_img, caption=cap_txt)
+                
+                reporte_txt = formatear_reporte_tecnico(info_at)
+                await update.message.reply_text(reporte_txt)
+            else:
+                await update.message.reply_text(f"⚠️ No se pudo generar el análisis técnico de {ticker_at}.")
+
+        if necesita_grafico_por_activos:
+            buf_img = generar_grafico_evolucion_por_activos(user_id, periodo_por_activos, tickers_filtro_activos)
+            if buf_img:
+                filtro_txt = f" ({', '.join(tickers_filtro_activos)})" if tickers_filtro_activos else ""
+                await update.message.reply_photo(photo=buf_img, caption=f"📊 Rendimiento relativo (Base 100){filtro_txt}")
+            else:
+                await update.message.reply_text("No hay suficientes activos que coincidan.")
+
+        elif necesita_grafico_consolidado:
+            buf_img = generar_grafico_evolucion_cartera_consolidada(user_id, periodo_consolidado)
+            if buf_img:
+                await update.message.reply_photo(photo=buf_img, caption="📈 Evolución consolidada de cartera (PnL realizado + flotante)")
+            else:
+                await update.message.reply_text("No hay datos suficientes para la curva consolidada.")
+
+        elif ticker_grafico_evol:
+            buf_img = generar_grafico_evolucion_activo(user_id, ticker_grafico_evol, periodo_activo)
+            if buf_img:
+                await update.message.reply_photo(photo=buf_img, caption=f"📈 Evolución de {ticker_grafico_evol}")
+            else:
+                await update.message.reply_text(f"⚠️ No pude generar la curva de {ticker_grafico_evol}.")
+
+        if necesita_cartera:
+            resumen = obtener_resumen_portafolio(user_id)
+            
+            with get_db_connection() as conn:
+                df_tc = pd.read_sql("SELECT SUM(pnl_usd) as pnl_tot, COUNT(id) as total_c FROM trades_cerrados WHERE user_id = %s;", conn, params=(user_id,))
+            pnl_realizado = float(df_tc['pnl_tot'].iloc[0]) if not df_tc.empty and pd.notnull(df_tc['pnl_tot'].iloc[0]) else 0.0
+            cant_c = int(df_tc['total_c'].iloc[0]) if not df_tc.empty and pd.notnull(df_tc['total_c'].iloc[0]) else 0
+            
+            if not resumen and cant_c == 0:
+                await update.message.reply_text("📉 No tienes activos ni trades cargados todavía.")
+            else:
+                total_inv = resumen['total_invertido'] if resumen else 0.0
+                total_act = resumen['total_actual'] if resumen else 0.0
+                pnl_flot = resumen['pnl_total_usd'] if resumen else 0.0
+                pnl_global = pnl_flot + pnl_realizado
+
+                em_flot = "🟢" if pnl_flot >= 0 else "🔴"
+                em_real = "🟢" if pnl_realizado >= 0 else "🔴"
+                em_glob = "🟢" if pnl_global >= 0 else "🔴"
+
+                msg_rep = (
+                    f"💼 ESTADO DE TU CARTERA\n\n"
+                    f"• Capital abierto: ${total_inv:,.2f} USD\n"
+                    f"• Valor actual: ${total_act:,.2f} USD\n"
+                    f"• PnL flotante: {em_flot} {pnl_flot:+,.2f} USD\n"
+                    f"• PnL realizado: {em_real} {pnl_realizado:+,.2f} USD ({cant_c} ops)\n"
+                    f"• RESULTADO NETO GLOBAL: {em_glob} {pnl_global:+,.2f} USD\n"
+                )
+
+                if resumen and resumen["posiciones"]:
+                    msg_rep += "\n📊 Posiciones abiertas:\n"
+                    for pos in resumen["posiciones"]:
+                        pnl_s = "+" if pos["pnl_usd"] >= 0 else ""
+                        em = "🟢" if pos["pnl_usd"] >= 0 else "🔴"
+                        lev_tag = f"[{pos['tipo_pos']} {pos['lev']:.0f}x]" if pos['tipo_pos'] != "SPOT" else "[SPOT]"
+                        dist = f"\n   Dist. liquidación: {pos['dist_liq_pct']:.1f}%" if pos.get("dist_liq_pct") is not None else ""
+                        msg_rep += (
+                            f"\n▪️ ID {pos['id']}  {pos['ticker']} {lev_tag}\n"
+                            f"   Margen ${pos['costo_margen']:,.0f}  |  PPC ${pos['ppc']:,.2f}  |  Spot ${pos['spot']:,.2f}\n"
+                            f"   PnL {em} {pnl_s}${pos['pnl_usd']:,.2f} ({pnl_s}{pos['pnl_pct']:.1f}%){dist}"
+                        )
+                await update.message.reply_text(msg_rep)
+
+        if necesita_grafico_inv:
+            buf_img = generar_grafico_distribucion_inversiones(user_id)
+            if buf_img:
+                await update.message.reply_photo(photo=buf_img, caption="📊 Distribución de posiciones abiertas")
+
+        if necesita_grafico_gastos:
+            buf_img = generar_grafico_gastos(user_id)
+            if buf_img:
+                await update.message.reply_photo(photo=buf_img, caption="📊 Distribución de gastos por categoría (ARS)")
+
+        if necesita_excel:
+            excel_buf = generar_excel_completo(user_id)
+            if excel_buf:
+                await update.message.reply_document(
+                    document=excel_buf, 
+                    filename="Finanzas_Consolidadas.xlsx", 
+                    caption="📁 Planilla completa: Gastos (ARS) + Posiciones abiertas + Trades cerrados"
+                )
+
+    except Exception as e:
+        logger.error(f"Error: {e}", exc_info=True)
+        await update.message.reply_text(f"Hubo un error: {e}")
+
 async def cmd_ytd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     per = extraer_periodo(update.message.text or "ytd") or "ytd"
