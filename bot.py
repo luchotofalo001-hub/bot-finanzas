@@ -640,7 +640,7 @@ def generar_grafico_evolucion_activo(user_id: int, ticker: str, periodo_solicita
         logger.error(f"Error graficando activo {ticker}: {e}")
         return None
 
-# ==================== MOTOR DE ANÁLISIS TÉCNICO LOCAL ====================
+# ==================== MOTOR CUANTITATIVO AVANZADO (SIN IA) ====================
 def calcular_rsi_serie(series, period=14):
     delta = series.diff()
     gain = delta.clip(lower=0)
@@ -664,20 +664,151 @@ def calcular_atr(df, period=14):
     tr = pd.concat([(high - low), (high - prev).abs(), (low - prev).abs()], axis=1).max(axis=1)
     return tr.ewm(alpha=1/period, adjust=False).mean()
 
-def describir_estructura(df, lookback=40):
-    sub = df.iloc[-lookback:] if len(df) >= lookback else df
-    if len(sub) < 8:
-        return "Sin datos", "neutro"
-    c = sub["Close"]
-    r1 = float(c.iloc[-1] / c.iloc[len(c)//2] - 1) * 100
-    r2 = float(c.iloc[-1] / c.iloc[0] - 1) * 100
-    hh = float(sub["High"].iloc[-10:].max()) >= float(sub["High"].iloc[:-10].max()) if len(sub) > 20 else r1 > 0
-    ll = float(sub["Low"].iloc[-10:].min()) <= float(sub["Low"].iloc[:-10].min()) if len(sub) > 20 else r1 < 0
-    if hh and r1 > 0 and r2 > 0:
-        return "Higher highs / tendencia alcista", "alcista"
-    if ll and r1 < 0 and r2 < 0:
-        return "Lower lows / tendencia bajista", "bajista"
-    return "Rango / compresión", "lateral"
+def calcular_pivots_y_niveles(df, ventana=4):
+    """Encuentra soportes y resistencias reales por fractales y toques recurrentes."""
+    highs = df['High'].values
+    lows = df['Low'].values
+    precio_actual = float(df['Close'].iloc[-1])
+    n = len(df)
+    
+    pivots_h = []
+    pivots_l = []
+    
+    for i in range(ventana, n - ventana):
+        if all(highs[i] >= highs[i - j] for j in range(1, ventana + 1)) and \
+           all(highs[i] >= highs[i + j] for j in range(1, ventana + 1)):
+            pivots_h.append((df.index[i], highs[i]))
+            
+        if all(lows[i] <= lows[i - j] for j in range(1, ventana + 1)) and \
+           all(lows[i] <= lows[i + j] for j in range(1, ventana + 1)):
+            pivots_l.append((df.index[i], lows[i]))
+
+    resistencias = sorted([val for _, val in pivots_h if val > precio_actual])
+    soportes = sorted([val for _, val in pivots_l if val < precio_actual], reverse=True)
+
+    res_inmediata = resistencias[0] if resistencias else None
+    res_segunda = resistencias[1] if len(resistencias) > 1 else None
+    sop_inmediato = soportes[0] if soportes else None
+    sop_segundo = soportes[1] if len(soportes) > 1 else None
+
+    ult_highs = [val for _, val in pivots_h[-3:]]
+    ult_lows = [val for _, val in pivots_l[-3:]]
+    
+    estructura_txt = "Consolidación / lateral"
+    estructura_bias = "lateral"
+    
+    if len(ult_highs) >= 2 and len(ult_lows) >= 2:
+        if ult_highs[-1] > ult_highs[-2] and ult_lows[-1] > ult_lows[-2]:
+            estructura_txt = "Estructura ALCISTA (Higher Highs + Higher Lows)"
+            estructura_bias = "alcista"
+        elif ult_highs[-1] < ult_highs[-2] and ult_lows[-1] < ult_lows[-2]:
+            estructura_txt = "Estructura BAJISTA (Lower Highs + Lower Lows)"
+            estructura_bias = "bajista"
+        elif ult_highs[-1] > ult_highs[-2] and ult_lows[-1] < ult_lows[-2]:
+            estructura_txt = "Expansión / Quiebre estructural reciente (CHoCH)"
+            estructura_bias = "choch"
+
+    fibo_niveles = {}
+    if pivots_h and pivots_l:
+        last_ph_idx, last_ph = pivots_h[-1]
+        last_pl_idx, last_pl = pivots_l[-1]
+        diff = abs(last_ph - last_pl)
+        if diff > 0:
+            if last_ph_idx > last_pl_idx:
+                fibo_niveles["0.382"] = last_ph - 0.382 * diff
+                fibo_niveles["0.500"] = last_ph - 0.500 * diff
+                fibo_niveles["Golden Pocket 0.618"] = last_ph - 0.618 * diff
+                fibo_niveles["Ext 1.618"] = last_ph + 0.618 * diff
+            else:
+                fibo_niveles["0.382"] = last_pl + 0.382 * diff
+                fibo_niveles["0.500"] = last_pl + 0.500 * diff
+                fibo_niveles["Golden Pocket 0.618"] = last_pl + 0.618 * diff
+                fibo_niveles["Ext 1.618"] = last_pl - 0.618 * diff
+
+    return {
+        "res_inmediata": res_inmediata,
+        "res_segunda": res_segunda,
+        "sop_inmediato": sop_inmediato,
+        "sop_segundo": sop_segundo,
+        "estructura_txt": estructura_txt,
+        "estructura_bias": estructura_bias,
+        "fibo_niveles": fibo_niveles
+    }
+
+def calcular_poc_volumen(df, barras_lookback=90, bins_count=40):
+    """Calcula el Point of Control (POC) de volumen."""
+    if "Volume" not in df.columns or df["Volume"].sum() == 0:
+        return None
+    sub = df.iloc[-barras_lookback:] if len(df) >= barras_lookback else df
+    min_p = sub["Low"].min()
+    max_p = sub["High"].max()
+    if min_p == max_p:
+        return None
+
+    bins = np.linspace(min_p, max_p, bins_count + 1)
+    vol_per_bin = np.zeros(bins_count)
+    typical_price = (sub["High"] + sub["Low"] + sub["Close"]) / 3.0
+    vol = sub["Volume"].values
+
+    for tp, v in zip(typical_price.values, vol):
+        idx = np.digitize(tp, bins) - 1
+        if 0 <= idx < bins_count:
+            vol_per_bin[idx] += v
+
+    poc_idx = np.argmax(vol_per_bin)
+    poc_price = (bins[poc_idx] + bins[poc_idx + 1]) / 2.0
+    return float(poc_price)
+
+def backtest_comportamiento_historico(df, condicion="sobreventa_rsi"):
+    """Backtesting estadístico de reacción histórica ante la misma condición técnica."""
+    if len(df) < 250:
+        return None
+    
+    rsi = df['RSI'].values
+    close = df['Close'].values
+    n = len(close)
+    dias_adelante = 15
+
+    casos_retornos = []
+
+    if condicion == "sobreventa_rsi":
+        for i in range(15, n - dias_adelante):
+            if rsi[i] <= 35 and rsi[i - 1] > 35:
+                ret = (close[i + dias_adelante] / close[i] - 1.0) * 100.0
+                casos_retornos.append(ret)
+        label = "RSI en sobreventa (<= 35)"
+
+    elif condicion == "sobrecompra_rsi":
+        for i in range(15, n - dias_adelante):
+            if rsi[i] >= 68 and rsi[i - 1] < 68:
+                ret = (close[i + dias_adelante] / close[i] - 1.0) * 100.0
+                casos_retornos.append(ret)
+        label = "RSI en sobrecompra (>= 68)"
+
+    elif condicion == "cruce_alcista_ema":
+        ema20 = df['EMA20'].values
+        ema50 = df['EMA50'].values
+        for i in range(15, n - dias_adelante):
+            if ema20[i] > ema50[i] and ema20[i - 1] <= ema50[i - 1]:
+                ret = (close[i + dias_adelante] / close[i] - 1.0) * 100.0
+                casos_retornos.append(ret)
+        label = "Cruce de EMA20 sobre EMA50"
+    else:
+        return None
+
+    if not casos_retornos:
+        return None
+
+    win_rate = (len([r for r in casos_retornos if r > 0]) / len(casos_retornos)) * 100.0
+    avg_ret = float(np.mean(casos_retornos))
+    
+    return {
+        "condicion": label,
+        "muestras": len(casos_retornos),
+        "dias": dias_adelante,
+        "win_rate": win_rate,
+        "avg_ret": avg_ret
+    }
 
 def detectar_divergencia_rsi(df, window=25):
     if len(df) < window:
@@ -739,79 +870,86 @@ def formatear_reporte_tecnico(info):
     e200 = info['ema200']
     rsi = info['rsi']
     diag_rsi = info['diagnostico_rsi']
-    fibo = info['fibo_niveles']
+    fibo = info.get('fibo_niveles', {})
+    poc = info.get('poc')
+    hist_stat = info.get('hist_stat')
     
     lineas = [f"📊 REPORTE TÉCNICO: {tk} ({tf})", f"• Precio actual: ${p:,.2f} USD", ""]
 
-    lineas.append("📈 Estructura y EMAs")
-    est = info.get("estructura_txt") or ""
-    if est:
-        lineas.append(f"• {est}")
+    lineas.append("📈 Estructura de Mercado y Pivots")
+    est = info.get("estructura_txt") or "En desarrollo"
+    lineas.append(f"• Estructura: {est}")
+    
+    sop1 = info.get("sop_inmediato")
+    sop2 = info.get("sop_segundo")
+    res1 = info.get("res_inmediata")
+    res2 = info.get("res_segunda")
+    
+    if sop1:
+        dist_s = ((p - sop1) / p) * 100.0
+        lineas.append(f"• Soporte clave: ${sop1:,.2f} (-{dist_s:.1f}%)" + (f" | S2: ${sop2:,.2f}" if sop2 else ""))
+    if res1:
+        dist_r = ((res1 - p) / p) * 100.0
+        lineas.append(f"• Resistencia clave: ${res1:,.2f} (+{dist_r:.1f}%)" + (f" | R2: ${res2:,.2f}" if res2 else ""))
+
+    if poc:
+        dist_poc = ((p - poc) / p) * 100.0
+        lado_poc = "soporte de volumen institucional" if p >= poc else "resistencia magnética de volumen"
+        signo = "+" if dist_poc >= 0 else ""
+        lineas.append(f"• POC (Mayor volumen): ${poc:,.2f} ({signo}{dist_poc:.1f}% → {lado_poc})")
+
+    lineas.append("")
+    lineas.append("🌊 Medias Móviles")
     if p > e20 and e20 > e50:
-        lineas.append(f"• Sesgo corto: alcista (precio > EMA20 ${e20:,.2f} > EMA50 ${e50:,.2f})")
+        lineas.append(f"• Sesgo dinámico: Alcista sólido (Precio > EMA20 ${e20:,.2f} > EMA50 ${e50:,.2f})")
     elif p < e20 and e20 < e50:
-        lineas.append(f"• Sesgo corto: bajista (precio < EMA20 ${e20:,.2f} < EMA50 ${e50:,.2f})")
+        lineas.append(f"• Sesgo dinámico: Bajista bajo presión (Precio < EMA20 ${e20:,.2f} < EMA50 ${e50:,.2f})")
     else:
-        lineas.append(f"• Sesgo corto: mixto / compresión (EMA20 ${e20:,.2f} | EMA50 ${e50:,.2f})")
+        lineas.append(f"• Sesgo dinámico: Mixto / compresión (EMA20 ${e20:,.2f} | EMA50 ${e50:,.2f})")
     if e200:
-        pos_200 = "soporte dinámico" if p > e200 else "resistencia dinámica"
-        lineas.append(f"• EMA200: ${e200:,.2f} ({pos_200})")
+        pos_200 = "soporte macro" if p > e200 else "resistencia macro"
+        lineas.append(f"• EMA 200: ${e200:,.2f} ({pos_200})")
 
     lineas.append("")
     lineas.append("⚡ Momentum")
     lineas.append(f"• RSI 14: {rsi:.1f} — {diag_rsi}")
     macd = info.get("macd")
-    macd_sig = info.get("macd_signal")
     macd_hist = info.get("macd_hist")
     if macd is not None:
-        cruce = "histograma +" if (macd_hist or 0) >= 0 else "histograma -"
-        lado = "sobre señal" if macd >= (macd_sig or 0) else "bajo señal"
-        lineas.append(f"• MACD: {macd:.4f} ({lado}, {cruce})")
+        cruce = "histograma verde (+)" if (macd_hist or 0) >= 0 else "histograma rojo (-)"
+        lineas.append(f"• MACD: {cruce} (Hist: {macd_hist:+.4f})")
 
-    atr = info.get("atr")
-    atr_pct = info.get("atr_pct")
-    if atr:
-        lineas.append("")
-        lineas.append("🌊 Volatilidad")
-        extra = f" ({atr_pct:.2f}% del precio)" if atr_pct else ""
-        lineas.append(f"• ATR 14: ${atr:,.2f}{extra}")
-        if atr_pct and atr_pct >= 5:
-            lineas.append("• Volatilidad alta: stops más anchos o size más chico.")
-        elif atr_pct and atr_pct <= 1.5:
-            lineas.append("• Volatilidad baja: posible expansión próxima.")
-
-    vol_txt = info.get("volumen_txt")
-    if vol_txt:
-        lineas.append(f"• Volumen: {vol_txt}")
-
-    sh, sl = info.get("swing_high"), info.get("swing_low")
-    if sh and sl:
-        lineas.append("")
-        lineas.append("🎯 Niveles")
-        lineas.append(f"• Resistencia swing: ${sh:,.2f}")
-        lineas.append(f"• Soporte swing: ${sl:,.2f}")
     if fibo:
-        if "0.618" in fibo:
-            lineas.append(f"• Golden Pocket 0.618: ${fibo['0.618']:,.2f}")
+        lineas.append("")
+        lineas.append("🎯 Fibonacci del Último Impulso")
+        if "Golden Pocket 0.618" in fibo:
+            lineas.append(f"• Golden Pocket 0.618: ${fibo['Golden Pocket 0.618']:,.2f}")
         if "0.500" in fibo:
-            lineas.append(f"• 50%: ${fibo['0.500']:,.2f}")
+            lineas.append(f"• 50% Retroceso: ${fibo['0.500']:,.2f}")
         if "Ext 1.618" in fibo:
-            lineas.append(f"• Ext 1.618: ${fibo['Ext 1.618']:,.2f}")
+            lineas.append(f"• Objetivo Extensión 1.618: ${fibo['Ext 1.618']:,.2f}")
+
+    if hist_stat:
+        lineas.append("")
+        lineas.append("🧠 Comportamiento Histórico de este Activo")
+        lineas.append(f"• Patrón testeado: {hist_stat['condicion']} ({hist_stat['muestras']} eventos en su historia)")
+        em_stat = "🟢" if hist_stat['win_rate'] >= 60 else ("🟡" if hist_stat['win_rate'] >= 45 else "🔴")
+        lineas.append(f"• Efectividad a {hist_stat['dias']} días: {em_stat} {hist_stat['win_rate']:.1f}% Win Rate")
+        signo_ret = "+" if hist_stat['avg_ret'] >= 0 else ""
+        lineas.append(f"• Retorno promedio histórico del trade: {signo_ret}{hist_stat['avg_ret']:.2f}%")
 
     lineas.append("")
-    lineas.append("💡 Lectura")
-    bias = info.get("estructura_bias") or "neutro"
-    if "DIVERGENCIA ALCISTA" in diag_rsi.upper() or (rsi <= 32 and bias != "bajista"):
-        lineas.append("• Rebote táctico probable. Confirmar recupe de EMA20 con volumen.")
-    elif "DIVERGENCIA BAJISTA" in diag_rsi.upper() or (rsi >= 68 and bias != "alcista"):
-        lineas.append("• Riesgo de techo. No perseguir largos acá; esperar pullback.")
+    lineas.append("💡 Conclusión Operativa")
+    bias = info.get("estructura_bias") or "lateral"
+    if "DIVERGENCIA ALCISTA" in diag_rsi.upper() or rsi <= 32:
+        lineas.append("• Probabilidad alta de rebote técnico. Buscar confirmación sobre EMA20.")
+    elif "DIVERGENCIA BAJISTA" in diag_rsi.upper() or rsi >= 68:
+        lineas.append("• Zona de agotamiento de compras. Riesgo alto de pullback a soporte o POC.")
     elif bias == "alcista" and p > e20:
-        lineas.append("• Tendencia a favor. Continúa válido mientras sostenga EMA20.")
-    elif bias == "bajista" and p < e20:
-        lineas.append("• Tendencia en contra. Esperar base o divergencia antes de comprar.")
+        lineas.append("• Tendencia a favor. Mantener stop bajo el último pivot soporte.")
     else:
-        lineas.append("• Mercado indefinido. Mejor esperar ruptura de rango.")
-    lineas.append("• No es señal de entrada automática: cruzá con tu plan y el apalancamiento.")
+        lineas.append("• Rango en desarrollo. Operar rebotes en extremos o esperar quiebre con volumen.")
+
     return "\n".join(lineas)
 
 def generar_grafico_analisis_tecnico(ticker: str, timeframe: str = "diario", con_fibo: bool = False, con_ext: bool = False):
@@ -861,7 +999,19 @@ def generar_grafico_analisis_tecnico(ticker: str, timeframe: str = "diario", con
         df['RSI'] = calcular_rsi_serie(df['Close'], period=14)
         df['MACD'], df['MACDs'], df['MACDh'] = calcular_macd(df['Close'])
         df['ATR'] = calcular_atr(df)
-        estructura_txt, estructura_bias = describir_estructura(df)
+
+        niveles_dict = calcular_pivots_y_niveles(df, ventana=4)
+        poc_price = calcular_poc_volumen(df, barras_lookback=90)
+        
+        hist_stat = None
+        rsi_act = float(df['RSI'].iloc[-1])
+        if rsi_act <= 36:
+            hist_stat = backtest_comportamiento_historico(df, "sobreventa_rsi")
+        elif rsi_act >= 65:
+            hist_stat = backtest_comportamiento_historico(df, "sobrecompra_rsi")
+        elif df['EMA20'].iloc[-1] > df['EMA50'].iloc[-1]:
+            hist_stat = backtest_comportamiento_historico(df, "cruce_alcista_ema")
+
         vol_txt = None
         if "Volume" in df.columns and df["Volume"].fillna(0).sum() > 0:
             v_now = float(df["Volume"].iloc[-1])
@@ -874,36 +1024,6 @@ def generar_grafico_analisis_tecnico(ticker: str, timeframe: str = "diario", con
                     vol_txt = f"bajo ({ratio:.1f}x vs 20)"
                 else:
                     vol_txt = f"normal ({ratio:.1f}x vs 20)"
-        
-        ult_velas = min(120, len(df))
-        sub_df = df.iloc[-ult_velas:].copy()
-        
-        swing_high = sub_df['High'].max()
-        swing_low = sub_df['Low'].min()
-        high_idx = sub_df['High'].idxmax()
-        low_idx = sub_df['Low'].idxmin()
-        
-        diff = swing_high - swing_low
-        fibo_niveles = {}
-        if (con_fibo or con_ext) and diff > 0:
-            if high_idx > low_idx:
-                if con_fibo:
-                    fibo_niveles["0.382"] = swing_high - 0.382 * diff
-                    fibo_niveles["0.500"] = swing_high - 0.500 * diff
-                    fibo_niveles["0.618"] = swing_high - 0.618 * diff
-                    fibo_niveles["1.000"] = swing_low
-                if con_ext:
-                    fibo_niveles["Ext 1.618"] = swing_high + 0.618 * diff
-                    fibo_niveles["Ext 2.618"] = swing_high + 1.618 * diff
-            else:
-                if con_fibo:
-                    fibo_niveles["0.382"] = swing_low + 0.382 * diff
-                    fibo_niveles["0.500"] = swing_low + 0.500 * diff
-                    fibo_niveles["0.618"] = swing_low + 0.618 * diff
-                    fibo_niveles["1.000"] = swing_high
-                if con_ext:
-                    fibo_niveles["Ext 1.618"] = swing_low - 0.618 * diff
-                    fibo_niveles["Ext 2.618"] = swing_low - 1.618 * diff
 
         estado_rsi_div = detectar_divergencia_rsi(df)
 
@@ -914,17 +1034,27 @@ def generar_grafico_analisis_tecnico(ticker: str, timeframe: str = "diario", con
         ax1.plot(df.index, df['EMA50'], label="EMA 50", color="#ffa726", linewidth=1.4)
         if len(df) >= 150:
             ax1.plot(df.index, df['EMA200'], label="EMA 200", color="#ef5350", linewidth=1.8)
+
+        if poc_price:
+            ax1.axhline(poc_price, color="#00e676", linestyle="-.", linewidth=1.3, alpha=0.9, label=f"POC Vol (${poc_price:,.2f})")
             
-        colores_fibo = {"0.382": "#ab47bc", "0.500": "#26a69a", "0.618": "#ffca28", "Ext 1.618": "#ff7043", "Ext 2.618": "#e91e63"}
-        for k, v in fibo_niveles.items():
-            if k in colores_fibo:
-                ax1.axhline(v, color=colores_fibo[k], linestyle="--", linewidth=1.1, alpha=0.75, label=f"Fibo {k} (${v:,.2f})")
+        if niveles_dict["sop_inmediato"]:
+            ax1.axhline(niveles_dict["sop_inmediato"], color="#29b6f6", linestyle=":", linewidth=1.2, label=f"Soporte (${niveles_dict['sop_inmediato']:,.2f})")
+            
+        if niveles_dict["res_inmediata"]:
+            ax1.axhline(niveles_dict["res_inmediata"], color="#ff5252", linestyle=":", linewidth=1.2, label=f"Resistencia (${niveles_dict['res_inmediata']:,.2f})")
+
+        fibo_niveles = niveles_dict["fibo_niveles"]
+        if (con_fibo or con_ext) and fibo_niveles:
+            colores_fibo = {"0.382": "#ab47bc", "0.500": "#26a69a", "Golden Pocket 0.618": "#ffca28", "Ext 1.618": "#ff7043"}
+            for k, v in fibo_niveles.items():
+                if k in colores_fibo:
+                    ax1.axhline(v, color=colores_fibo[k], linestyle="--", linewidth=1.1, alpha=0.75, label=f"{k} (${v:,.2f})")
 
         ax1.set_facecolor("#131722")
         fig.patch.set_facecolor("#131722")
         ax1.grid(True, linestyle="--", alpha=0.15, color="#787b86")
-        tit_fibo = ", Fibonacci" if (con_fibo or con_ext) else ""
-        ax1.set_title(f"{ticker} | Analisis Tecnico ({tf_label})\nEMA 20/50/200 + MACD + RSI{tit_fibo}", color="#ffffff", fontsize=12, fontweight='bold', pad=10)
+        ax1.set_title(f"{ticker} | Analisis Tecnico Cuantitativo ({tf_label})\nEMA 20/50/200 + POC + Pivots + RSI", color="#ffffff", fontsize=12, fontweight='bold', pad=10)
         ax1.tick_params(colors="#787b86")
         ax1.legend(loc="upper left", facecolor="#1e222d", edgecolor="#2a2e39", labelcolor="#d1d4dc", fontsize=8)
 
@@ -973,16 +1103,20 @@ def generar_grafico_analisis_tecnico(ticker: str, timeframe: str = "diario", con
             "ema200": ema200_val,
             "rsi": rsi_val,
             "diagnostico_rsi": estado_rsi_div,
-            "swing_high": swing_high,
-            "swing_low": swing_low,
+            "sop_inmediato": niveles_dict["sop_inmediato"],
+            "sop_segundo": niveles_dict["sop_segundo"],
+            "res_inmediata": niveles_dict["res_inmediata"],
+            "res_segunda": niveles_dict["res_segunda"],
             "fibo_niveles": fibo_niveles,
+            "poc": poc_price,
+            "hist_stat": hist_stat,
             "macd": float(df['MACD'].iloc[-1]),
             "macd_signal": float(df['MACDs'].iloc[-1]),
             "macd_hist": float(df['MACDh'].iloc[-1]),
             "atr": atr_val,
             "atr_pct": atr_pct,
-            "estructura_txt": estructura_txt,
-            "estructura_bias": estructura_bias,
+            "estructura_txt": niveles_dict["estructura_txt"],
+            "estructura_bias": niveles_dict["estructura_bias"],
             "volumen_txt": vol_txt,
         }
         return buf, datos_analisis
@@ -1017,32 +1151,21 @@ def escanear_cartera_senales(user_id: int):
         rsi_d = info_d['rsi']
         diag_d = info_d['diagnostico_rsi']
         precio = info_d['precio_actual']
-        ema20_d = info_d['ema20']
-        ema50_d = info_d['ema50']
+        est_d = info_d.get('estructura_txt', '')
+        poc_d = info_d.get('poc')
 
         rsi_w = info_w['rsi'] if (info_w and not isinstance(info_w, str)) else None
         diag_w = info_w['diagnostico_rsi'] if (info_w and not isinstance(info_w, str)) else "N/A"
 
-        tiene_senal_d = ("DIVERGENCIA" in diag_d.upper()) or (rsi_d >= 70) or (rsi_d <= 30)
+        tiene_senal_d = ("DIVERGENCIA" in diag_d.upper()) or (rsi_d >= 70) or (rsi_d <= 30) or (poc_d and abs(precio - poc_d)/precio <= 0.01)
         tiene_senal_w = ("DIVERGENCIA" in diag_w.upper()) or (rsi_w and (rsi_w >= 70 or rsi_w <= 30))
 
-        movimiento = []
-        if precio > ema20_d > ema50_d:
-            movimiento.append("Estructura alcista sólida sobre EMA 20 y 50")
-            probabilidad = "Continuidad alcista o consolidación sana."
-        elif precio < ema20_d < ema50_d:
-            movimiento.append("Estructura bajista / corrección activa bajo EMAs")
-            probabilidad = "Presión vendedora; probable búsqueda de soportes."
-        elif precio > ema20_d:
-            movimiento.append("Rebote táctico sobre EMA 20")
-            probabilidad = "Testeo de resistencia en EMA 50."
-        else:
-            movimiento.append("Lateral / comprimiendo entre EMAs")
-            probabilidad = "Ruptura inminente de rango."
-
         diag_texto = [f"📌 {tk} (${precio:,.2f} USD)"]
-        diag_texto.append(f"• Movimiento: {', '.join(movimiento)}")
-        diag_texto.append(f"• Escenario probable: {probabilidad}")
+        diag_texto.append(f"• Estructura: {est_d}")
+        
+        if poc_d:
+            dist_p = ((precio - poc_d) / precio) * 100
+            diag_texto.append(f"• POC volumen: ${poc_d:,.2f} ({dist_p:+.1f}%)")
         
         avisos_rsi = []
         if "DIVERGENCIA" in diag_d.upper():
@@ -1061,7 +1184,7 @@ def escanear_cartera_senales(user_id: int):
         diag_texto.append(f"• Aviso RSI: {' | '.join(avisos_rsi)}")
 
         if tiene_senal_d and buf_d:
-            imagenes_senales.append((buf_d, f"🚨 {tk} (Diario) — Señal RSI activa"))
+            imagenes_senales.append((buf_d, f"🚨 {tk} (Diario) — Señal técnica activa"))
         elif tiene_senal_w and buf_w:
             imagenes_senales.append((buf_w, f"🚨 {tk} (Semanal) — Señal RSI activa"))
 
@@ -1352,7 +1475,7 @@ def obtener_resumen_portafolio(user_id: int):
                 pnl_pct = var_precio_pct * lev * 100
                 pnl_usd = costo_margen * (var_precio_pct * lev)
                 valor_actual = max(0.0, costo_margen + pnl_usd)
-            else: # SPOT
+            else:
                 valor_actual = cant * spot
                 pnl_usd = valor_actual - costo_margen
                 pnl_pct = (pnl_usd / costo_margen * 100) if costo_margen > 0 else 0.0
@@ -1808,7 +1931,7 @@ def desactivar_objetivo(user_id: int, oid: int):
             cursor.execute("UPDATE objetivos SET activo = FALSE WHERE id = %s AND user_id = %s;", (oid, user_id))
             conn.commit()
 
-# ==================== SISTEMA DE ALERTAS ====================
+# ==================== SISTEMA DE ALERTAS INTELIGENTE ====================
 def _hash_alerta(tipo: str, clave: str, detalle: str = "") -> str:
     raw = f"{tipo}|{clave}|{detalle}"
     return hashlib.sha256(raw.encode()).hexdigest()[:32]
@@ -1836,6 +1959,7 @@ def registrar_alerta_enviada(user_id: int, tipo: str, clave: str, hash_a: str):
 def generar_alertas_para_usuario(user_id: int) -> list:
     alertas = []
 
+    # 1. Alertas de Liquidación
     resumen = obtener_resumen_portafolio(user_id)
     if resumen:
         for p in resumen["posiciones"]:
@@ -1851,15 +1975,47 @@ def generar_alertas_para_usuario(user_id: int) -> list:
                         "hash": h
                     })
 
+    # 2. Alertas Cuantitativas Avanzadas (POC, CHoCH, RSI y Estadísticas)
     if resumen:
         tickers = list({p['ticker'] for p in resumen["posiciones"] if p['ticker'] not in ["USDT", "USDC", "DAI", "USD"]})
         for tk in tickers[:8]:
             try:
                 _, info = generar_grafico_analisis_tecnico(tk, "diario")
                 if info and not isinstance(info, str):
+                    p_act = info['precio_actual']
                     rsi = info.get("rsi", 50)
                     diag = info.get("diagnostico_rsi", "")
-                    
+                    poc = info.get("poc")
+                    sop = info.get("sop_inmediato")
+                    res = info.get("res_inmediata")
+                    bias = info.get("estructura_bias")
+                    hist = info.get("hist_stat")
+
+                    # Alerta de Testeo de POC (Punto de Mayor Volumen Institucional)
+                    if poc and abs(p_act - poc) / p_act <= 0.008:
+                        clave = f"{tk}_test_poc"
+                        h = _hash_alerta("poc_test", clave, "")
+                        if not alerta_ya_enviada(user_id, h, horas_ventana=24):
+                            alertas.append({
+                                "texto": f"🎯 TESTEO DE POC INSTITUCIONAL\n{tk} está testeando su POC de volumen en ${poc:,.2f} (Precio: ${p_act:,.2f}). Zona de alta reacción.",
+                                "tipo": "poc_test",
+                                "clave": clave,
+                                "hash": h
+                            })
+
+                    # Alerta de Quiebre de Estructura (CHoCH)
+                    if bias == "choch":
+                        clave = f"{tk}_choch"
+                        h = _hash_alerta("choch", clave, "")
+                        if not alerta_ya_enviada(user_id, h, horas_ventana=24):
+                            alertas.append({
+                                "texto": f"🔄 CAMBIO DE ESTRUCTURA (CHoCH)\n{tk} acaba de quebrar su estructura previa en ${p_act:,.2f}. Posible giro de tendencia.",
+                                "tipo": "choch",
+                                "clave": clave,
+                                "hash": h
+                            })
+
+                    # Alerta de Divergencia y Extremos con Backtest
                     tipo_senal = None
                     if "SE ESTÁ FORMANDO" in diag.upper() or "EN FORMACIÓN" in diag.upper():
                         tipo_senal = "div_predictiva"
@@ -1876,8 +2032,11 @@ def generar_alertas_para_usuario(user_id: int) -> list:
                         clave = f"{tk}_{tipo_senal}"
                         h = _hash_alerta("rsi_senal", clave, "")
                         if not alerta_ya_enviada(user_id, h, horas_ventana=18):
+                            extra_stat = ""
+                            if hist:
+                                extra_stat = f"\n📊 Historia: {hist['win_rate']:.0f}% Win Rate a 15 días (retorno prom: {hist['avg_ret']:+.1f}%)"
                             alertas.append({
-                                "texto": f"📡 SEÑAL TÉCNICA (Diario)\n{tk} — RSI {rsi:.1f}\n{diag}",
+                                "texto": f"📡 SEÑAL TÉCNICA (Diario)\n{tk} — RSI {rsi:.1f}\n{diag}{extra_stat}",
                                 "tipo": "rsi_senal",
                                 "clave": clave,
                                 "hash": h
@@ -1885,6 +2044,7 @@ def generar_alertas_para_usuario(user_id: int) -> list:
             except Exception:
                 pass
 
+    # 3. Alertas de Gasto
     try:
         with get_db_connection() as conn:
             df_hoy = pd.read_sql(
@@ -2322,7 +2482,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/resumen   →  balance consolidado\n"
         "/ytd       →  rendimiento acumulado + Alpha SPY\n"
         "/riesgo    →  métricas de riesgo + liquidaciones\n"
-        "/analisis  →  análisis técnico algorítmico (sin IA)\n"
+        "/analisis  →  análisis técnico cuantitativo (sin IA)\n"
         "/mes       →  gastos del mes + presupuestos\n"
         "/objetivos →  progreso de metas\n\n"
         "También podés hablarme en lenguaje natural."
@@ -2452,7 +2612,7 @@ async def intentar_comando_local(update: Update, user_id: int, user_msg: str) ->
         con_fibo = "fibo" in low
         buf_img, info_at = generar_grafico_analisis_tecnico(tk, tf_at, con_fibo, con_fibo)
         if buf_img and info_at and not isinstance(info_at, str):
-            await update.message.reply_photo(photo=buf_img, caption=f"📈 {tk} ({tf_at}) EMA+MACD+RSI")
+            await update.message.reply_photo(photo=buf_img, caption=f"📈 {tk} ({tf_at}) POC + Pivots + RSI")
             await update.message.reply_text(formatear_reporte_tecnico(info_at))
         else:
             await update.message.reply_text(f"No pude analizar {tk}.")
@@ -2487,7 +2647,7 @@ async def intentar_comando_local(update: Update, user_id: int, user_msg: str) ->
         con_fibo = "fibo" in low
         buf_img, info_at = generar_grafico_analisis_tecnico(tk, tf_at, con_fibo, con_fibo)
         if buf_img and info_at and not isinstance(info_at, str):
-            await update.message.reply_photo(photo=buf_img, caption=f"📈 {tk} ({tf_at}) EMA+MACD+RSI")
+            await update.message.reply_photo(photo=buf_img, caption=f"📈 {tk} ({tf_at}) POC + Pivots + RSI")
             await update.message.reply_text(formatear_reporte_tecnico(info_at))
         else:
             await update.message.reply_text(f"No pude analizar {tk}.")
@@ -2899,7 +3059,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             con_ext = bool(re.search(r'\bextensi[oó]n\b|\bext\b', user_msg, re.IGNORECASE))
             buf_img, info_at = generar_grafico_analisis_tecnico(ticker_at, tf_at, con_fibo, con_ext)
             if buf_img and info_at and not isinstance(info_at, str):
-                tags = "EMAs + RSI"
+                tags = "POC + Pivots + RSI"
                 if con_fibo or con_ext:
                     tags += " + Fibo"
                 cap_txt = f"📈 {ticker_at} ({tf_at.capitalize()}) | {tags}"
