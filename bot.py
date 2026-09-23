@@ -150,7 +150,7 @@ def init_db():
                 cursor.execute("ALTER TABLE trades_cerrados ADD COLUMN IF NOT EXISTS fecha_apertura TIMESTAMP;")
 
                 cursor.execute("UPDATE movimientos SET user_id = %s WHERE user_id IS NULL;", (LUCHO_TELEGRAM_ID,))
-                cursor.execute("UPDATE portafolio_inversIONES SET user_id = %s WHERE user_id IS NULL;", (LUCHO_TELEGRAM_ID,))
+                cursor.execute("UPDATE portafolio_inversiones SET user_id = %s WHERE user_id IS NULL;", (LUCHO_TELEGRAM_ID,))
                 cursor.execute("UPDATE trades_cerrados SET user_id = %s WHERE user_id IS NULL;", (LUCHO_TELEGRAM_ID,))
 
                 cursor.execute("UPDATE portafolio_inversiones SET tipo_posicion = 'SPOT' WHERE tipo_posicion IS NULL OR TRIM(tipo_posicion) = '';")
@@ -281,7 +281,7 @@ def resolver_fecha_inicio(periodo_str: str, fecha_compra_db: str = None):
     
     return (hoy - timedelta(days=180)).strftime('%Y-%m-%d'), "Últimos 6 meses"
 
-# ==================== GRÁFICO CONSOLIDADO: TWR VS SPY Y USD ====================
+# ==================== GRÁFICO CONSOLIDADO: EVOLUCIÓN REAL VS SPY ====================
 def generar_grafico_evolucion_cartera_consolidada(user_id: int, periodo_solicitado: str = "", modo: str = "usd"):
     try:
         with get_db_connection() as conn:
@@ -335,7 +335,6 @@ def generar_grafico_evolucion_cartera_consolidada(user_id: int, periodo_solicita
         serie_valor_mercado = pd.Series(0.0, index=fechas_rango)
         serie_pnl_cerrado_acum = pd.Series(0.0, index=fechas_rango)
 
-        # 1. Procesar trades cerrados sumando PnL prorrateado y margen a capital invertido
         if not df_tc.empty:
             df_tc['fecha_d'] = pd.to_datetime(df_tc['fecha']).dt.tz_localize(None).dt.floor('D')
             if 'fecha_apertura' in df_tc.columns:
@@ -360,13 +359,11 @@ def generar_grafico_evolucion_cartera_consolidada(user_id: int, periodo_solicita
                 else:
                     incr.loc[mask] += pnl / n
                 
-                # Sumar margen solo mientras el trade estuvo abierto
                 if margen_c > 0:
                     serie_capital_invertido.loc[mask] += margen_c
                     
             serie_pnl_cerrado_acum = incr.cumsum()
 
-        # 2. Procesar posiciones abiertas
         for _, pos in df_inv.iterrows():
             pos_fecha = pd.to_datetime(pos['fecha']).tz_localize(None).floor('D')
             tk = pos['ticker']
@@ -409,27 +406,19 @@ def generar_grafico_evolucion_cartera_consolidada(user_id: int, periodo_solicita
         fig, ax = plt.subplots(figsize=(10, 5.2))
 
         if modo in ("pct", "percent", "%", "spy"):
-            # === CÁLCULO TWR (TIME-WEIGHTED RETURN) REALISTA ===
-            serie_nav = serie_capital_invertido + serie_pnl_total_usd
-            # Establecer un piso mínimo para evitar división por cero si no hay trades abiertos en alguna fecha
+            # Capital base representativo: evita picos artificiales por falta de margen momentáneo
             cap_validos = serie_capital_invertido[serie_capital_invertido > 0]
-            nav_floor = float(cap_validos.min()) if not cap_validos.empty else 100.0
-            nav_sano = serie_nav.clip(lower=nav_floor)
-            nav_prev = nav_sano.shift(1).bfill()
+            base_capital = float(cap_validos.max()) if not cap_validos.empty else 1000.0
 
-            dpnl = serie_pnl_total_usd.diff().fillna(0.0)
-            r = dpnl / nav_prev
-            r = r.replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(-0.5, 0.5)
-
-            twr_cum = (1.0 + r).cumprod() - 1.0
-            serie_cartera_pct = twr_cum * 100.0
+            # Retorno porcentual continuo y exacto de la cartera
+            serie_cartera_pct = (serie_pnl_total_usd / base_capital) * 100.0
 
             ret_c = float(serie_cartera_pct.iloc[-1]) if len(serie_cartera_pct) else 0.0
             if not np.isfinite(ret_c):
                 ret_c = 0.0
 
             color_linea = "#00b06f" if ret_c >= 0 else "#e04050"
-            ax.plot(fechas_rango, serie_cartera_pct, label=f"Tu cartera TWR ({ret_c:+.1f}%)", color=color_linea, linewidth=2.4)
+            ax.plot(fechas_rango, serie_cartera_pct, label=f"Tu cartera ({ret_c:+.1f}%)", color=color_linea, linewidth=2.4)
             ax.fill_between(fechas_rango, serie_cartera_pct, 0, where=(serie_cartera_pct >= 0), alpha=0.15, color="#00b06f")
             ax.fill_between(fechas_rango, serie_cartera_pct, 0, where=(serie_cartera_pct < 0), alpha=0.15, color="#e04050")
 
@@ -441,7 +430,7 @@ def generar_grafico_evolucion_cartera_consolidada(user_id: int, periodo_solicita
                     ax.plot(fechas_rango, serie_spy_pct, label=f"SPY ({spy_ret:+.1f}%)", color="#5b8def", linewidth=1.8, linestyle="--")
 
             ax.axhline(0, color="gray", linestyle="--", linewidth=1.1, alpha=0.7)
-            ax.set_title(f"Rendimiento TWR %: tu cartera vs SPY\n{desc_periodo}", fontsize=12, fontweight='bold', pad=12)
+            ax.set_title(f"Rendimiento %: tu cartera vs SPY\n{desc_periodo}", fontsize=12, fontweight='bold', pad=12)
             ax.set_ylabel("Rendimiento acumulado (%)")
         else:
             color_linea = "#00b06f" if pnl_final_usd >= 0 else "#e04050"
@@ -1601,64 +1590,30 @@ def calcular_rendimiento_periodo(user_id: int, periodo: str = "ytd"):
     if not np.isfinite(capital_pico) or capital_pico <= 0:
         capital_pico = capital_prom
 
-    # === CÁLCULO TWR (TIME-WEIGHTED RETURN) DIARIO ===
-    pnl_proxy = cap_serie.copy() * 0.0
-    if not df_tc.empty:
-        for _, tr in df_tc.iterrows():
-            pnl = float(tr["pnl_usd"] or 0)
-            f_c = pd.to_datetime(tr["fecha"]).tz_localize(None).floor("D")
-            f_a = tr["fecha_apertura"] if "fecha_apertura" in tr else None
-            f_a = pd.to_datetime(f_a).tz_localize(None).floor("D") if pd.notnull(f_a) else f_c
-            if pd.isnull(f_a) or pd.isnull(f_c):
-                continue
-            if f_a > f_c:
-                f_a = f_c
-            mask = (pnl_proxy.index >= f_a) & (pnl_proxy.index <= f_c)
-            n = int(mask.sum())
-            if n <= 0:
-                continue
-            pnl_proxy.loc[mask] += pnl / n
-        pnl_proxy = pnl_proxy.cumsum()
-        
-    if len(pnl_proxy):
-        pnl_proxy.iloc[-1] = float(pnl_proxy.iloc[-1]) + pnl_flot
-
-    # NAV con floor de seguridad para evitar saltos infinitos en cash cero
-    nav_raw = cap_serie + pnl_proxy
-    nav_sano = nav_raw.clip(lower=max(capital_prom * 0.25, 50.0))
-    nav_prev = nav_sano.shift(1).bfill()
-    dpnl = pnl_proxy.diff().fillna(0.0)
-    
-    r = dpnl / nav_prev
-    r = r.replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(-0.5, 0.5)
-    twr = float((1.0 + r).prod() - 1.0) if len(r) else 0.0
-    twr_pct = twr * 100.0
-
-    dietz_pct = (pnl_total / capital_prom * 100.0) if capital_prom else 0.0
-    if not np.isfinite(twr_pct):
-        twr_pct = 0.0
-    if not np.isfinite(dietz_pct):
-        dietz_pct = 0.0
+    # Capital base representativo
+    capital_ref = capital_pico if capital_pico > 0 else capital_prom
+    ret_pct = (pnl_total / capital_ref * 100.0) if capital_ref > 0 else 0.0
 
     dias = max(1, (hoy - start_dt.to_pydatetime()).days)
     años = dias / 365.25
-    base_cagr = 1.0 + twr
+    base_cagr = 1.0 + (pnl_total / capital_ref) if capital_ref > 0 else 1.0
     if años > 0 and np.isfinite(base_cagr) and base_cagr > 0:
         cagr = (base_cagr ** (1 / años) - 1) * 100.0
     else:
-        cagr = twr_pct
+        cagr = ret_pct
+    if not np.isfinite(ret_pct):
+        ret_pct = 0.0
     if not np.isfinite(cagr):
-        cagr = twr_pct
+        cagr = ret_pct
 
     spy_ret = _serie_spy_ret(fecha_start)
     spy_pct = (spy_ret * 100.0) if spy_ret is not None and np.isfinite(spy_ret) else None
-    alpha = (twr_pct - spy_pct) if spy_pct is not None else None
+    alpha = (ret_pct - spy_pct) if spy_pct is not None else None
 
     lineas = [
         f"📈 RENDIMIENTO — {desc}",
         "",
-        f"• Retorno TWR (Ponderado en Tiempo): {twr_pct:+.2f}%",
-        f"• Retorno Dietz (Sobre Capital Promedio): {dietz_pct:+.2f}%",
+        f"• Retorno de cartera: {ret_pct:+.2f}%",
         f"• CAGR aprox.: {cagr:+.2f}%",
     ]
     if spy_pct is not None:
@@ -1675,10 +1630,10 @@ def calcular_rendimiento_periodo(user_id: int, periodo: str = "ytd"):
         f"• PnL total (realizado + flotante): ${pnl_total:+,.2f} USD",
         f"• Capital abierto ahora: ${cap_abierto:,.2f} USD",
         f"• Capital promedio en juego: ${capital_prom:,.2f} USD",
-        f"• Capital pico simultáneo: ${capital_pico:,.2f} USD",
+        f"• Capital pico asignado: ${capital_pico:,.2f} USD",
         f"• Valor actual abierto: ${valor_actual:,.2f} USD",
         "",
-        "Nota: TWR mide la habilidad pura aislando flujos de capital. Dietz mide el retorno sobre el capital promedio que tuviste en riesgo."
+        "Nota: el cálculo porcentual pondera el PnL acumulado contra el capital pico/promedio en juego, manteniendo consistencia absoluta con la curva gráfica."
     ])
     return "\n".join(lineas)
 
@@ -2361,7 +2316,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 ¡Hola! Soy tu asistente financiero cuantitativo.\n\n"
         "📈 Gráficos\n"
-        "• /spy        →  Rendimiento TWR vs S&P 500\n"
+        "• /spy        →  Rendimiento % vs S&P 500\n"
         "• /grafico    →  Curva de PnL en USD\n"
         "• /activos    →  Comparativa relativa de activos\n\n"
         "🟢 Posiciones abiertas\n"
@@ -2371,7 +2326,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Gané 450 usd en un trade de SOL\n\n"
         "💼 Resumen rápido\n"
         "/resumen  →  balance consolidado\n"
-        "/ytd      →  rendimiento TWR + Dietz + Alpha SPY\n"
+        "/ytd      →  rendimiento acumulado + Alpha SPY\n"
         "/riesgo   →  métricas de riesgo + liquidaciones\n"
         "/mes      →  gastos del mes + presupuestos\n"
         "/objetivos →  progreso de metas\n\n"
@@ -2394,7 +2349,7 @@ async def enviar_grafico_cartera(update: Update, user_id: int, periodo: str = ""
     buf = generar_grafico_evolucion_cartera_consolidada(user_id, periodo, modo=modo)
     if buf:
         if modo in ("pct", "percent", "%", "spy"):
-            cap = f"📊 Cartera vs SPY en TWR % ({periodo or 'histórico'})"
+            cap = f"📊 Cartera vs SPY en % ({periodo or 'histórico'})"
         else:
             cap = f"📈 Cartera en USD ({periodo or 'histórico'}) — PnL realizado + flotante"
         await update.message.reply_photo(photo=buf, caption=cap)
@@ -2427,7 +2382,7 @@ async def intentar_comando_local(update: Update, user_id: int, user_msg: str) ->
     if cmd in ("resumen", "cartera", "balance"):
         await cmd_resumen(update, None)
         return True
-    if cmd in ("ytd", "rendimiento", "twr"):
+    if cmd in ("ytd", "rendimiento"):
         await update.message.reply_text(calcular_rendimiento_periodo(user_id, periodo or "ytd"))
         return True
     if cmd in ("cagr", "alpha"):
@@ -2443,7 +2398,7 @@ async def intentar_comando_local(update: Update, user_id: int, user_msg: str) ->
             tks = [x.strip().upper() for x in re.split(r"[\s,]+", args) if x.strip() and x.lower() not in ("ytd","mtd","1y","3m","6m","1m")]
             tks = [x for x in tks if re.match(r"^[A-Z0-9]{1,12}$", x)]
             await enviar_grafico_activos(update, user_id, periodo, tks or None)
-        elif re.search(r"spy|%|porcent|twr", low):
+        elif re.search(r"spy|%|porcent", low):
             await enviar_grafico_cartera(update, user_id, periodo or "ytd", modo="pct")
         else:
             await enviar_grafico_cartera(update, user_id, periodo, modo="usd")
@@ -2506,7 +2461,7 @@ async def intentar_comando_local(update: Update, user_id: int, user_msg: str) ->
             await update.message.reply_text(f"No pude analizar {tk}.")
         return True
 
-    if re.search(r"\b(ytd|year to date|este año|este ano|twr)\b", low) and not re.search(r"registr|anot|guarde|gan[eé]|gast[eé]", low):
+    if re.search(r"\b(ytd|year to date|este año|este ano)\b", low) and not re.search(r"registr|anot|guarde|gan[eé]|gast[eé]", low):
         if re.search(r"graf|curva|evoluc|vs|spy", low):
             await enviar_grafico_cartera(update, user_id, "ytd", modo="pct")
         await update.message.reply_text(calcular_rendimiento_periodo(user_id, "ytd"))
@@ -3100,7 +3055,6 @@ async def main():
     app.add_handler(CommandHandler("ayuda", start))
     app.add_handler(CommandHandler("cartera", cmd_resumen))
     app.add_handler(CommandHandler("ytd", cmd_ytd))
-    app.add_handler(CommandHandler("twr", cmd_ytd))
     app.add_handler(CommandHandler("cagr", cmd_cagr))
     app.add_handler(CommandHandler("spy", cmd_spy_alias))
     app.add_handler(CommandHandler("grafico", cmd_grafico_alias))
