@@ -185,23 +185,28 @@ def limpiar_estilo_telegram(texto: str) -> str:
     return texto.strip()
 
 # ==================== CONSULTAS DE MERCADO EN VIVO ====================
+CRIPTOS_COMUNES = {
+    "BTC", "ETH", "SOL", "BNB", "ADA", "XRP", "DOGE", "SUI", 
+    "PAXG", "NEXO", "AVAX", "DOT", "LINK", "NEAR", "RENDER", "PEPE"
+}
+
 def normalizar_ticker_yf(ticker: str):
     ticker = ticker.strip().upper()
-    if ticker in ["BTC", "ETH", "SOL", "BNB", "ADA", "XRP", "DOGE", "SUI", "PAXG"]:
+    if ticker in CRIPTOS_COMUNES:
         return f"{ticker}-USD"
     return ticker
 
 def consultar_datos_mercado(ticker: str):
     ticker = ticker.strip().upper()
     simbolos_a_probar = [normalizar_ticker_yf(ticker)]
-    if not ticker.endswith("-USD") and ticker not in ["BTC", "ETH", "SOL", "BNB", "ADA", "XRP", "DOGE", "SUI", "PAXG"]:
+    if not ticker.endswith("-USD") and ticker not in CRIPTOS_COMUNES:
         simbolos_a_probar.append(f"{ticker}-USD")
 
     for sym in simbolos_a_probar:
         try:
             t = yf.Ticker(sym)
             df_hist = t.history(period="5d")
-            if not df_hist.empty:
+            if df_hist is not None and not df_hist.empty:
                 last_price = float(df_hist['Close'].iloc[-1])
                 day_high = float(df_hist['High'].iloc[-1])
                 day_low = float(df_hist['Low'].iloc[-1])
@@ -217,26 +222,38 @@ def consultar_datos_mercado(ticker: str):
                     "day_high": day_high,
                     "day_low": day_low
                 }
-            fi = t.fast_info
-            last_price = getattr(fi, "last_price", None) or fi.get("last_price", None)
-            if last_price:
-                prev_close = getattr(fi, "previous_close", None) or fi.get("previous_close", last_price)
-                var_usd = (last_price - prev_close) if prev_close else 0.0
-                var_pct = (var_usd / prev_close * 100) if prev_close else 0.0
-                return {
-                    "ticker": sym,
-                    "precio": float(last_price),
-                    "prev_close": float(prev_close) if prev_close else None,
-                    "var_usd": float(var_usd),
-                    "var_pct": float(var_pct),
-                    "day_high": getattr(fi, "day_high", None),
-                    "day_low": getattr(fi, "day_low", None)
-                }
-        except Exception as e:
-            logger.error(f"Error consultando ticker {sym}: {e}")
-            pass
-    return None
 
+            # Si history viene vacío, intentamos con fast_info de forma segura
+            fi = getattr(t, "fast_info", None)
+            if fi:
+                last_price = None
+                try:
+                    last_price = getattr(fi, "last_price", None) or fi.get("last_price", None)
+                except Exception:
+                    pass
+
+                if last_price:
+                    prev_close = None
+                    try:
+                        prev_close = getattr(fi, "previous_close", None) or fi.get("previous_close", last_price)
+                    except Exception:
+                        prev_close = last_price
+
+                    var_usd = (last_price - prev_close) if prev_close else 0.0
+                    var_pct = (var_usd / prev_close * 100) if prev_close else 0.0
+                    return {
+                        "ticker": sym,
+                        "precio": float(last_price),
+                        "prev_close": float(prev_close) if prev_close else None,
+                        "var_usd": float(var_usd),
+                        "var_pct": float(var_pct),
+                        "day_high": getattr(fi, "day_high", None) if hasattr(fi, "day_high") else None,
+                        "day_low": getattr(fi, "day_low", None) if hasattr(fi, "day_low") else None
+                    }
+        except Exception as e:
+            logger.warning(f"Intento fallido con {sym}: {e}")
+            continue
+    return None
 def obtener_precio_actual(ticker: str):
     datos = consultar_datos_mercado(ticker)
     if datos:
