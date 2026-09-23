@@ -281,7 +281,7 @@ def resolver_fecha_inicio(periodo_str: str, fecha_compra_db: str = None):
     
     return (hoy - timedelta(days=180)).strftime('%Y-%m-%d'), "Últimos 6 meses"
 
-# ==================== GRÁFICO CONSOLIDADO: EVOLUCIÓN REAL VS SPY ====================
+# ==================== GRÁFICO CONSOLIDADO: EVOLUCIÓN REAL Y CONTINUA ====================
 def generar_grafico_evolucion_cartera_consolidada(user_id: int, periodo_solicitado: str = "", modo: str = "usd"):
     try:
         with get_db_connection() as conn:
@@ -290,7 +290,7 @@ def generar_grafico_evolucion_cartera_consolidada(user_id: int, periodo_solicita
                 conn, params=(user_id,)
             )
             df_tc = pd.read_sql(
-                "SELECT fecha, fecha_apertura, ticker, tipo_posicion, pnl_usd, monto_invertido FROM trades_cerrados WHERE user_id = %s ORDER BY fecha ASC;",
+                "SELECT fecha, fecha_apertura, ticker, tipo_posicion, pnl_usd, monto_invertido, descripcion FROM trades_cerrados WHERE user_id = %s ORDER BY fecha ASC;",
                 conn, params=(user_id,)
             )
 
@@ -309,8 +309,6 @@ def generar_grafico_evolucion_cartera_consolidada(user_id: int, periodo_solicita
         fecha_start, desc_periodo = resolver_fecha_inicio(periodo_solicitado, primera_fecha_global)
 
         tickers_unicos = list(df_inv['ticker'].unique()) if not df_inv.empty else []
-        if not df_tc.empty and 'ticker' in df_tc.columns:
-            tickers_unicos += [x for x in df_tc['ticker'].dropna().unique().tolist() if x not in tickers_unicos]
         precios_hist = {}
         for tk in tickers_unicos:
             if tk in ["USDT", "USDC", "DAI", "USD"]:
@@ -331,26 +329,35 @@ def generar_grafico_evolucion_cartera_consolidada(user_id: int, periodo_solicita
             df_precios[tk] = s
         df_precios = df_precios.ffill().bfill()
 
-        serie_capital_invertido = pd.Series(0.0, index=fechas_rango)
+        serie_capital_abierto = pd.Series(0.0, index=fechas_rango)
         serie_valor_mercado = pd.Series(0.0, index=fechas_rango)
         serie_pnl_cerrado_acum = pd.Series(0.0, index=fechas_rango)
 
+        # 1. PnL de trades cerrados prorrateado exactamente a lo largo de su vida útil
         if not df_tc.empty:
             df_tc['fecha_d'] = pd.to_datetime(df_tc['fecha']).dt.tz_localize(None).dt.floor('D')
-            if 'fecha_apertura' in df_tc.columns:
-                df_tc['fecha_a'] = pd.to_datetime(df_tc['fecha_apertura']).dt.tz_localize(None).dt.floor('D')
-            else:
-                df_tc['fecha_a'] = df_tc['fecha_d']
+            f_a_list = []
+            for _, tr in df_tc.iterrows():
+                f_a = tr['fecha_apertura'] if 'fecha_apertura' in tr and pd.notnull(tr['fecha_apertura']) else None
+                if pd.isnull(f_a) and 'descripcion' in tr and tr['descripcion']:
+                    m_ap = re.search(r"Apertura\s+(\d{4}-\d{2}-\d{2})", str(tr['descripcion']))
+                    if m_ap:
+                        f_a = m_ap.group(1)
+                f_a = pd.to_datetime(f_a).tz_localize(None).floor('D') if pd.notnull(f_a) else tr['fecha_d']
+                f_a_list.append(f_a)
+            df_tc['fecha_a'] = f_a_list
+
             incr = pd.Series(0.0, index=fechas_rango)
             for _, tr in df_tc.iterrows():
                 pnl = float(tr['pnl_usd'] or 0)
-                margen_c = float(tr['monto_invertido'] or 0) if 'monto_invertido' in tr and pd.notnull(tr['monto_invertido']) else 0.0
                 f_c = tr['fecha_d']
-                f_a = tr['fecha_a'] if pd.notnull(tr['fecha_a']) else f_c
+                f_a = tr['fecha_a']
                 if pd.isnull(f_a) or pd.isnull(f_c):
                     continue
                 if f_a > f_c:
                     f_a = f_c
+
+                # Distribuir PnL en la ventana activa del trade dentro del rango graficado
                 mask = (fechas_rango >= f_a) & (fechas_rango <= f_c)
                 n = int(mask.sum())
                 if n <= 1:
@@ -358,12 +365,10 @@ def generar_grafico_evolucion_cartera_consolidada(user_id: int, periodo_solicita
                         incr.loc[f_c] += pnl
                 else:
                     incr.loc[mask] += pnl / n
-                
-                if margen_c > 0:
-                    serie_capital_invertido.loc[mask] += margen_c
-                    
+
             serie_pnl_cerrado_acum = incr.cumsum()
 
+        # 2. Posiciones abiertas actuales (únicas que computan PnL flotante en tiempo real)
         for _, pos in df_inv.iterrows():
             pos_fecha = pd.to_datetime(pos['fecha']).tz_localize(None).floor('D')
             tk = pos['ticker']
@@ -374,7 +379,7 @@ def generar_grafico_evolucion_cartera_consolidada(user_id: int, periodo_solicita
             lev = float(pos['apalancamiento']) if pos['apalancamiento'] else 1.0
 
             mascara = fechas_rango >= pos_fecha
-            serie_capital_invertido[mascara] += margen
+            serie_capital_abierto[mascara] += margen
 
             if tk in ["USDT", "USDC", "DAI", "USD"] or tk not in df_precios.columns:
                 serie_valor_mercado[mascara] += margen
@@ -388,9 +393,14 @@ def generar_grafico_evolucion_cartera_consolidada(user_id: int, periodo_solicita
                     val_t = cant * spot_t
                 serie_valor_mercado[mascara] += val_t
 
-        serie_pnl_flotante = serie_valor_mercado - serie_capital_invertido
+        # PnL flotante real sin restar capitales ajenos
+        serie_pnl_flotante = serie_valor_mercado - serie_capital_abierto
         serie_pnl_total_usd = serie_pnl_flotante + serie_pnl_cerrado_acum
-        pnl_final_usd = serie_pnl_total_usd.iloc[-1]
+
+        # Normalización: el rendimiento del período específico siempre inicia en $0 / 0.0%
+        pnl_base_inicio = float(serie_pnl_total_usd.iloc[0]) if len(serie_pnl_total_usd) else 0.0
+        serie_pnl_periodo = serie_pnl_total_usd - pnl_base_inicio
+        pnl_final_periodo = serie_pnl_periodo.iloc[-1] if len(serie_pnl_periodo) else 0.0
 
         sspy = None
         try:
@@ -406,13 +416,13 @@ def generar_grafico_evolucion_cartera_consolidada(user_id: int, periodo_solicita
         fig, ax = plt.subplots(figsize=(10, 5.2))
 
         if modo in ("pct", "percent", "%", "spy"):
-            # Capital base representativo: evita picos artificiales por falta de margen momentáneo
-            cap_validos = serie_capital_invertido[serie_capital_invertido > 0]
-            base_capital = float(cap_validos.max()) if not cap_validos.empty else 1000.0
+            # Capital representativo de la cuenta
+            cap_abierto_total = float(df_inv['monto_total_usd'].sum()) if not df_inv.empty else 2000.0
+            cap_tc_pico = float(df_tc['monto_invertido'].max()) if not df_tc.empty and 'monto_invertido' in df_tc and pd.notnull(df_tc['monto_invertido'].max()) else 2000.0
+            base_capital = max(cap_abierto_total, cap_tc_pico, 2500.0)
 
-            # Retorno porcentual continuo y exacto de la cartera
-            serie_cartera_pct = (serie_pnl_total_usd / base_capital) * 100.0
-
+            # Curva porcentual continua que arranca en 0.0%
+            serie_cartera_pct = (serie_pnl_periodo / base_capital) * 100.0
             ret_c = float(serie_cartera_pct.iloc[-1]) if len(serie_cartera_pct) else 0.0
             if not np.isfinite(ret_c):
                 ret_c = 0.0
@@ -433,12 +443,12 @@ def generar_grafico_evolucion_cartera_consolidada(user_id: int, periodo_solicita
             ax.set_title(f"Rendimiento %: tu cartera vs SPY\n{desc_periodo}", fontsize=12, fontweight='bold', pad=12)
             ax.set_ylabel("Rendimiento acumulado (%)")
         else:
-            color_linea = "#00b06f" if pnl_final_usd >= 0 else "#e04050"
-            ax.plot(fechas_rango, serie_pnl_total_usd, label=f"PnL Total ({pnl_final_usd:+,.2f} USD)", color=color_linea, linewidth=2.4)
-            ax.fill_between(fechas_rango, serie_pnl_total_usd, 0, where=(serie_pnl_total_usd >= 0), alpha=0.15, color="#00b06f")
-            ax.fill_between(fechas_rango, serie_pnl_total_usd, 0, where=(serie_pnl_total_usd < 0), alpha=0.15, color="#e04050")
+            color_linea = "#00b06f" if pnl_final_periodo >= 0 else "#e04050"
+            ax.plot(fechas_rango, serie_pnl_periodo, label=f"PnL Período ({pnl_final_periodo:+,.2f} USD)", color=color_linea, linewidth=2.4)
+            ax.fill_between(fechas_rango, serie_pnl_periodo, 0, where=(serie_pnl_periodo >= 0), alpha=0.15, color="#00b06f")
+            ax.fill_between(fechas_rango, serie_pnl_periodo, 0, where=(serie_pnl_periodo < 0), alpha=0.15, color="#e04050")
             ax.axhline(0, color="gray", linestyle="--", linewidth=1.1, alpha=0.7)
-            ax.set_title(f"Evolución de cartera en USD (PnL realizado + flotante)\n{desc_periodo}", fontsize=12, fontweight='bold', pad=12)
+            ax.set_title(f"Evolución de cartera en USD (PnL del período)\n{desc_periodo}", fontsize=12, fontweight='bold', pad=12)
             ax.set_ylabel("Ganancia / Pérdida acumulada (USD)")
 
         ax.grid(True, linestyle="--", alpha=0.35)
@@ -1528,40 +1538,14 @@ def _serie_spy_ret(fecha_start: str):
             continue
     return None
 
-def _serie_capital_desplegado(df_inv, df_tc, fecha_start, fecha_end):
-    fechas = pd.date_range(start=fecha_start, end=fecha_end, freq="D")
-    cap = pd.Series(0.0, index=fechas)
-    if df_inv is not None and not df_inv.empty:
-        for _, row in df_inv.iterrows():
-            f0 = pd.to_datetime(row["fecha"]).tz_localize(None).floor("D")
-            margen = float(row["monto_total_usd"] or 0)
-            if margen == 0:
-                continue
-            mask = fechas >= f0
-            cap.loc[mask] += margen
-    if df_tc is not None and not df_tc.empty:
-        for _, row in df_tc.iterrows():
-            margen = float(row["monto_invertido"] or 0) if "monto_invertido" in row and pd.notnull(row["monto_invertido"]) else 0.0
-            if margen <= 0:
-                continue
-            f_c = pd.to_datetime(row["fecha"]).tz_localize(None).floor("D")
-            f_a = row["fecha_apertura"] if "fecha_apertura" in row else None
-            f_a = pd.to_datetime(f_a).tz_localize(None).floor("D") if pd.notnull(f_a) else f_c
-            if f_a > f_c:
-                f_a = f_c
-            mask = (fechas >= f_a) & (fechas <= f_c)
-            cap.loc[mask] += margen
-    return cap
-
 def calcular_rendimiento_periodo(user_id: int, periodo: str = "ytd"):
     hoy = datetime.now()
     fecha_start, desc = resolver_fecha_inicio(periodo, datetime(hoy.year, 1, 1).strftime("%Y-%m-%d"))
     start_dt = pd.to_datetime(fecha_start)
-    end_dt = pd.to_datetime(hoy.strftime("%Y-%m-%d"))
 
     with get_db_connection() as conn:
         df_tc = pd.read_sql(
-            "SELECT fecha, fecha_apertura, pnl_usd, monto_invertido FROM trades_cerrados WHERE user_id = %s;",
+            "SELECT fecha, fecha_apertura, pnl_usd, monto_invertido, descripcion FROM trades_cerrados WHERE user_id = %s;",
             conn, params=(user_id,),
         )
         df_inv = pd.read_sql(
@@ -1581,17 +1565,9 @@ def calcular_rendimiento_periodo(user_id: int, periodo: str = "ytd"):
     valor_actual = float(resumen["total_actual"]) if resumen else 0.0
     pnl_total = pnl_realizado + pnl_flot
 
-    cap_serie = _serie_capital_desplegado(df_inv, df_tc, start_dt, end_dt)
-    cap_positivo = cap_serie[cap_serie > 0]
-    capital_prom = float(cap_positivo.mean()) if not cap_positivo.empty else cap_abierto
-    capital_pico = float(cap_serie.max()) if len(cap_serie) else cap_abierto
-    if not np.isfinite(capital_prom) or capital_prom <= 0:
-        capital_prom = cap_abierto if cap_abierto > 0 else max(abs(pnl_total), 1.0)
-    if not np.isfinite(capital_pico) or capital_pico <= 0:
-        capital_pico = capital_prom
+    cap_tc_pico = float(df_tc['monto_invertido'].max()) if not df_tc.empty and 'monto_invertido' in df_tc and pd.notnull(df_tc['monto_invertido'].max()) else 2000.0
+    capital_ref = max(cap_abierto, cap_tc_pico, 2500.0)
 
-    # Capital base representativo
-    capital_ref = capital_pico if capital_pico > 0 else capital_prom
     ret_pct = (pnl_total / capital_ref * 100.0) if capital_ref > 0 else 0.0
 
     dias = max(1, (hoy - start_dt.to_pydatetime()).days)
@@ -1629,11 +1605,10 @@ def calcular_rendimiento_periodo(user_id: int, periodo: str = "ytd"):
         f"• PnL flotante actual: ${pnl_flot:+,.2f} USD",
         f"• PnL total (realizado + flotante): ${pnl_total:+,.2f} USD",
         f"• Capital abierto ahora: ${cap_abierto:,.2f} USD",
-        f"• Capital promedio en juego: ${capital_prom:,.2f} USD",
-        f"• Capital pico asignado: ${capital_pico:,.2f} USD",
+        f"• Capital base de referencia: ${capital_ref:,.2f} USD",
         f"• Valor actual abierto: ${valor_actual:,.2f} USD",
         "",
-        "Nota: el cálculo porcentual pondera el PnL acumulado contra el capital pico/promedio en juego, manteniendo consistencia absoluta con la curva gráfica."
+        "Nota: el cálculo porcentual pondera el PnL neto del período contra la base de capital de la cuenta, manteniendo consistencia total con la curva gráfica."
     ])
     return "\n".join(lineas)
 
@@ -3075,4 +3050,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
