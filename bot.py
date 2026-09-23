@@ -223,7 +223,6 @@ def consultar_datos_mercado(ticker: str):
                     "day_low": day_low
                 }
 
-            # Si history viene vacío, intentamos con fast_info de forma segura
             fi = getattr(t, "fast_info", None)
             if fi:
                 last_price = None
@@ -251,9 +250,10 @@ def consultar_datos_mercado(ticker: str):
                         "day_low": getattr(fi, "day_low", None) if hasattr(fi, "day_low") else None
                     }
         except Exception as e:
-            logger.warning(f"Intento fallido con {sym}: {e}")
+            logger.warning(f"Intento fallido con ticker {sym}: {e}")
             continue
     return None
+
 def obtener_precio_actual(ticker: str):
     datos = consultar_datos_mercado(ticker)
     if datos:
@@ -265,6 +265,11 @@ def resolver_fecha_inicio(periodo_str: str, fecha_compra_db: str = None):
     p = periodo_str.strip().lower() if periodo_str else ""
     hoy = datetime.now()
     
+    if p in ["todo", "max", "historico", "histórico", "desde el inicio", "desde siempre", "total"]:
+        if fecha_compra_db:
+            return fecha_compra_db, f"Histórico total (desde {fecha_compra_db})"
+        return (hoy - timedelta(days=365 * 3)).strftime('%Y-%m-%d'), "Histórico"
+
     m_meses = re.search(r"(\d+)\s*(?:mes|meses|mo)", p)
     m_dias = re.search(r"(\d+)\s*(?:dia|dias|d)", p)
     m_anos = re.search(r"(\d+)\s*(?:ano|anos|año|años|y)", p)
@@ -350,7 +355,7 @@ def generar_grafico_evolucion_cartera_consolidada(user_id: int, periodo_solicita
         serie_valor_mercado = pd.Series(0.0, index=fechas_rango)
         serie_pnl_cerrado_acum = pd.Series(0.0, index=fechas_rango)
 
-        # 1. PnL de trades cerrados prorrateado exactamente a lo largo de su vida útil
+        # 1. PnL de trades cerrados prorrateado de forma continua en su vida útil
         if not df_tc.empty:
             df_tc['fecha_d'] = pd.to_datetime(df_tc['fecha']).dt.tz_localize(None).dt.floor('D')
             f_a_list = []
@@ -374,7 +379,6 @@ def generar_grafico_evolucion_cartera_consolidada(user_id: int, periodo_solicita
                 if f_a > f_c:
                     f_a = f_c
 
-                # Distribuir PnL en la ventana activa del trade dentro del rango graficado
                 mask = (fechas_rango >= f_a) & (fechas_rango <= f_c)
                 n = int(mask.sum())
                 if n <= 1:
@@ -385,7 +389,7 @@ def generar_grafico_evolucion_cartera_consolidada(user_id: int, periodo_solicita
 
             serie_pnl_cerrado_acum = incr.cumsum()
 
-        # 2. Posiciones abiertas actuales (únicas que computan PnL flotante en tiempo real)
+        # 2. Posiciones abiertas actuales (PnL flotante en tiempo real)
         for _, pos in df_inv.iterrows():
             pos_fecha = pd.to_datetime(pos['fecha']).tz_localize(None).floor('D')
             tk = pos['ticker']
@@ -410,7 +414,6 @@ def generar_grafico_evolucion_cartera_consolidada(user_id: int, periodo_solicita
                     val_t = cant * spot_t
                 serie_valor_mercado[mascara] += val_t
 
-        # PnL flotante real sin restar capitales ajenos
         serie_pnl_flotante = serie_valor_mercado - serie_capital_abierto
         serie_pnl_total_usd = serie_pnl_flotante + serie_pnl_cerrado_acum
 
@@ -433,12 +436,10 @@ def generar_grafico_evolucion_cartera_consolidada(user_id: int, periodo_solicita
         fig, ax = plt.subplots(figsize=(10, 5.2))
 
         if modo in ("pct", "percent", "%", "spy"):
-            # Capital representativo de la cuenta
             cap_abierto_total = float(df_inv['monto_total_usd'].sum()) if not df_inv.empty else 2000.0
             cap_tc_pico = float(df_tc['monto_invertido'].max()) if not df_tc.empty and 'monto_invertido' in df_tc and pd.notnull(df_tc['monto_invertido'].max()) else 2000.0
             base_capital = max(cap_abierto_total, cap_tc_pico, 2500.0)
 
-            # Curva porcentual continua que arranca en 0.0%
             serie_cartera_pct = (serie_pnl_periodo / base_capital) * 100.0
             ret_c = float(serie_cartera_pct.iloc[-1]) if len(serie_cartera_pct) else 0.0
             if not np.isfinite(ret_c):
@@ -639,7 +640,7 @@ def generar_grafico_evolucion_activo(user_id: int, ticker: str, periodo_solicita
         logger.error(f"Error graficando activo {ticker}: {e}")
         return None
 
-# ==================== MOTOR DE ANÁLISIS TÉCNICO ====================
+# ==================== MOTOR DE ANÁLISIS TÉCNICO LOCAL ====================
 def calcular_rsi_serie(series, period=14):
     delta = series.diff()
     gain = delta.clip(lower=0)
@@ -1557,18 +1558,18 @@ def _serie_spy_ret(fecha_start: str):
 
 def calcular_rendimiento_periodo(user_id: int, periodo: str = "ytd"):
     hoy = datetime.now()
-    fecha_start, desc = resolver_fecha_inicio(periodo, datetime(hoy.year, 1, 1).strftime("%Y-%m-%d"))
-    start_dt = pd.to_datetime(fecha_start)
-
+    primera_fecha = "2025-05-01"
     with get_db_connection() as conn:
-        df_tc = pd.read_sql(
-            "SELECT fecha, fecha_apertura, pnl_usd, monto_invertido, descripcion FROM trades_cerrados WHERE user_id = %s;",
-            conn, params=(user_id,),
-        )
-        df_inv = pd.read_sql(
-            "SELECT fecha, monto_total_usd FROM portafolio_inversiones WHERE user_id = %s;",
-            conn, params=(user_id,),
-        )
+        df_tc = pd.read_sql("SELECT fecha, pnl_usd, monto_invertido FROM trades_cerrados WHERE user_id = %s ORDER BY fecha ASC;", conn, params=(user_id,))
+        df_inv = pd.read_sql("SELECT fecha, monto_total_usd FROM portafolio_inversiones WHERE user_id = %s ORDER BY fecha ASC;", conn, params=(user_id,))
+
+    if not df_tc.empty:
+        primera_fecha = df_tc['fecha'].min().strftime('%Y-%m-%d')
+    elif not df_inv.empty:
+        primera_fecha = df_inv['fecha'].min().strftime('%Y-%m-%d')
+
+    fecha_start, desc = resolver_fecha_inicio(periodo, primera_fecha)
+    start_dt = pd.to_datetime(fecha_start)
 
     pnl_realizado = 0.0
     if not df_tc.empty:
@@ -2308,7 +2309,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 ¡Hola! Soy tu asistente financiero cuantitativo.\n\n"
         "📈 Gráficos\n"
-        "• /spy        →  Rendimiento % vs S&P 500\n"
+        "• /spy        →  Rendimiento % vs S&P 500 (año actual)\n"
+        "• /spy todo   →  Rendimiento % vs S&P 500 (desde tu inicio)\n"
         "• /grafico    →  Curva de PnL en USD\n"
         "• /activos    →  Comparativa relativa de activos\n\n"
         "🟢 Posiciones abiertas\n"
@@ -2317,17 +2319,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🏆 Trades cerrados\n"
         "• Gané 450 usd en un trade de SOL\n\n"
         "💼 Resumen rápido\n"
-        "/resumen  →  balance consolidado\n"
-        "/ytd      →  rendimiento acumulado + Alpha SPY\n"
-        "/riesgo   →  métricas de riesgo + liquidaciones\n"
-        "/mes      →  gastos del mes + presupuestos\n"
+        "/resumen   →  balance consolidado\n"
+        "/ytd       →  rendimiento acumulado + Alpha SPY\n"
+        "/riesgo    →  métricas de riesgo + liquidaciones\n"
+        "/analisis  →  análisis técnico algorítmico (sin IA)\n"
+        "/mes       →  gastos del mes + presupuestos\n"
         "/objetivos →  progreso de metas\n\n"
         "También podés hablarme en lenguaje natural."
     )
 
 def extraer_periodo(texto: str) -> str:
     tlow = (texto or "").lower()
-    for key in ["ytd", "mtd", "wtd", "1y", "1a", "3m", "6m", "1m", "2m"]:
+    if re.search(r"\b(todo|max|historico|histórico|desde el inicio|desde siempre|total)\b", tlow):
+        return "todo"
+    for key in ["ytd", "mtd", "wtd", "1y", "1a", "3m", "6m", "1m", "2m", "2y", "3y", "5y"]:
         if re.search(r"\b" + re.escape(key) + r"\b", tlow):
             return key
     m = re.search(r"(\d+)\s*(mes|meses|dia|dias|año|anos|ano|años)", tlow)
@@ -2343,7 +2348,7 @@ async def enviar_grafico_cartera(update: Update, user_id: int, periodo: str = ""
         if modo in ("pct", "percent", "%", "spy"):
             cap = f"📊 Cartera vs SPY en % ({periodo or 'histórico'})"
         else:
-            cap = f"📈 Cartera en USD ({periodo or 'histórico'}) — PnL realizado + flotante"
+            cap = f"📈 Cartera en USD ({periodo or 'histórico'}) — PnL del período"
         await update.message.reply_photo(photo=buf, caption=cap)
     else:
         await update.message.reply_text("No hay datos suficientes para la curva.")
@@ -2387,7 +2392,7 @@ async def intentar_comando_local(update: Update, user_id: int, user_msg: str) ->
         return True
     if cmd in ("grafico", "gráfico", "curva", "evolucion", "evolución"):
         if re.search(r"activo", low):
-            tks = [x.strip().upper() for x in re.split(r"[\s,]+", args) if x.strip() and x.lower() not in ("ytd","mtd","1y","3m","6m","1m")]
+            tks = [x.strip().upper() for x in re.split(r"[\s,]+", args) if x.strip() and x.lower() not in ("ytd","mtd","1y","3m","6m","1m","todo")]
             tks = [x for x in tks if re.match(r"^[A-Z0-9]{1,12}$", x)]
             await enviar_grafico_activos(update, user_id, periodo, tks or None)
         elif re.search(r"spy|%|porcent", low):
@@ -2397,7 +2402,7 @@ async def intentar_comando_local(update: Update, user_id: int, user_msg: str) ->
         return True
     if cmd in ("activos", "comparar"):
         tks = [x.strip().upper() for x in re.split(r"[\s,]+", args) if x.strip()]
-        tks = [x for x in tks if re.match(r"^[A-Z0-9]{1,12}$", x) and x.lower() not in ("YTD",)]
+        tks = [x for x in tks if re.match(r"^[A-Z0-9]{1,12}$", x) and x.lower() not in ("YTD", "TODO")]
         await enviar_grafico_activos(update, user_id, periodo, tks or None)
         return True
     if cmd in ("precio", "coti", "cotizacion", "cotización"):
@@ -2611,13 +2616,11 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "ACCION: VER_RIESGO", "ACCION: VER_PRESUPUESTOS", "ACCION: VER_OBJETIVOS"]:
             texto_limpio = texto_limpio.replace(tag, "")
 
-        # Escáner de cartera
         necesita_escanear_cartera = "ACCION: ESCANEAR_CARTERA" in reply
         if not necesita_escanear_cartera and re.search(r"(?:analiza(?:me)?\s+todos?\s+(?:mis\s+)?activos?|escanear?\s+(?:mi\s+)?cartera|revisa(?:me)?\s+mis\s+activos)", user_msg, re.IGNORECASE):
             necesita_escanear_cartera = True
         texto_limpio = texto_limpio.replace("ACCION: ESCANEAR_CARTERA", "")
 
-        # Análisis técnico individual
         ticker_at = None
         tf_at = "diario"
         m_at = re.search(r"ACCION:\s*ANALIZAR_ACTIVO\|([^\n\r|]+)(?:\|([^\n\r]+))?", texto_limpio)
@@ -2636,14 +2639,12 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 tf_at = "diario"
 
-        # Cotización
         ticker_a_cotizar = None
         m_precio = re.search(r"ACCION: CONSULTA_PRECIO\|([^\n\r]+)", texto_limpio)
         if m_precio:
             ticker_a_cotizar = m_precio.group(1).strip()
             texto_limpio = texto_limpio.replace(m_precio.group(0), "")
 
-        # Gráfico por activos
         necesita_grafico_por_activos = False
         periodo_por_activos = ""
         tickers_filtro_activos = []
@@ -2656,7 +2657,6 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 tickers_filtro_activos = [t.strip().upper() for t in raw_tks.split(",") if t.strip()]
             texto_limpio = texto_limpio.replace(m_gpa.group(0), "")
 
-        # Gráfico consolidado
         necesita_grafico_consolidado = False
         periodo_consolidado = ""
         m_gc = re.search(r"ACCION: GRAFICO_EVOLUCION_CARTERA_CONSOLIDADA(?:\|([^\n\r]+))?", texto_limpio)
@@ -2672,7 +2672,6 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 periodo_consolidado = m_gc_old.group(1).strip() if m_gc_old.group(1) else ""
                 texto_limpio = texto_limpio.replace(m_gc_old.group(0), "")
 
-        # Gráfico activo individual
         ticker_grafico_evol = None
         periodo_activo = ""
         m_ga = re.search(r"ACCION: GRAFICO_EVOLUCION_ACTIVO\|([^\n\r|]+)(?:\|([^\n\r]+))?", texto_limpio)
@@ -2681,10 +2680,9 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             periodo_activo = m_ga.group(2).strip() if m_ga.group(2) else ""
             texto_limpio = texto_limpio.replace(m_ga.group(0), "")
 
-        # Fallback inteligente multi-ticker
         es_pedido_grafico_o_comparativa = bool(re.search(r"(?:grafico|grafica|evolucion|compara|comparame|comparar|vs|versus)", user_msg, re.IGNORECASE))
         if es_pedido_grafico_o_comparativa and not necesita_grafico_consolidado:
-            tickers_posibles = ["MELI", "NU", "GGAL", "SUPV", "NVDA", "BTC", "SOL", "YPF", "VIST", "MSFT", "META", "AMD", "TSLA", "GOOGL", "LOMA", "ETH", "BNB"]
+            tickers_posibles = ["MELI", "NU", "GGAL", "SUPV", "NVDA", "BTC", "SOL", "YPF", "VIST", "MSFT", "META", "AMD", "TSLA", "GOOGL", "LOMA", "ETH", "BNB", "NEXO"]
             tickers_mencionados = []
             for tk in tickers_posibles:
                 if re.search(r'\b' + re.escape(tk) + r'\b', user_msg, re.IGNORECASE):
@@ -2697,7 +2695,6 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if not periodo_por_activos:
                     periodo_por_activos = periodo_activo
 
-        # Cierre de posición
         m_close_pos = re.search(r"ACCION: CERRAR_POSICION\|(\d+)(?:\|([^|\n\r]*))?(?:\|([^\n\r]*))?", texto_limpio)
         if m_close_pos:
             c_inv_id = int(m_close_pos.group(1))
@@ -2713,7 +2710,6 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 texto_limpio += f"\n\n⚠️ No se pudo cerrar: {msg_cierre}"
 
-        # Agregar margen
         m_add_m = re.search(r"ACCION: AGREGAR_MARGEN\|(\d+)\|([^\n\r]+)", texto_limpio)
         if m_add_m:
             inv_id_m = int(m_add_m.group(1))
@@ -2725,7 +2721,6 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 texto_limpio += f"\n\n⚠️ No se encontró la posición ID {inv_id_m}."
 
-        # Modificaciones
         m_mod_inv = re.search(r"ACCION: MODIFICAR_INVERSION\|(\d+)\|([^|\n\r]+)\|([^\n\r]+)", texto_limpio)
         if m_mod_inv:
             inv_id = int(m_mod_inv.group(1))
@@ -2744,7 +2739,6 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             prev, info = modificar_movimiento_por_id(user_id, mov_id, campo, val)
             texto_limpio += f"\n\n✏️ Movimiento ID {mov_id}: {info}"
 
-        # Presupuestos
         m_set_pres = re.search(r"ACCION: SET_PRESUPUESTO\|([^|\n\r]+)\|([^\n\r]+)", texto_limpio)
         if m_set_pres:
             cat = m_set_pres.group(1).strip()
@@ -2753,7 +2747,6 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             c, m, mes, anio = set_presupuesto(user_id, cat, monto)
             texto_limpio += f"\n\n📅 Presupuesto guardado: {c} → ${m:,.0f} ARS ({mes:02d}/{anio})"
 
-        # Objetivos
         m_obj = re.search(r"ACCION: CREAR_OBJETIVO\|([^|\n\r]+)\|([^|\n\r]+)\|([^|\n\r]+)(?:\|([^\n\r]*))?", texto_limpio)
         if m_obj:
             desc = m_obj.group(1).strip()
@@ -2764,7 +2757,6 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             oid = crear_objetivo(user_id, desc, tipo, monto, fecha)
             texto_limpio += f"\n\n🎯 Objetivo creado (ID {oid}): {desc} → ${monto:,.0f}"
 
-        # Borrados
         m_btk = re.search(r"ACCION: BORRAR_INVERSION_TICKER\|([^\n\r]+)", texto_limpio)
         if m_btk:
             tk_b = m_btk.group(1).strip()
@@ -2796,7 +2788,6 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if r_del:
                 texto_limpio += f"\n\n🗑️ Eliminado gasto/ingreso ID {mid_b}"
 
-        # Registro Trade Cerrado
         match_tc = re.search(r"REGISTRO_TRADE_CERRADO:\s*([^\n\r]+)", texto_limpio)
         if match_tc:
             linea_tc = match_tc.group(1).strip()
@@ -2816,7 +2807,6 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f_txt = f" — {f}" if f else ""
             texto_limpio = f"{texto_limpio}\n\n🏆 Trade cerrado registrado: {t} [{tp}] | PnL {signo_p}${p:,.2f} USD{roi_s}{f_txt} (ID {tid})".strip()
 
-        # Registro Inversión
         match_inv = re.search(r"REGISTRO_INV:\s*([^\n\r]+)", texto_limpio)
         if match_inv:
             linea_inv = match_inv.group(1).strip()
@@ -2839,7 +2829,6 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             liq_str = f" | Liq est: ${liq_t:,.2f}" if liq_t else ""
             texto_limpio = f"{texto_limpio}\n\n💼 Guardado como abierto: {t}{lev_str} | Margen ${m:,.2f} | PPC ${p:,.2f} | Cant {c:,.4f}{liq_str}{fecha_str}".strip()
 
-        # Registro ARS
         match_ars = re.search(r"REGISTRO_ARS:\s*([^\n\r]+)", texto_limpio)
         if match_ars:
             linea_ars = match_ars.group(1).strip()
@@ -2931,7 +2920,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif necesita_grafico_consolidado:
             buf_img = generar_grafico_evolucion_cartera_consolidada(user_id, periodo_consolidado)
             if buf_img:
-                await update.message.reply_photo(photo=buf_img, caption="📈 Evolución consolidada de cartera (PnL realizado + flotante)")
+                await update.message.reply_photo(photo=buf_img, caption="📈 Evolución consolidada de cartera (PnL del período)")
             else:
                 await update.message.reply_text("No hay datos suficientes para la curva consolidada.")
 
@@ -3067,3 +3056,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
