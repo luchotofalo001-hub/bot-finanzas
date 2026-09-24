@@ -207,21 +207,23 @@ def consultar_datos_mercado(ticker: str):
             t = yf.Ticker(sym)
             df_hist = t.history(period="5d")
             if df_hist is not None and not df_hist.empty:
-                last_price = float(df_hist['Close'].iloc[-1])
-                day_high = float(df_hist['High'].iloc[-1])
-                day_low = float(df_hist['Low'].iloc[-1])
-                prev_close = float(df_hist['Close'].iloc[-2]) if len(df_hist) > 1 else float(df_hist['Open'].iloc[-1])
-                var_usd = last_price - prev_close
-                var_pct = (var_usd / prev_close * 100) if prev_close else 0.0
-                return {
-                    "ticker": sym,
-                    "precio": last_price,
-                    "prev_close": prev_close,
-                    "var_usd": var_usd,
-                    "var_pct": var_pct,
-                    "day_high": day_high,
-                    "day_low": day_low
-                }
+                df_hist = df_hist.dropna(subset=['Close'])
+                if not df_hist.empty:
+                    last_price = float(df_hist['Close'].iloc[-1])
+                    day_high = float(df_hist['High'].iloc[-1])
+                    day_low = float(df_hist['Low'].iloc[-1])
+                    prev_close = float(df_hist['Close'].iloc[-2]) if len(df_hist) > 1 else float(df_hist['Open'].iloc[-1])
+                    var_usd = last_price - prev_close
+                    var_pct = (var_usd / prev_close * 100) if prev_close else 0.0
+                    return {
+                        "ticker": sym,
+                        "precio": last_price,
+                        "prev_close": prev_close,
+                        "var_usd": var_usd,
+                        "var_pct": var_pct,
+                        "day_high": day_high,
+                        "day_low": day_low
+                    }
 
             fi = getattr(t, "fast_info", None)
             if fi:
@@ -231,7 +233,7 @@ def consultar_datos_mercado(ticker: str):
                 except Exception:
                     pass
 
-                if last_price:
+                if last_price and not np.isnan(last_price):
                     prev_close = None
                     try:
                         prev_close = getattr(fi, "previous_close", None) or fi.get("previous_close", last_price)
@@ -339,7 +341,7 @@ def generar_grafico_evolucion_cartera_consolidada(user_id: int, periodo_solicita
             try:
                 h = yf.Ticker(sym).history(start=fecha_start)
                 if not h.empty:
-                    s = h['Close']
+                    s = h['Close'].ffill().bfill()
                     s.index = pd.to_datetime(s.index).tz_localize(None)
                     precios_hist[tk] = s
             except Exception:
@@ -525,7 +527,7 @@ def generar_grafico_evolucion_por_activos(user_id: int, periodo_solicitado: str 
             try:
                 h = yf.Ticker(sym).history(start=fecha_start)
                 if not h.empty:
-                    s = h['Close']
+                    s = h['Close'].ffill().bfill()
                     s.index = pd.to_datetime(s.index).tz_localize(None)
                     s = s.reindex(fechas_rango).ffill().bfill()
                     
@@ -613,6 +615,7 @@ def generar_grafico_evolucion_activo(user_id: int, ticker: str, periodo_solicita
         if df_hist.empty:
             return None
 
+        df_hist = df_hist.dropna(subset=['Close'])
         df_hist.index = pd.to_datetime(df_hist.index).tz_localize(None)
         serie = df_hist['Close'].ffill().bfill()
 
@@ -668,7 +671,7 @@ def calcular_pivots_y_niveles(df, ventana=4):
     """Encuentra soportes y resistencias reales por fractales y detecta quiebres estructurales."""
     highs = df['High'].values
     lows = df['Low'].values
-    precio_actual = float(df['Close'].iloc[-1])
+    precio_actual = float(df['Close'].dropna().iloc[-1])
     n = len(df)
     
     pivots_h = []
@@ -745,18 +748,23 @@ def calcular_poc_volumen(df, barras_lookback=90, bins_count=40):
     sub = df.iloc[-barras_lookback:] if len(df) >= barras_lookback else df
     min_p = sub["Low"].min()
     max_p = sub["High"].max()
-    if min_p == max_p:
+    if min_p == max_p or np.isnan(min_p) or np.isnan(max_p):
         return None
 
     bins = np.linspace(min_p, max_p, bins_count + 1)
     vol_per_bin = np.zeros(bins_count)
     typical_price = (sub["High"] + sub["Low"] + sub["Close"]) / 3.0
-    vol = sub["Volume"].values
+    vol = sub["Volume"].fillna(0).values
 
     for tp, v in zip(typical_price.values, vol):
+        if np.isnan(tp) or np.isnan(v):
+            continue
         idx = np.digitize(tp, bins) - 1
         if 0 <= idx < bins_count:
             vol_per_bin[idx] += v
+
+    if vol_per_bin.sum() == 0:
+        return None
 
     poc_idx = np.argmax(vol_per_bin)
     poc_price = (bins[poc_idx] + bins[poc_idx + 1]) / 2.0
@@ -764,7 +772,7 @@ def calcular_poc_volumen(df, barras_lookback=90, bins_count=40):
 
 def backtest_comportamiento_historico(df, condicion="sobreventa_rsi"):
     """Analiza estadísticamente cómo reaccionó este activo en su historia a 15 días, 1 mes, 3 meses, 6 meses y 1 año."""
-    if len(df) < 260:
+    if len(df) < 250:
         return None
     
     rsi = df['RSI'].values
@@ -775,15 +783,15 @@ def backtest_comportamiento_historico(df, condicion="sobreventa_rsi"):
 
     if condicion == "sobreventa_rsi":
         for i in range(15, n - 15):
-            if rsi[i] <= 35 and rsi[i - 1] > 35:
+            if rsi[i] <= 40 and rsi[i - 1] > 40:
                 eventos_idx.append(i)
-        label = "RSI en sobreventa (<= 35)"
+        label = "RSI en zona baja / sobreventa (<= 40)"
 
     elif condicion == "sobrecompra_rsi":
         for i in range(15, n - 15):
-            if rsi[i] >= 68 and rsi[i - 1] < 68:
+            if rsi[i] >= 60 and rsi[i - 1] < 60:
                 eventos_idx.append(i)
-        label = "RSI en sobrecompra (>= 68)"
+        label = "RSI en zona alta / sobrecompra (>= 60)"
 
     elif condicion == "cruce_alcista_ema":
         ema20 = df['EMA20'].values
@@ -792,6 +800,14 @@ def backtest_comportamiento_historico(df, condicion="sobreventa_rsi"):
             if ema20[i] > ema50[i] and ema20[i - 1] <= ema50[i - 1]:
                 eventos_idx.append(i)
         label = "Cruce alcista (EMA20 > EMA50)"
+
+    elif condicion == "cruce_bajista_ema":
+        ema20 = df['EMA20'].values
+        ema50 = df['EMA50'].values
+        for i in range(15, n - 15):
+            if ema20[i] < ema50[i] and ema20[i - 1] >= ema50[i - 1]:
+                eventos_idx.append(i)
+        label = "Presión bajista (EMA20 < EMA50)"
     else:
         return None
 
@@ -812,7 +828,8 @@ def backtest_comportamiento_historico(df, condicion="sobreventa_rsi"):
         for idx in eventos_idx:
             if idx + barras < n:
                 r = (close[idx + barras] / close[idx] - 1.0) * 100.0
-                rets.append(r)
+                if np.isfinite(r):
+                    rets.append(r)
         if rets:
             wr = (len([r for r in rets if r > 0]) / len(rets)) * 100.0
             avg = float(np.mean(rets))
@@ -907,14 +924,14 @@ def formatear_reporte_tecnico(info):
     res1 = info.get("res_inmediata")
     res2 = info.get("res_segunda")
     
-    if sop1:
+    if sop1 and not np.isnan(sop1):
         dist_s = ((p - sop1) / p) * 100.0
         lineas.append(f"• Soporte clave: ${sop1:,.2f} (-{dist_s:.1f}%)" + (f" | S2: ${sop2:,.2f}" if sop2 else ""))
-    if res1:
+    if res1 and not np.isnan(res1):
         dist_r = ((res1 - p) / p) * 100.0
         lineas.append(f"• Resistencia clave: ${res1:,.2f} (+{dist_r:.1f}%)" + (f" | R2: ${res2:,.2f}" if res2 else ""))
 
-    if poc:
+    if poc and not np.isnan(poc):
         dist_poc = ((p - poc) / p) * 100.0
         lado_poc = "soporte de volumen institucional" if p >= poc else "resistencia magnética de volumen"
         signo = "+" if dist_poc >= 0 else ""
@@ -928,7 +945,7 @@ def formatear_reporte_tecnico(info):
         lineas.append(f"• Sesgo dinámico: Bajista bajo presión (Precio < EMA20 ${e20:,.2f} < EMA50 ${e50:,.2f})")
     else:
         lineas.append(f"• Sesgo dinámico: Mixto / compresión (EMA20 ${e20:,.2f} | EMA50 ${e50:,.2f})")
-    if e200:
+    if e200 and not np.isnan(e200):
         pos_200 = "soporte macro" if p > e200 else "resistencia macro"
         lineas.append(f"• EMA 200: ${e200:,.2f} ({pos_200})")
 
@@ -944,11 +961,11 @@ def formatear_reporte_tecnico(info):
     if fibo:
         lineas.append("")
         lineas.append("🎯 Fibonacci del Último Impulso")
-        if "Golden Pocket 0.618" in fibo:
+        if "Golden Pocket 0.618" in fibo and not np.isnan(fibo['Golden Pocket 0.618']):
             lineas.append(f"• Golden Pocket 0.618: ${fibo['Golden Pocket 0.618']:,.2f}")
-        if "0.500" in fibo:
+        if "0.500" in fibo and not np.isnan(fibo['0.500']):
             lineas.append(f"• 50% Retroceso: ${fibo['0.500']:,.2f}")
-        if "Ext 1.618" in fibo:
+        if "Ext 1.618" in fibo and not np.isnan(fibo['Ext 1.618']):
             lineas.append(f"• Objetivo Extensión 1.618: ${fibo['Ext 1.618']:,.2f}")
 
     if hist_stat:
@@ -991,11 +1008,11 @@ def generar_grafico_analisis_tecnico(ticker: str, timeframe: str = "diario", con
         intervalo = "1h"
         tf_label = "4 Horas"
     elif "sem" in tf_str or "1w" in tf_str:
-        periodo = "3y"
+        periodo = "5y"
         intervalo = "1wk"
         tf_label = "Semanal"
     else:
-        periodo = "1y"
+        periodo = "3y"
         intervalo = "1d"
         tf_label = "Diario"
 
@@ -1010,6 +1027,11 @@ def generar_grafico_analisis_tecnico(ticker: str, timeframe: str = "diario", con
         if df.empty:
             return None, f"No se encontraron datos para {ticker} en {tf_label}"
 
+        # Eliminar filas incompletas o nulas de Yahoo Finance
+        df = df.dropna(subset=['Close', 'High', 'Low'])
+        if df.empty:
+            return None, f"Datos insuficientes para {ticker}"
+
         if tf_label == "4 Horas":
             df = df.resample('4h').agg({
                 'Open': 'first',
@@ -1021,6 +1043,7 @@ def generar_grafico_analisis_tecnico(ticker: str, timeframe: str = "diario", con
 
         df.index = pd.to_datetime(df.index).tz_localize(None)
         
+        df['Close'] = df['Close'].ffill()
         df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
         df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
         df['EMA200'] = df['Close'].ewm(span=200, adjust=False).mean()
@@ -1033,17 +1056,20 @@ def generar_grafico_analisis_tecnico(ticker: str, timeframe: str = "diario", con
         poc_price = calcular_poc_volumen(df, barras_lookback=90)
         
         hist_stat = None
-        rsi_act = float(df['RSI'].iloc[-1])
-        if rsi_act <= 36:
+        rsi_act = float(df['RSI'].dropna().iloc[-1]) if 'RSI' in df and not df['RSI'].dropna().empty else 50.0
+        
+        if rsi_act <= 40:
             hist_stat = backtest_comportamiento_historico(df, "sobreventa_rsi")
-        elif rsi_act >= 65:
+        elif rsi_act >= 60:
             hist_stat = backtest_comportamiento_historico(df, "sobrecompra_rsi")
         elif df['EMA20'].iloc[-1] > df['EMA50'].iloc[-1]:
             hist_stat = backtest_comportamiento_historico(df, "cruce_alcista_ema")
+        else:
+            hist_stat = backtest_comportamiento_historico(df, "cruce_bajista_ema")
 
         vol_txt = None
         if "Volume" in df.columns and df["Volume"].fillna(0).sum() > 0:
-            v_now = float(df["Volume"].iloc[-1])
+            v_now = float(df["Volume"].dropna().iloc[-1])
             v_avg = float(df["Volume"].tail(20).mean())
             if v_avg > 0:
                 ratio = v_now / v_avg
@@ -1056,28 +1082,32 @@ def generar_grafico_analisis_tecnico(ticker: str, timeframe: str = "diario", con
 
         estado_rsi_div = detectar_divergencia_rsi(df)
 
+        # Usar el último año para graficar
+        ult_velas = min(252, len(df))
+        sub_df = df.iloc[-ult_velas:].copy()
+
         fig, (ax1, axm, ax2) = plt.subplots(3, 1, figsize=(11, 8.2), gridspec_kw={'height_ratios': [3.0, 1.0, 1.1]}, sharex=True)
         
-        ax1.plot(df.index, df['Close'], label="Precio", color="#ffffff", linewidth=1.5, alpha=0.9)
-        ax1.plot(df.index, df['EMA20'], label="EMA 20", color="#29b6f6", linewidth=1.4)
-        ax1.plot(df.index, df['EMA50'], label="EMA 50", color="#ffa726", linewidth=1.4)
+        ax1.plot(sub_df.index, sub_df['Close'], label="Precio", color="#ffffff", linewidth=1.5, alpha=0.9)
+        ax1.plot(sub_df.index, sub_df['EMA20'], label="EMA 20", color="#29b6f6", linewidth=1.4)
+        ax1.plot(sub_df.index, sub_df['EMA50'], label="EMA 50", color="#ffa726", linewidth=1.4)
         if len(df) >= 150:
-            ax1.plot(df.index, df['EMA200'], label="EMA 200", color="#ef5350", linewidth=1.8)
+            ax1.plot(sub_df.index, sub_df['EMA200'], label="EMA 200", color="#ef5350", linewidth=1.8)
 
-        if poc_price:
+        if poc_price and not np.isnan(poc_price):
             ax1.axhline(poc_price, color="#00e676", linestyle="-.", linewidth=1.3, alpha=0.9, label=f"POC Vol (${poc_price:,.2f})")
             
-        if niveles_dict["sop_inmediato"]:
+        if niveles_dict["sop_inmediato"] and not np.isnan(niveles_dict["sop_inmediato"]):
             ax1.axhline(niveles_dict["sop_inmediato"], color="#29b6f6", linestyle=":", linewidth=1.2, label=f"Soporte (${niveles_dict['sop_inmediato']:,.2f})")
             
-        if niveles_dict["res_inmediata"]:
+        if niveles_dict["res_inmediata"] and not np.isnan(niveles_dict["res_inmediata"]):
             ax1.axhline(niveles_dict["res_inmediata"], color="#ff5252", linestyle=":", linewidth=1.2, label=f"Resistencia (${niveles_dict['res_inmediata']:,.2f})")
 
         fibo_niveles = niveles_dict["fibo_niveles"]
         if (con_fibo or con_ext) and fibo_niveles:
             colores_fibo = {"0.382": "#ab47bc", "0.500": "#26a69a", "Golden Pocket 0.618": "#ffca28", "Ext 1.618": "#ff7043"}
             for k, v in fibo_niveles.items():
-                if k in colores_fibo:
+                if k in colores_fibo and not np.isnan(v):
                     ax1.axhline(v, color=colores_fibo[k], linestyle="--", linewidth=1.1, alpha=0.75, label=f"{k} (${v:,.2f})")
 
         ax1.set_facecolor("#131722")
@@ -1088,22 +1118,22 @@ def generar_grafico_analisis_tecnico(ticker: str, timeframe: str = "diario", con
         ax1.legend(loc="upper left", facecolor="#1e222d", edgecolor="#2a2e39", labelcolor="#d1d4dc", fontsize=8)
 
         axm.set_facecolor("#131722")
-        hist_colors = np.where(df["MACDh"] >= 0, "#26a69a", "#ef5350")
-        axm.bar(df.index, df["MACDh"], color=hist_colors, width=1.0, alpha=0.7, label="Hist")
-        axm.plot(df.index, df["MACD"], color="#29b6f6", linewidth=1.2, label="MACD")
-        axm.plot(df.index, df["MACDs"], color="#ffa726", linewidth=1.1, label="Signal")
+        hist_colors = np.where(sub_df["MACDh"] >= 0, "#26a69a", "#ef5350")
+        axm.bar(sub_df.index, sub_df["MACDh"], color=hist_colors, width=1.0, alpha=0.7, label="Hist")
+        axm.plot(sub_df.index, sub_df["MACD"], color="#29b6f6", linewidth=1.2, label="MACD")
+        axm.plot(sub_df.index, sub_df["MACDs"], color="#ffa726", linewidth=1.1, label="Signal")
         axm.axhline(0, color="#787b86", linewidth=0.7, alpha=0.6)
         axm.grid(True, linestyle="--", alpha=0.15, color="#787b86")
         axm.tick_params(colors="#787b86")
         axm.legend(loc="upper left", facecolor="#1e222d", edgecolor="#2a2e39", labelcolor="#d1d4dc", fontsize=7)
 
         ax2.set_facecolor("#131722")
-        ax2.plot(df.index, df['RSI'], color="#ba68c8", linewidth=1.6, label="RSI 14")
+        ax2.plot(sub_df.index, sub_df['RSI'], color="#ba68c8", linewidth=1.6, label="RSI 14")
         ax2.axhline(70, color="#ef5350", linestyle=":", linewidth=1.1, alpha=0.8)
         ax2.axhline(30, color="#26a69a", linestyle=":", linewidth=1.1, alpha=0.8)
         ax2.axhline(50, color="#787b86", linestyle="--", linewidth=0.8, alpha=0.5)
-        ax2.fill_between(df.index, df['RSI'], 70, where=(df['RSI'] >= 70), color="#ef5350", alpha=0.25)
-        ax2.fill_between(df.index, df['RSI'], 30, where=(df['RSI'] <= 30), color="#26a69a", alpha=0.25)
+        ax2.fill_between(sub_df.index, sub_df['RSI'], 70, where=(sub_df['RSI'] >= 70), color="#ef5350", alpha=0.25)
+        ax2.fill_between(sub_df.index, sub_df['RSI'], 30, where=(sub_df['RSI'] <= 30), color="#26a69a", alpha=0.25)
         ax2.set_ylim(10, 90)
         ax2.grid(True, linestyle="--", alpha=0.15, color="#787b86")
         ax2.tick_params(colors="#787b86")
@@ -1115,12 +1145,13 @@ def generar_grafico_analisis_tecnico(ticker: str, timeframe: str = "diario", con
         buf.seek(0)
         plt.close()
 
-        precio_actual = float(df['Close'].iloc[-1])
-        ema20_val = float(df['EMA20'].iloc[-1])
-        ema50_val = float(df['EMA50'].iloc[-1])
-        ema200_val = float(df['EMA200'].iloc[-1]) if 'EMA200' in df else None
-        rsi_val = float(df['RSI'].iloc[-1])
-        atr_val = float(df['ATR'].iloc[-1]) if pd.notnull(df['ATR'].iloc[-1]) else None
+        # Precio real limpio
+        precio_actual = float(df['Close'].dropna().iloc[-1])
+        ema20_val = float(df['EMA20'].dropna().iloc[-1])
+        ema50_val = float(df['EMA50'].dropna().iloc[-1])
+        ema200_val = float(df['EMA200'].dropna().iloc[-1]) if 'EMA200' in df and not df['EMA200'].dropna().empty else None
+        rsi_val = float(df['RSI'].dropna().iloc[-1])
+        atr_val = float(df['ATR'].dropna().iloc[-1]) if pd.notnull(df['ATR'].dropna().iloc[-1]) else None
         atr_pct = (atr_val / precio_actual * 100.0) if atr_val and precio_actual else None
 
         datos_analisis = {
@@ -1139,9 +1170,9 @@ def generar_grafico_analisis_tecnico(ticker: str, timeframe: str = "diario", con
             "fibo_niveles": fibo_niveles,
             "poc": poc_price,
             "hist_stat": hist_stat,
-            "macd": float(df['MACD'].iloc[-1]),
-            "macd_signal": float(df['MACDs'].iloc[-1]),
-            "macd_hist": float(df['MACDh'].iloc[-1]),
+            "macd": float(df['MACD'].dropna().iloc[-1]),
+            "macd_signal": float(df['MACDs'].dropna().iloc[-1]),
+            "macd_hist": float(df['MACDh'].dropna().iloc[-1]),
             "atr": atr_val,
             "atr_pct": atr_pct,
             "estructura_txt": niveles_dict["estructura_txt"],
@@ -2017,7 +2048,7 @@ def generar_alertas_para_usuario(user_id: int) -> list:
                     hist = info.get("hist_stat")
 
                     # Testeo de POC
-                    if poc and abs(p_act - poc) / p_act <= 0.008:
+                    if poc and not np.isnan(poc) and abs(p_act - poc) / p_act <= 0.008:
                         clave = f"{tk}_test_poc"
                         h = _hash_alerta("poc_test", clave, "")
                         if not alerta_ya_enviada(user_id, h, horas_ventana=24):
@@ -2457,6 +2488,7 @@ REGLAS DE GRÁFICOS (MUY ESTRICTAS Y OBLIGATORIAS):
    ACCION: GRAFICO_EVOLUCION_CARTERA_CONSOLIDADA|[PERIODO_DETECTADO]
 
 4. UN SOLO ACTIVO INDIVIDUAL:
+   Únicamente si pide UN SOLO activo:
    ACCION: GRAFICO_EVOLUCION_ACTIVO|[TICKER]|[PERIODO_DETECTADO]
 
 REGLAS DE CIERRE DE POSICIÓN ABIERTA:
@@ -2709,7 +2741,7 @@ async def cmd_resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with get_db_connection() as conn:
         df_tc = pd.read_sql("SELECT SUM(pnl_usd) as pnl_tot, COUNT(id) as total_c FROM trades_cerrados WHERE user_id = %s;", conn, params=(user_id,))
     pnl_realizado = float(df_tc['pnl_tot'].iloc[0]) if not df_tc.empty and pd.notnull(df_tc['pnl_tot'].iloc[0]) else 0.0
-    cant_c = int(df_tc['total_c'].iloc[0]) if not df_tc.empty and pd.notnull(df_tc['total_c'].iloc[0]) else 0
+    cant_c = int(df_tc['total_c'].iloc[0]) if not df_tc.empty and pd.notnull(df_tc['total_c'].iloc[0]) else 0.0
     
     if not resumen and cant_c == 0:
         await update.message.reply_text("📉 No tienes activos ni trades cargados todavía.")
