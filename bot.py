@@ -665,7 +665,7 @@ def calcular_atr(df, period=14):
     return tr.ewm(alpha=1/period, adjust=False).mean()
 
 def calcular_pivots_y_niveles(df, ventana=4):
-    """Encuentra soportes y resistencias reales por fractales y toques recurrentes."""
+    """Encuentra soportes y resistencias reales por fractales y detecta quiebres estructurales."""
     highs = df['High'].values
     lows = df['Low'].values
     precio_actual = float(df['Close'].iloc[-1])
@@ -699,14 +699,17 @@ def calcular_pivots_y_niveles(df, ventana=4):
     
     if len(ult_highs) >= 2 and len(ult_lows) >= 2:
         if ult_highs[-1] > ult_highs[-2] and ult_lows[-1] > ult_lows[-2]:
-            estructura_txt = "Estructura ALCISTA (Higher Highs + Higher Lows)"
+            estructura_txt = "Estructura ALCISTA (Máximos y mínimos en subida)"
             estructura_bias = "alcista"
         elif ult_highs[-1] < ult_highs[-2] and ult_lows[-1] < ult_lows[-2]:
-            estructura_txt = "Estructura BAJISTA (Lower Highs + Lower Lows)"
+            estructura_txt = "Estructura BAJISTA (Máximos y mínimos en caída)"
             estructura_bias = "bajista"
-        elif ult_highs[-1] > ult_highs[-2] and ult_lows[-1] < ult_lows[-2]:
-            estructura_txt = "Expansión / Quiebre estructural reciente (CHoCH)"
-            estructura_bias = "choch"
+        elif ult_highs[-1] > ult_highs[-2]:
+            estructura_txt = "Se rompió un techo/máximo importante (Posible giro alcista)"
+            estructura_bias = "choch_alcista"
+        elif ult_lows[-1] < ult_lows[-2]:
+            estructura_txt = "Se rompió un piso/mínimo importante (Posible giro bajista)"
+            estructura_bias = "choch_bajista"
 
     fibo_niveles = {}
     if pivots_h and pivots_l:
@@ -760,54 +763,73 @@ def calcular_poc_volumen(df, barras_lookback=90, bins_count=40):
     return float(poc_price)
 
 def backtest_comportamiento_historico(df, condicion="sobreventa_rsi"):
-    """Backtesting estadístico de reacción histórica ante la misma condición técnica."""
-    if len(df) < 250:
+    """Analiza estadísticamente cómo reaccionó este activo en su historia a 15 días, 1 mes, 3 meses, 6 meses y 1 año."""
+    if len(df) < 260:
         return None
     
     rsi = df['RSI'].values
     close = df['Close'].values
     n = len(close)
-    dias_adelante = 15
 
-    casos_retornos = []
+    eventos_idx = []
 
     if condicion == "sobreventa_rsi":
-        for i in range(15, n - dias_adelante):
+        for i in range(15, n - 15):
             if rsi[i] <= 35 and rsi[i - 1] > 35:
-                ret = (close[i + dias_adelante] / close[i] - 1.0) * 100.0
-                casos_retornos.append(ret)
+                eventos_idx.append(i)
         label = "RSI en sobreventa (<= 35)"
 
     elif condicion == "sobrecompra_rsi":
-        for i in range(15, n - dias_adelante):
+        for i in range(15, n - 15):
             if rsi[i] >= 68 and rsi[i - 1] < 68:
-                ret = (close[i + dias_adelante] / close[i] - 1.0) * 100.0
-                casos_retornos.append(ret)
+                eventos_idx.append(i)
         label = "RSI en sobrecompra (>= 68)"
 
     elif condicion == "cruce_alcista_ema":
         ema20 = df['EMA20'].values
         ema50 = df['EMA50'].values
-        for i in range(15, n - dias_adelante):
+        for i in range(15, n - 15):
             if ema20[i] > ema50[i] and ema20[i - 1] <= ema50[i - 1]:
-                ret = (close[i + dias_adelante] / close[i] - 1.0) * 100.0
-                casos_retornos.append(ret)
-        label = "Cruce de EMA20 sobre EMA50"
+                eventos_idx.append(i)
+        label = "Cruce alcista (EMA20 > EMA50)"
     else:
         return None
 
-    if not casos_retornos:
+    if not eventos_idx:
         return None
 
-    win_rate = (len([r for r in casos_retornos if r > 0]) / len(casos_retornos)) * 100.0
-    avg_ret = float(np.mean(casos_retornos))
-    
+    horizontes = [
+        ("15 días", 11),
+        ("1 mes", 21),
+        ("3 meses", 63),
+        ("6 meses", 126),
+        ("1 año", 252)
+    ]
+
+    desglose = []
+    for nombre_h, barras in horizontes:
+        rets = []
+        for idx in eventos_idx:
+            if idx + barras < n:
+                r = (close[idx + barras] / close[idx] - 1.0) * 100.0
+                rets.append(r)
+        if rets:
+            wr = (len([r for r in rets if r > 0]) / len(rets)) * 100.0
+            avg = float(np.mean(rets))
+            desglose.append({
+                "horizonte": nombre_h,
+                "win_rate": wr,
+                "avg_ret": avg,
+                "muestras": len(rets)
+            })
+
+    if not desglose:
+        return None
+
     return {
         "condicion": label,
-        "muestras": len(casos_retornos),
-        "dias": dias_adelante,
-        "win_rate": win_rate,
-        "avg_ret": avg_ret
+        "total_eventos": len(eventos_idx),
+        "desglose": desglose
     }
 
 def detectar_divergencia_rsi(df, window=25):
@@ -931,12 +953,15 @@ def formatear_reporte_tecnico(info):
 
     if hist_stat:
         lineas.append("")
-        lineas.append("🧠 Comportamiento Histórico de este Activo")
-        lineas.append(f"• Patrón testeado: {hist_stat['condicion']} ({hist_stat['muestras']} eventos en su historia)")
-        em_stat = "🟢" if hist_stat['win_rate'] >= 60 else ("🟡" if hist_stat['win_rate'] >= 45 else "🔴")
-        lineas.append(f"• Efectividad a {hist_stat['dias']} días: {em_stat} {hist_stat['win_rate']:.1f}% Win Rate")
-        signo_ret = "+" if hist_stat['avg_ret'] >= 0 else ""
-        lineas.append(f"• Retorno promedio histórico del trade: {signo_ret}{hist_stat['avg_ret']:.2f}%")
+        lineas.append(f"🧠 Comportamiento Histórico ante: {hist_stat['condicion']}")
+        lineas.append(f"• Eventos detectados en su historia: {hist_stat['total_eventos']}")
+        lineas.append("• Desglose por horizonte temporal:")
+        for item in hist_stat['desglose']:
+            em = "🟢" if item['win_rate'] >= 60 else ("🟡" if item['win_rate'] >= 45 else "🔴")
+            signo = "+" if item['avg_ret'] >= 0 else ""
+            lineas.append(
+                f"   {em} {item['horizonte']:<8} → WR: {item['win_rate']:>5.1f}% | Retorno prom: {signo}{item['avg_ret']:>6.2f}% ({item['muestras']} casos)"
+            )
 
     lineas.append("")
     lineas.append("💡 Conclusión Operativa")
@@ -945,6 +970,10 @@ def formatear_reporte_tecnico(info):
         lineas.append("• Probabilidad alta de rebote técnico. Buscar confirmación sobre EMA20.")
     elif "DIVERGENCIA BAJISTA" in diag_rsi.upper() or rsi >= 68:
         lineas.append("• Zona de agotamiento de compras. Riesgo alto de pullback a soporte o POC.")
+    elif "choch_alcista" in bias:
+        lineas.append("• Se rompió un techo/máximo importante. Posible cambio a tendencia alcista; esperar retesteo.")
+    elif "choch_bajista" in bias:
+        lineas.append("• Se rompió un piso/mínimo importante. Posible cambio a tendencia bajista; ajustar stops.")
     elif bias == "alcista" and p > e20:
         lineas.append("• Tendencia a favor. Mantener stop bajo el último pivot soporte.")
     else:
@@ -1959,7 +1988,6 @@ def registrar_alerta_enviada(user_id: int, tipo: str, clave: str, hash_a: str):
 def generar_alertas_para_usuario(user_id: int) -> list:
     alertas = []
 
-    # 1. Alertas de Liquidación
     resumen = obtener_resumen_portafolio(user_id)
     if resumen:
         for p in resumen["posiciones"]:
@@ -1975,7 +2003,6 @@ def generar_alertas_para_usuario(user_id: int) -> list:
                         "hash": h
                     })
 
-    # 2. Alertas Cuantitativas Avanzadas (POC, CHoCH, RSI y Estadísticas)
     if resumen:
         tickers = list({p['ticker'] for p in resumen["posiciones"] if p['ticker'] not in ["USDT", "USDC", "DAI", "USD"]})
         for tk in tickers[:8]:
@@ -1986,12 +2013,10 @@ def generar_alertas_para_usuario(user_id: int) -> list:
                     rsi = info.get("rsi", 50)
                     diag = info.get("diagnostico_rsi", "")
                     poc = info.get("poc")
-                    sop = info.get("sop_inmediato")
-                    res = info.get("res_inmediata")
                     bias = info.get("estructura_bias")
                     hist = info.get("hist_stat")
 
-                    # Alerta de Testeo de POC (Punto de Mayor Volumen Institucional)
+                    # Testeo de POC
                     if poc and abs(p_act - poc) / p_act <= 0.008:
                         clave = f"{tk}_test_poc"
                         h = _hash_alerta("poc_test", clave, "")
@@ -2003,19 +2028,29 @@ def generar_alertas_para_usuario(user_id: int) -> list:
                                 "hash": h
                             })
 
-                    # Alerta de Quiebre de Estructura (CHoCH)
-                    if bias == "choch":
-                        clave = f"{tk}_choch"
+                    # Quiebre de Estructura en lenguaje informal
+                    if bias == "choch_alcista":
+                        clave = f"{tk}_choch_up"
                         h = _hash_alerta("choch", clave, "")
                         if not alerta_ya_enviada(user_id, h, horas_ventana=24):
                             alertas.append({
-                                "texto": f"🔄 CAMBIO DE ESTRUCTURA (CHoCH)\n{tk} acaba de quebrar su estructura previa en ${p_act:,.2f}. Posible giro de tendencia.",
+                                "texto": f"🟢 CAMBIO DE ESTRUCTURA\n{tk} rompió un techo/máximo importante en ${p_act:,.2f}. Es posible un cambio a tendencia alcista.",
+                                "tipo": "choch",
+                                "clave": clave,
+                                "hash": h
+                            })
+                    elif bias == "choch_bajista":
+                        clave = f"{tk}_choch_down"
+                        h = _hash_alerta("choch", clave, "")
+                        if not alerta_ya_enviada(user_id, h, horas_ventana=24):
+                            alertas.append({
+                                "texto": f"🔴 CAMBIO DE ESTRUCTURA\n{tk} rompió un piso/mínimo importante en ${p_act:,.2f}. Es posible un cambio a tendencia bajista.",
                                 "tipo": "choch",
                                 "clave": clave,
                                 "hash": h
                             })
 
-                    # Alerta de Divergencia y Extremos con Backtest
+                    # Señal RSI con Backtest multitemporal
                     tipo_senal = None
                     if "SE ESTÁ FORMANDO" in diag.upper() or "EN FORMACIÓN" in diag.upper():
                         tipo_senal = "div_predictiva"
@@ -2033,8 +2068,20 @@ def generar_alertas_para_usuario(user_id: int) -> list:
                         h = _hash_alerta("rsi_senal", clave, "")
                         if not alerta_ya_enviada(user_id, h, horas_ventana=18):
                             extra_stat = ""
-                            if hist:
-                                extra_stat = f"\n📊 Historia: {hist['win_rate']:.0f}% Win Rate a 15 días (retorno prom: {hist['avg_ret']:+.1f}%)"
+                            if hist and hist.get('desglose'):
+                                d = {x['horizonte']: x for x in hist['desglose']}
+                                h15 = d.get('15 días')
+                                h3m = d.get('3 meses')
+                                h1y = d.get('1 año')
+                                lineas_stat = []
+                                if h15:
+                                    lineas_stat.append(f"15d: {h15['win_rate']:.0f}% WR ({h15['avg_ret']:+.1f}%)")
+                                if h3m:
+                                    lineas_stat.append(f"3m: {h3m['win_rate']:.0f}% WR ({h3m['avg_ret']:+.1f}%)")
+                                if h1y:
+                                    lineas_stat.append(f"1a: {h1y['win_rate']:.0f}% WR ({h1y['avg_ret']:+.1f}%)")
+                                extra_stat = "\n📊 Histórico: " + " | ".join(lineas_stat)
+
                             alertas.append({
                                 "texto": f"📡 SEÑAL TÉCNICA (Diario)\n{tk} — RSI {rsi:.1f}\n{diag}{extra_stat}",
                                 "tipo": "rsi_senal",
@@ -2044,7 +2091,6 @@ def generar_alertas_para_usuario(user_id: int) -> list:
             except Exception:
                 pass
 
-    # 3. Alertas de Gasto
     try:
         with get_db_connection() as conn:
             df_hoy = pd.read_sql(
@@ -2090,7 +2136,7 @@ async def tarea_alertas_periodicas(app):
                         with conn.cursor() as cursor:
                             cursor.execute("""
                                 SELECT DISTINCT user_id FROM (
-                                    SELECT user_id FROM portafolio_inversiones
+                                    SELECT user_id FROM portafolio_inversIONES
                                     UNION
                                     SELECT user_id FROM movimientos
                                     UNION
@@ -2393,43 +2439,34 @@ REGLAS DE FORMATO Y ESTILO VISUAL (OBLIGATORIO Y ESTRICTO):
 - Diseña respuestas prolijas, elegantes y scannables para la pantalla de un celular.
 
 REGLAS DE ANÁLISIS TÉCNICO PERSONALIZADO (MUY IMPORTANTE):
-- Si el usuario pide escanear o analizar todos sus activos (ej: "Analizame todos mis activos", "analizá toda mi cartera", "escanear activos", "cómo están mis activos"):
+- Si el usuario pide escanear o analizar todos sus activos:
   DEBES EMITIR OBLIGATORIAMENTE: ACCION: ESCANEAR_CARTERA
-  Tu respuesta textual debe ser brevísima y concisa anunciando el reporte.
 
-- Si el usuario pide analizar técnicamente un activo (ej: "analizá BTC", "analizame MELI", "análisis técnico de ETH en 4h", "cómo ves NVDA en semanal", "haceme un análisis de SOL"):
+- Si el usuario pide analizar técnicamente un activo:
   DEBES EMITIR: ACCION: ANALIZAR_ACTIVO|[TICKER]|[TIMEFRAME_DETECTADO]
   Donde TIMEFRAME_DETECTADO puede ser: "diario", "semanal" o "4h" (por defecto "diario").
 
 REGLAS DE GRÁFICOS (MUY ESTRICTAS Y OBLIGATORIAS):
 1. COMPARATIVA DE DOS O MÁS ACTIVOS:
-   Si el usuario pide ver el gráfico o la evolución de DOS O MÁS ACTIVOS:
-   DEBES EMITIR OBLIGATORIAMENTE AL FINAL DE TU MENSAJE:
    ACCION: GRAFICO_EVOLUCION_POR_ACTIVOS|[PERIODO_DETECTADO]|[TICKERS_SEPARADOS_POR_COMA]
 
 2. TODOS LOS ACTIVOS DE LA CARTERA:
-   Si el usuario pide ver todos los activos juntos:
    ACCION: GRAFICO_EVOLUCION_POR_ACTIVOS|[PERIODO_DETECTADO]
 
 3. EVOLUCIÓN CONSOLIDADA DE CARTERA (UNA SOLA LÍNEA):
-   Si el usuario pide la evolución general de su cartera:
    ACCION: GRAFICO_EVOLUCION_CARTERA_CONSOLIDADA|[PERIODO_DETECTADO]
 
 4. UN SOLO ACTIVO INDIVIDUAL:
-   Únicamente si pide UN SOLO activo:
    ACCION: GRAFICO_EVOLUCION_ACTIVO|[TICKER]|[PERIODO_DETECTADO]
 
 REGLAS DE CIERRE DE POSICIÓN ABIERTA:
-- Si el usuario dice que cerró una posición abierta:
-  ACCION: CERRAR_POSICION|[ID]|[PNL_USD_MANUAL_O_VACIO]|[PRECIO_SALIDA_O_VACIO]
+- ACCION: CERRAR_POSICION|[ID]|[PNL_USD_MANUAL_O_VACIO]|[PRECIO_SALIDA_O_VACIO]
 
 REGLAS DE REGISTRO DE TRADES CERRADOS PASADOS:
-- Si el usuario menciona una ganancia o trade pasado que ya cerró:
-  REGISTRO_TRADE_CERRADO: [TICKER]|[PNL_USD]|[TIPO_POS]|[ROI_PCT]|[MONTO_INVERTIDO]|[DESCRIPCION]|[FECHA_YYYY-MM-DD]
+- REGISTRO_TRADE_CERRADO: [TICKER]|[PNL_USD]|[TIPO_POS]|[ROI_PCT]|[MONTO_INVERTIDO]|[DESCRIPCION]|[FECHA_YYYY-MM-DD]
 
 REGLAS DE REGISTRO DE POSICIONES ABIERTAS (SPOT / FUTUROS):
-- Si el usuario abre un trade o compra activa:
-  REGISTRO_INV: [TICKER]|[MARGEN_USD]|[PPC]|[CANTIDAD]|[FECHA_YYYY-MM-DD]|[TIPO_POS]|[APALANCAMIENTO]|[PRECIO_LIQ]
+- REGISTRO_INV: [TICKER]|[MARGEN_USD]|[PPC]|[CANTIDAD]|[FECHA_YYYY-MM-DD]|[TIPO_POS]|[APALANCAMIENTO]|[PRECIO_LIQ]
 
 REGLAS DE MODIFICACIÓN Y AGREGADO DE MARGEN:
 - Agregar margen: ACCION: AGREGAR_MARGEN|[ID]|[MONTO_EXTRA_USD]
@@ -2445,19 +2482,19 @@ REGLAS DE BORRADO:
 - Resetear todo: ACCION: BORRAR_TODO
 
 REGLAS DE PRESUPUESTOS:
-- Definir o cambiar un presupuesto: ACCION: SET_PRESUPUESTO|[CATEGORIA]|[MONTO]
-- Ver progreso de presupuestos: ACCION: VER_PRESUPUESTOS
+- Definir presupuesto: ACCION: SET_PRESUPUESTO|[CATEGORIA]|[MONTO]
+- Ver presupuestos: ACCION: VER_PRESUPUESTOS
 
 REGLAS DE OBJETIVOS:
-- Definir un objetivo: ACCION: CREAR_OBJETIVO|[DESCRIPCION]|[TIPO]|[MONTO]|[FECHA_YYYY-MM-DD_O_VACIO]
+- Definir objetivo: ACCION: CREAR_OBJETIVO|[DESCRIPCION]|[TIPO]|[MONTO]|[FECHA_YYYY-MM-DD_O_VACIO]
 - Ver objetivos: ACCION: VER_OBJETIVOS
 
 REGLAS DE MÉTRICAS DE RIESGO:
-- Si pide métricas de riesgo o performance: ACCION: VER_RIESGO
+- ACCION: VER_RIESGO
 
 REGLAS GENERALES:
 - Registro ARS: REGISTRO_ARS: [TIPO]|[MONTO]|[CATEGORIA]|[DESCRIPCION]|[FECHA_YYYY-MM-DD]
-- Ver cartera y balance: ACCION: VER_CARTERA
+- Ver cartera: ACCION: VER_CARTERA
 - Cotización en vivo: ACCION: CONSULTA_PRECIO|[TICKER]
 - Gráfico torta inversiones: ACCION: GRAFICO_INVERSIONES
 - Gráfico torta gastos: ACCION: GRAFICO_GASTOS
@@ -2618,6 +2655,23 @@ async def intentar_comando_local(update: Update, user_id: int, user_msg: str) ->
             await update.message.reply_text(f"No pude analizar {tk}.")
         return True
 
+    # 100% LOCAL: Captura lenguaje ultra informal sin consumir tokens de IA
+    m_an = re.match(r"^(?:(?:analiza(?:me)?|an[aá]lisis(?:\s+t[eé]cnico)?|c[oó]mo\s+ves|at)\s+)?([a-zA-Z0-9]{2,10})(?:\s+(diario|semanal|4h))?$", low)
+    if m_an:
+        posible_tk = m_an.group(1).upper()
+        palabras_comunes = {"HOLA", "BUENAS", "GRACIAS", "OK", "RESET", "AYUDA", "MES", "GASTOS", "RESUMEN", "CARTERA", "OBJETIVOS", "RIESGO"}
+        if posible_tk not in palabras_comunes and not posible_tk.isdigit():
+            tk = posible_tk
+            tf_at = m_an.group(2) or "diario"
+            con_fibo = "fibo" in low
+            buf_img, info_at = generar_grafico_analisis_tecnico(tk, tf_at, con_fibo, con_fibo)
+            if buf_img and info_at and not isinstance(info_at, str):
+                await update.message.reply_photo(photo=buf_img, caption=f"📈 {tk} ({tf_at}) POC + Pivots + RSI")
+                await update.message.reply_text(formatear_reporte_tecnico(info_at))
+            else:
+                await update.message.reply_text(f"No pude analizar {tk}.")
+            return True
+
     if re.search(r"\b(ytd|year to date|este año|este ano)\b", low) and not re.search(r"registr|anot|guarde|gan[eé]|gast[eé]", low):
         if re.search(r"graf|curva|evoluc|vs|spy", low):
             await enviar_grafico_cartera(update, user_id, "ytd", modo="pct")
@@ -2640,18 +2694,7 @@ async def intentar_comando_local(update: Update, user_id: int, user_msg: str) ->
     if re.search(r"^(c[oó]mo viene(n)? mi(s)? (cartera|posiciones)|estado de (la )?cartera)$", low):
         await cmd_resumen(update, None)
         return True
-    m_an = re.match(r"^(?:analiza(?:me)?|an[aá]lisis(?:\s+t[eé]cnico)?)\s+([a-zA-Z0-9]+)(?:\s+(diario|semanal|4h))?", low)
-    if m_an:
-        tk = m_an.group(1).upper()
-        tf_at = m_an.group(2) or "diario"
-        con_fibo = "fibo" in low
-        buf_img, info_at = generar_grafico_analisis_tecnico(tk, tf_at, con_fibo, con_fibo)
-        if buf_img and info_at and not isinstance(info_at, str):
-            await update.message.reply_photo(photo=buf_img, caption=f"📈 {tk} ({tf_at}) POC + Pivots + RSI")
-            await update.message.reply_text(formatear_reporte_tecnico(info_at))
-        else:
-            await update.message.reply_text(f"No pude analizar {tk}.")
-        return True
+
     return False
 
 async def cmd_borrar_todo(update: Update, context: ContextTypes.DEFAULT_TYPE):
