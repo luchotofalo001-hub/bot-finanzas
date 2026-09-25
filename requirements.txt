@@ -1,7 +1,8 @@
-python-telegram-bot==21.10
-google-genai
+requests
 psycopg2-binary
 pandas
-matplotlib
-openpyxl
+numpy
 yfinance
+matplotlib
+google-genai
+openpyxl
