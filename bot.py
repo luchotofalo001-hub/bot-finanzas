@@ -802,25 +802,35 @@ def calcular_pivots_y_niveles(df, ventana=4):
     sop_inmediato = soportes[0] if soportes else None
     sop_segundo = soportes[1] if len(soportes) > 1 else None
 
-    ult_highs = [val for _, val in pivots_h[-3:]]
+        ult_highs = [val for _, val in pivots_h[-3:]]
     ult_lows = [val for _, val in pivots_l[-3:]]
     
     estructura_txt = "Consolidación / lateral"
     estructura_bias = "lateral"
-    
-    if len(ult_highs) >= 2 and len(ult_lows) >= 2:
-        if ult_highs[-1] > ult_highs[-2] and ult_lows[-1] > ult_lows[-2]:
-            estructura_txt = "Estructura ALCISTA (Máximos y mínimos en subida)"
-            estructura_bias = "alcista"
-        elif ult_highs[-1] < ult_highs[-2] and ult_lows[-1] < ult_lows[-2]:
-            estructura_txt = "Estructura BAJISTA (Máximos y mínimos en caída)"
-            estructura_bias = "bajista"
-        elif ult_highs[-1] > ult_highs[-2]:
-            estructura_txt = "Se rompió un techo/máximo importante (Posible giro alcista)"
-            estructura_bias = "choch_alcista"
-        elif ult_lows[-1] < ult_lows[-2]:
-            estructura_txt = "Se rompió un piso/mínimo importante (Posible giro bajista)"
+
+    if ult_highs and ult_lows:
+        last_high = ult_highs[-1]
+        last_low = ult_lows[-1]
+        
+        # 1. Roturas activas en tiempo real:
+        if precio_actual < last_low:
+            estructura_txt = f"🔴 Se rompió un piso/mínimo importante (${last_low:,.2f}) — Presión bajista activa"
             estructura_bias = "choch_bajista"
+        elif precio_actual > last_high:
+            estructura_txt = f"🟢 Se rompió un techo/máximo importante (${last_high:,.2f}) — Posible giro alcista"
+            estructura_bias = "choch_alcista"
+            
+        # 2. Si no hay rotura activa hoy, evaluar la tendencia de los picos y valles:
+        elif len(ult_highs) >= 2 and len(ult_lows) >= 2:
+            if ult_highs[-1] < ult_highs[-2] and ult_lows[-1] < ult_lows[-2]:
+                estructura_txt = "Estructura BAJISTA sólida (Máximos y mínimos descendentes)"
+                estructura_bias = "bajista"
+            elif ult_highs[-1] > ult_highs[-2] and ult_lows[-1] > ult_lows[-2]:
+                estructura_txt = "Estructura ALCISTA sólida (Máximos y mínimos ascendentes)"
+                estructura_bias = "alcista"
+            elif precio_actual < ult_highs[-1] and precio_actual > ult_lows[-1]:
+                estructura_txt = f"Rango lateral / compresión entre ${last_low:,.2f} y ${last_high:,.2f}"
+                estructura_bias = "lateral"
 
     fibo_niveles = {}
     if pivots_h and pivots_l:
