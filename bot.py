@@ -802,7 +802,7 @@ def calcular_pivots_y_niveles(df, ventana=4):
     sop_inmediato = soportes[0] if soportes else None
     sop_segundo = soportes[1] if len(soportes) > 1 else None
 
-        ult_highs = [val for _, val in pivots_h[-3:]]
+    ult_highs = [val for _, val in pivots_h[-3:]]
     ult_lows = [val for _, val in pivots_l[-3:]]
     
     estructura_txt = "Consolidación / lateral"
