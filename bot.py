@@ -1,15 +1,14 @@
 import os
 import io
 import re
-import json
 import asyncio
 import logging
 import threading
 import hashlib
 from datetime import datetime, timedelta, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
-import urllib.parse
-import requests
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 from google import genai
 import psycopg2
 import pandas as pd
@@ -27,16 +26,29 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ==================== SERVIDOR WEB PARA RENDER ====================
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Bot activo")
+    def log_message(self, format, *args):
+        pass
+
+def run_web_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    server.serve_forever()
+
+threading.Thread(target=run_web_server, daemon=True).start()
+
 # ==================== CONFIGURACIÓN ====================
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 DATABASE_URL = os.environ.get("DATABASE_URL")
-LUCHO_USER_ID = 8429535344
+LUCHO_TELEGRAM_ID = 8429535344
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
-
-WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN")
-WHATSAPP_PHONE_ID = os.environ.get("WHATSAPP_PHONE_ID", "1330411630157040")
-WHATSAPP_VERIFY_TOKEN = os.environ.get("WHATSAPP_VERIFY_TOKEN", "secreto_finanzas_123")
-MI_NUMERO_WHATSAPP = os.environ.get("MI_NUMERO_WHATSAPP")
 
 ALERTA_HORA_INICIO = 7
 ALERTA_HORA_FIN = 22
@@ -46,164 +58,7 @@ UMBRAL_GASTO_INUSUAL = 2.2
 UMBRAL_GASTO_HORMIGA_ARS = 15000.0
 
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
-loop_principal = None
 
-# ==================== MOTOR DE ENVÍO WHATSAPP ROBUSTO ====================
-def enviar_mensaje_whatsapp(to_number: str, texto: str):
-    if not WHATSAPP_TOKEN or not WHATSAPP_PHONE_ID or not to_number:
-        return
-    url = f"https://graph.facebook.com/v21.0/{WHATSAPP_PHONE_ID}/messages"
-    headers = {
-        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to_number,
-        "type": "text",
-        "text": {"body": texto}
-    }
-    try:
-        r = requests.post(url, json=payload, headers=headers, timeout=10)
-        if r.status_code >= 400:
-            logger.error(f"Error WhatsApp send message: {r.text}")
-    except Exception as e:
-        logger.error(f"Error enviando mensaje a WhatsApp: {e}")
-
-def subir_media_whatsapp(buf: io.BytesIO, filename: str = "grafico.png", mime_type: str = "image/png") -> str:
-    url = f"https://graph.facebook.com/v21.0/{WHATSAPP_PHONE_ID}/media"
-    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
-    buf.seek(0)
-    files = {"file": (filename, buf.read(), mime_type)}
-    data = {"messaging_product": "whatsapp", "type": mime_type}
-    try:
-        r = requests.post(url, headers=headers, files=files, data=data, timeout=25)
-        if r.status_code == 200:
-            return r.json().get("id")
-        else:
-            logger.error(f"Error subiendo media: {r.text}")
-            return None
-    except Exception as e:
-        logger.error(f"Excepción subiendo media a WhatsApp: {e}")
-        return None
-
-def enviar_imagen_whatsapp(to_number: str, buf: io.BytesIO, caption: str = ""):
-    media_id = subir_media_whatsapp(buf, "grafico.png", "image/png")
-    if not media_id:
-        if caption:
-            enviar_mensaje_whatsapp(to_number, f"{caption}\n(No se pudo procesar la imagen)")
-        return
-
-    url = f"https://graph.facebook.com/v21.0/{WHATSAPP_PHONE_ID}/messages"
-    headers = {
-        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to_number,
-        "type": "image",
-        "image": {"id": media_id, "caption": caption}
-    }
-    try:
-        requests.post(url, json=payload, headers=headers, timeout=10)
-    except Exception as e:
-        logger.error(f"Error enviando imagen a WhatsApp: {e}")
-
-def enviar_documento_whatsapp(to_number: str, buf: io.BytesIO, filename: str = "archivo.xlsx", caption: str = ""):
-    media_id = subir_media_whatsapp(buf, filename, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    if not media_id:
-        enviar_mensaje_whatsapp(to_number, "No se pudo subir el archivo Excel a WhatsApp.")
-        return
-
-    url = f"https://graph.facebook.com/v21.0/{WHATSAPP_PHONE_ID}/messages"
-    headers = {
-        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to_number,
-        "type": "document",
-        "document": {"id": media_id, "caption": caption, "filename": filename}
-    }
-    try:
-        requests.post(url, json=payload, headers=headers, timeout=10)
-    except Exception as e:
-        logger.error(f"Error enviando documento a WhatsApp: {e}")
-
-# ==================== SERVIDOR WEB PARA RENDER Y META ====================
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        parsed = urllib.parse.urlparse(self.path)
-        if parsed.path == "/webhook":
-            query = urllib.parse.parse_qs(parsed.query)
-            mode = query.get("hub.mode", [None])[0]
-            token = query.get("hub.verify_token", [None])[0]
-            challenge = query.get("hub.challenge", [None])[0]
-            
-            if mode == "subscribe" and token == WHATSAPP_VERIFY_TOKEN:
-                self.send_response(200)
-                self.send_header("Content-type", "text/plain")
-                self.end_headers()
-                self.wfile.write(challenge.encode("utf-8"))
-                logger.info("Webhook de WhatsApp verificado correctamente con Meta.")
-                return
-            else:
-                self.send_response(403)
-                self.end_headers()
-                return
-
-        self.send_response(200)
-        self.send_header("Content-type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"Bot WhatsApp activo")
-
-    def do_POST(self):
-        parsed = urllib.parse.urlparse(self.path)
-        if parsed.path == "/webhook":
-            content_length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(content_length).decode("utf-8")
-            
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"EVENT_RECEIVED")
-            
-            try:
-                data = json.loads(body)
-                entries = data.get("entry", [])
-                if entries:
-                    changes = entries[0].get("changes", [])
-                    if changes:
-                        value = changes[0].get("value", {})
-                        messages = value.get("messages", [])
-                        if messages:
-                            msg = messages[0]
-                            if msg.get("type") == "text":
-                                sender = msg.get("from")
-                                texto = msg.get("text", {}).get("body", "")
-                                if loop_principal and loop_principal.is_running():
-                                    asyncio.run_coroutine_threadsafe(
-                                        procesar_mensaje_whatsapp(sender, texto),
-                                        loop_principal
-                                    )
-            except Exception as e:
-                logger.error(f"Error procesando payload de WhatsApp: {e}")
-            return
-
-        self.send_response(404)
-        self.end_headers()
-
-    def log_message(self, format, *args):
-        pass
-
-def run_web_server():
-    port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-    logger.info(f"Servidor HTTP escuchando en el puerto {port}")
-    server.serve_forever()
-
-# ==================== SUPABASE DB ====================
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL)
 
@@ -292,15 +147,15 @@ def init_db():
                 cursor.execute("ALTER TABLE trades_cerrados ADD COLUMN IF NOT EXISTS user_id BIGINT;")
                 cursor.execute("ALTER TABLE trades_cerrados ADD COLUMN IF NOT EXISTS fecha_apertura TIMESTAMP;")
 
-                cursor.execute("UPDATE movimientos SET user_id = %s WHERE user_id IS NULL;", (LUCHO_USER_ID,))
-                cursor.execute("UPDATE portafolio_inversiones SET user_id = %s WHERE user_id IS NULL;", (LUCHO_USER_ID,))
-                cursor.execute("UPDATE trades_cerrados SET user_id = %s WHERE user_id IS NULL;", (LUCHO_USER_ID,))
+                cursor.execute("UPDATE movimientos SET user_id = %s WHERE user_id IS NULL;", (LUCHO_TELEGRAM_ID,))
+                cursor.execute("UPDATE portafolio_inversiones SET user_id = %s WHERE user_id IS NULL;", (LUCHO_TELEGRAM_ID,))
+                cursor.execute("UPDATE trades_cerrados SET user_id = %s WHERE user_id IS NULL;", (LUCHO_TELEGRAM_ID,))
 
                 cursor.execute("UPDATE portafolio_inversiones SET tipo_posicion = 'SPOT' WHERE tipo_posicion IS NULL OR TRIM(tipo_posicion) = '';")
                 cursor.execute("UPDATE portafolio_inversiones SET apalancamiento = 1 WHERE apalancamiento IS NULL OR apalancamiento <= 0;")
                 cursor.execute("UPDATE portafolio_inversiones SET precio_compra = monto_total_usd / cantidad WHERE (precio_compra IS NULL OR precio_compra <= 0) AND cantidad > 0;")
                 conn.commit()
-        logger.info("Tablas inicializadas y normalizadas en Supabase.")
+        logger.info("Tablas inicializadas y normalizadas.")
     except Exception as e:
         logger.error(f"Error en init_db: {e}")
 
@@ -314,16 +169,20 @@ def en_horario_alertas():
     h = ahora_argentina().hour
     return ALERTA_HORA_INICIO <= h < ALERTA_HORA_FIN
 
-def limpiar_estilo_whatsapp(texto: str) -> str:
+# ==================== FORMATEO LIMPIO TELEGRAM ====================
+def limpiar_estilo_telegram(texto: str) -> str:
     if not texto:
         return ""
     texto = re.sub(r"#{2,6}\s*", "", texto)
+    texto = re.sub(r"^\s*[*•-]\s*\*\*(.*?)(?:\*\*:?|\*\*)\s*", r"• \1: ", texto, flags=re.MULTILINE)
     texto = re.sub(r"::\s*", ": ", texto)
+    texto = re.sub(r"^\s*[*]\s+", r"• ", texto, flags=re.MULTILINE)
+    texto = texto.replace("**", "")
     texto = re.sub(r"\n\s*---\s*\n", "\n\n", texto)
     texto = re.sub(r"\n{3,}", "\n\n", texto)
     return texto.strip()
 
-# ==================== MERCADO Y COTIZACIONES ====================
+# ==================== CONSULTAS DE MERCADO EN VIVO ====================
 CRIPTOS_COMUNES = {
     "BTC", "ETH", "SOL", "BNB", "ADA", "XRP", "DOGE", "SUI", 
     "PAXG", "NEXO", "AVAX", "DOT", "LINK", "NEAR", "RENDER", "PEPE"
@@ -401,9 +260,11 @@ def obtener_precio_actual(ticker: str):
         return datos["precio"], datos["ticker"]
     return None, ticker
 
+# ==================== CÁLCULO DE FECHAS ====================
 def resolver_fecha_inicio(periodo_str: str, fecha_compra_db: str = None):
     p = periodo_str.strip().lower() if periodo_str else ""
     hoy = datetime.now()
+    
     if p in ["todo", "max", "historico", "histórico", "desde el inicio", "desde siempre", "total"]:
         if fecha_compra_db:
             return fecha_compra_db, f"Histórico total (desde {fecha_compra_db})"
@@ -439,10 +300,20 @@ def resolver_fecha_inicio(periodo_str: str, fecha_compra_db: str = None):
     
     if fecha_compra_db:
         return fecha_compra_db, f"Desde tu primera inversión ({fecha_compra_db})"
+    
     return (hoy - timedelta(days=180)).strftime('%Y-%m-%d'), "Últimos 6 meses"
 
 # ==================== MOTOR CUANTITATIVO DE FINANZAS PERSONALES (ARS) ====================
 def calcular_metricas_finanzas_completas(user_id: int, meses_lookback: int = 6):
+    """
+    Calcula de forma nativa en Python métricas completas de finanzas personales:
+    - Promedios mensuales de ingreso, gasto y superávit neto.
+    - Tasa de ahorro histórica (Savings Rate %).
+    - Detección cuantitativa de Gastos Hormiga (frecuencia, volumen y % del gasto).
+    - Regla de Pareto (categorías que concentran el 80% de salidas).
+    - Desvío MoM (Mes actual vs Promedio histórico).
+    - Runway estimado (Meses de vida cubiertos por patrimonio).
+    """
     with get_db_connection() as conn:
         df_mov = pd.read_sql(
             """SELECT fecha, tipo, monto, categoria, descripcion 
@@ -473,16 +344,20 @@ def calcular_metricas_finanzas_completas(user_id: int, meses_lookback: int = 6):
     prom_gasto_mensual = tot_gastos / cant_meses_reales
     prom_ingreso_mensual = tot_ingresos / cant_meses_reales
     superavit_mensual_prom = prom_ingreso_mensual - prom_gasto_mensual
+    
     tasa_ahorro_pct = ((tot_ingresos - tot_gastos) / tot_ingresos * 100.0) if tot_ingresos > 0 else 0.0
 
+    # 1. Gastos Hormiga (compras menores o iguales a UMBRAL_GASTO_HORMIGA_ARS)
     df_hormiga = df_gastos[df_gastos['monto'] <= UMBRAL_GASTO_HORMIGA_ARS]
     tot_hormiga = float(df_hormiga['monto'].sum()) if not df_hormiga.empty else 0.0
     prom_hormiga_mes = tot_hormiga / cant_meses_reales
     pct_hormiga_sobre_gastos = (tot_hormiga / tot_gastos * 100.0) if tot_gastos > 0 else 0.0
     compras_hormiga_por_mes = len(df_hormiga) / cant_meses_reales
 
+    # 2. Desglose Pareto por categorías
     cat_totales = df_gastos.groupby('categoria')['monto'].sum().sort_values(ascending=False) if not df_gastos.empty else pd.Series()
     
+    # 3. Desvío MoM (Mes actual vs Promedio)
     periodo_actual = pd.Period(ahora_argentina(), freq='M')
     df_mes_actual = df_gastos[df_gastos['mes_periodo'] == periodo_actual]
     gasto_mes_actual = float(df_mes_actual['monto'].sum()) if not df_mes_actual.empty else 0.0
@@ -491,15 +366,17 @@ def calcular_metricas_finanzas_completas(user_id: int, meses_lookback: int = 6):
     proyeccion_mes_actual = (gasto_mes_actual / dia_del_mes * dias_en_mes) if dia_del_mes > 0 else gasto_mes_actual
     desvio_pct_vs_prom = ((proyeccion_mes_actual - prom_gasto_mensual) / prom_gasto_mensual * 100.0) if prom_gasto_mensual > 0 else 0.0
 
+    # 4. Runway (Meses de vida cubiertos por patrimonio abierto)
     resumen_cartera = obtener_resumen_portafolio(user_id)
     patrimonio_usd = float(resumen_cartera['total_actual']) if resumen_cartera else 0.0
+    # Estimación de runway asumiendo un tipo de cambio implícito de referencia (aprox 1250-1300 ARS/USD)
     patrimonio_ars_aprox = patrimonio_usd * 1300.0
     runway_meses = (patrimonio_ars_aprox / prom_gasto_mensual) if prom_gasto_mensual > 0 else 0.0
 
     lineas = [
-        f"📊 *RADIOGRAFÍA FINANCIERA* (Últimos {cant_meses_reales} meses)",
+        f"📊 RADIOGRAFÍA FINANCIERA (Últimos {cant_meses_reales} meses)",
         "",
-        "💵 *Flujo de Caja y Ahorro*",
+        "💵 Flujo de Caja y Ahorro",
         f"• Ingresos promedio: ${prom_ingreso_mensual:,.0f} ARS/mes",
         f"• Gastos promedio:   ${prom_gasto_mensual:,.0f} ARS/mes",
         f"• Superávit neto:    ${superavit_mensual_prom:+,.0f} ARS/mes",
@@ -510,7 +387,7 @@ def calcular_metricas_finanzas_completas(user_id: int, meses_lookback: int = 6):
     lineas.append(f"• Diagnóstico: {em_ahorro}")
 
     lineas.append("")
-    lineas.append("🐜 *Análisis de Gastos Hormiga (≤ $15.000 ARS)*")
+    lineas.append("🐜 Análisis de Gastos Hormiga (≤ $15.000 ARS)")
     lineas.append(f"• Fuga total acumulada: ${tot_hormiga:,.0f} ARS ({len(df_hormiga)} compras)")
     lineas.append(f"• Impacto mensual:      ${prom_hormiga_mes:,.0f} ARS/mes ({pct_hormiga_sobre_gastos:.1f}% del total)")
     lineas.append(f"• Frecuencia:           ~{compras_hormiga_por_mes:.0f} micro-compras al mes")
@@ -521,7 +398,7 @@ def calcular_metricas_finanzas_completas(user_id: int, meses_lookback: int = 6):
         lineas.append(f"• Principales focos:    {top_str}")
 
     lineas.append("")
-    lineas.append("🏆 *Salidas Principales (Ley de Pareto)*")
+    lineas.append("🏆 Salidas Principales (Ley de Pareto)")
     acum = 0.0
     for cat, val in cat_totales.head(4).items():
         pct = (val / tot_gastos * 100.0) if tot_gastos > 0 else 0.0
@@ -531,7 +408,7 @@ def calcular_metricas_finanzas_completas(user_id: int, meses_lookback: int = 6):
     lineas.append(f"   (Estas categorías explican el {acum:.0f}% de tus gastos totales)")
 
     lineas.append("")
-    lineas.append("⏱️ *Control del Mes en Curso y Runway*")
+    lineas.append("⏱️ Control del Mes en Curso y Runway")
     signo_d = "+" if desvio_pct_vs_prom >= 0 else ""
     em_d = "🔴" if desvio_pct_vs_prom > 15 else ("🟢" if desvio_pct_vs_prom < -5 else "🟡")
     lineas.append(f"• Gastado este mes:     ${gasto_mes_actual:,.0f} ARS (Día {dia_del_mes})")
@@ -812,6 +689,8 @@ def generar_grafico_evolucion_por_activos(user_id: int, periodo_solicitado: str 
     except Exception as e:
         logger.error(f"Error generando comparativa por activos: {e}", exc_info=True)
         return None
+
+generar_grafico_por_activos = generar_grafico_evolucion_por_activos
 
 # ==================== EVOLUCIÓN ACTIVO INDIVIDUAL ====================
 def generar_grafico_evolucion_activo(user_id: int, ticker: str, periodo_solicitado: str = ""):
@@ -1140,9 +1019,9 @@ def formatear_reporte_tecnico(info):
     poc = info.get('poc')
     hist_stat = info.get('hist_stat')
     
-    lineas = [f"📊 *REPORTE TÉCNICO: {tk} ({tf})*", f"• Precio actual: ${p:,.2f} USD", ""]
+    lineas = [f"📊 REPORTE TÉCNICO: {tk} ({tf})", f"• Precio actual: ${p:,.2f} USD", ""]
 
-    lineas.append("📈 *Estructura de Mercado y Pivots*")
+    lineas.append("📈 Estructura de Mercado y Pivots")
     est = info.get("estructura_txt") or "En desarrollo"
     lineas.append(f"• Estructura: {est}")
     
@@ -1165,7 +1044,7 @@ def formatear_reporte_tecnico(info):
         lineas.append(f"• POC (Mayor volumen): ${poc:,.2f} ({signo}{dist_poc:.1f}% → {lado_poc})")
 
     lineas.append("")
-    lineas.append("🌊 *Medias Móviles*")
+    lineas.append("🌊 Medias Móviles")
     if p > e20 and e20 > e50:
         lineas.append(f"• Sesgo dinámico: Alcista sólido (Precio > EMA20 ${e20:,.2f} > EMA50 ${e50:,.2f})")
     elif p < e20 and e20 < e50:
@@ -1177,7 +1056,7 @@ def formatear_reporte_tecnico(info):
         lineas.append(f"• EMA 200: ${e200:,.2f} ({pos_200})")
 
     lineas.append("")
-    lineas.append("⚡ *Momentum*")
+    lineas.append("⚡ Momentum")
     lineas.append(f"• RSI 14: {rsi:.1f} — {diag_rsi}")
     macd = info.get("macd")
     macd_hist = info.get("macd_hist")
@@ -1187,7 +1066,7 @@ def formatear_reporte_tecnico(info):
 
     if fibo:
         lineas.append("")
-        lineas.append("🎯 *Fibonacci del Último Impulso*")
+        lineas.append("🎯 Fibonacci del Último Impulso")
         if "Golden Pocket 0.618" in fibo and not np.isnan(fibo['Golden Pocket 0.618']):
             lineas.append(f"• Golden Pocket 0.618: ${fibo['Golden Pocket 0.618']:,.2f}")
         if "0.500" in fibo and not np.isnan(fibo['0.500']):
@@ -1197,7 +1076,7 @@ def formatear_reporte_tecnico(info):
 
     if hist_stat:
         lineas.append("")
-        lineas.append(f"🧠 *Comportamiento Histórico ante: {hist_stat['condicion']}*")
+        lineas.append(f"🧠 Comportamiento Histórico ante: {hist_stat['condicion']}")
         lineas.append(f"• Eventos detectados en su historia: {hist_stat['total_eventos']}")
         lineas.append("• Desglose por horizonte temporal:")
         for item in hist_stat['desglose']:
@@ -1208,7 +1087,7 @@ def formatear_reporte_tecnico(info):
             )
 
     lineas.append("")
-    lineas.append("💡 *Conclusión Operativa*")
+    lineas.append("💡 Conclusión Operativa")
     bias = info.get("estructura_bias") or "lateral"
     if "DIVERGENCIA ALCISTA" in diag_rsi.upper() or rsi <= 32:
         lineas.append("• Probabilidad alta de rebote técnico. Buscar confirmación sobre EMA20.")
@@ -1443,7 +1322,7 @@ def escanear_cartera_senales(user_id: int):
         tiene_senal_d = ("DIVERGENCIA" in diag_d.upper()) or (rsi_d >= 70) or (rsi_d <= 30) or (poc_d and abs(precio - poc_d)/precio <= 0.01)
         tiene_senal_w = ("DIVERGENCIA" in diag_w.upper()) or (rsi_w and (rsi_w >= 70 or rsi_w <= 30))
 
-        diag_texto = [f"📌 *{tk}* (${precio:,.2f} USD)"]
+        diag_texto = [f"📌 {tk} (${precio:,.2f} USD)"]
         diag_texto.append(f"• Estructura: {est_d}")
         
         if poc_d:
@@ -1473,7 +1352,7 @@ def escanear_cartera_senales(user_id: int):
 
         diagnosticos.append("\n".join(diag_texto))
 
-    resumen_final = "🔍 *ESCÁNER DE CARTERA (Diario + Semanal)*\n\n" + "\n\n".join(diagnosticos)
+    resumen_final = "🔍 ESCÁNER DE CARTERA (Diario + Semanal)\n\n" + "\n\n".join(diagnosticos)
     if not imagenes_senales:
         resumen_final += "\n\nℹ️ No se detectaron divergencias ni extremos de RSI críticos."
     else:
@@ -1481,7 +1360,7 @@ def escanear_cartera_senales(user_id: int):
 
     return resumen_final, imagenes_senales
 
-# ==================== OPERACIONES Y BASE DE DATOS ====================
+# ==================== OPERACIONES BANCARIAS Y CARTERA ====================
 def registrar_operacion_inversion(user_id: int, ticker: str, monto_usd: float, precio_compra: float = None, cantidad: float = None, fecha_compra: str = None, tipo_posicion: str = "SPOT", apalancamiento: float = 1.0, precio_liq: float = None):
     ticker = ticker.strip().upper()
     tipo_pos = tipo_posicion.strip().upper() if tipo_posicion else "SPOT"
@@ -1707,128 +1586,118 @@ def modificar_movimiento_por_id(user_id: int, mov_id: int, campo: str, nuevo_val
             conn.commit()
             return prev, f"Campo {col} actualizado a {val}"
 
-def guardar_movimiento(user_id: int, tipo: str, monto: float, categoria: str, descripcion: str, fecha_str: str = None):
+def obtener_resumen_portafolio(user_id: int):
     with get_db_connection() as conn:
-        with conn.cursor() as cursor:
-            if fecha_str:
-                cursor.execute(
-                    "INSERT INTO movimientos (user_id, fecha, tipo, monto, categoria, descripcion) VALUES (%s, %s, %s, %s, %s, %s);",
-                    (user_id, fecha_str, tipo.upper(), float(monto), categoria.capitalize(), descripcion)
-                )
+        df = pd.read_sql(
+            "SELECT id, fecha, ticker, cantidad, precio_compra, monto_total_usd, tipo_posicion, apalancamiento, precio_liquidacion FROM portafolio_inversiones WHERE user_id = %s;",
+            conn, params=(user_id,)
+        )
+    
+    if df.empty:
+        return None
+
+    posiciones = []
+    total_margen_invertido = 0.0
+    total_valor_actual = 0.0
+
+    for _, fila in df.iterrows():
+        inv_id = int(fila['id'])
+        ticker = str(fila['ticker']).strip().upper()
+        cant = float(fila['cantidad']) if pd.notnull(fila['cantidad']) else 0.0
+        costo_margen = float(fila['monto_total_usd']) if pd.notnull(fila['monto_total_usd']) else 0.0
+        
+        if pd.notnull(fila['precio_compra']) and float(fila['precio_compra']) > 0:
+            ppc = float(fila['precio_compra'])
+        elif cant > 0:
+            ppc = costo_margen / cant
+        else:
+            ppc = 1.0
+
+        tipo_pos = str(fila['tipo_posicion']).upper() if pd.notnull(fila['tipo_posicion']) else "SPOT"
+        lev = float(fila['apalancamiento']) if pd.notnull(fila['apalancamiento']) and float(fila['apalancamiento']) > 0 else 1.0
+        p_liq = float(fila['precio_liquidacion']) if pd.notnull(fila['precio_liquidacion']) else None
+
+        if ticker in ["USDT", "USDC", "DAI", "USD"]:
+            spot = 1.0
+            valor_actual = costo_margen if costo_margen > 0 else cant
+            pnl_usd = 0.0
+            pnl_pct = 0.0
+        else:
+            spot, _ = obtener_precio_actual(ticker)
+            if spot is None or np.isnan(spot) or spot <= 0:
+                spot = ppc
+
+            if tipo_pos == "SHORT":
+                var_precio_pct = (ppc - spot) / ppc if ppc > 0 else 0.0
+                pnl_pct = var_precio_pct * lev * 100
+                pnl_usd = costo_margen * (var_precio_pct * lev)
+                valor_actual = max(0.0, costo_margen + pnl_usd)
+            elif tipo_pos == "LONG":
+                var_precio_pct = (spot - ppc) / ppc if ppc > 0 else 0.0
+                pnl_pct = var_precio_pct * lev * 100
+                pnl_usd = costo_margen * (var_precio_pct * lev)
+                valor_actual = max(0.0, costo_margen + pnl_usd)
             else:
-                cursor.execute(
-                    "INSERT INTO movimientos (user_id, fecha, tipo, monto, categoria, descripcion) VALUES (%s, NOW(), %s, %s, %s, %s);",
-                    (user_id, tipo.upper(), float(monto), categoria.capitalize(), descripcion)
-                )
-            conn.commit()
+                valor_actual = cant * spot
+                pnl_usd = valor_actual - costo_margen
+                pnl_pct = (pnl_usd / costo_margen * 100) if costo_margen > 0 else 0.0
 
-def borrar_inversion_por_id(user_id: int, inv_id: int):
-    with get_db_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT id, ticker, monto_total_usd FROM portafolio_inversiones WHERE id = %s AND user_id = %s;", (inv_id, user_id))
-            reg = cursor.fetchone()
-            if reg:
-                cursor.execute("DELETE FROM portafolio_inversiones WHERE id = %s AND user_id = %s;", (inv_id, user_id))
-                conn.commit()
-                return reg
-            return None
+        if np.isnan(valor_actual):
+            valor_actual = costo_margen
+        if np.isnan(pnl_usd):
+            pnl_usd = 0.0
+        if np.isnan(pnl_pct):
+            pnl_pct = 0.0
 
-def borrar_trade_cerrado_por_id(user_id: int, tc_id: int):
-    with get_db_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT id, ticker, pnl_usd FROM trades_cerrados WHERE id = %s AND user_id = %s;", (tc_id, user_id))
-            reg = cursor.fetchone()
-            if reg:
-                cursor.execute("DELETE FROM trades_cerrados WHERE id = %s AND user_id = %s;", (tc_id, user_id))
-                conn.commit()
-                return reg
-            return None
+        total_margen_invertido += costo_margen
+        total_valor_actual += valor_actual
 
-def borrar_movimiento_por_id(user_id: int, mov_id: int):
-    with get_db_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT id, tipo, monto, categoria, descripcion FROM movimientos WHERE id = %s AND user_id = %s;", (mov_id, user_id))
-            reg = cursor.fetchone()
-            if reg:
-                cursor.execute("DELETE FROM movimientos WHERE id = %s AND user_id = %s;", (mov_id, user_id))
-                conn.commit()
-                return reg
-            return None
-
-def borrar_ultimo_registro_general(user_id: int):
-    with get_db_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT 'MOV' as origen, id, fecha, tipo, monto FROM movimientos WHERE user_id = %s ORDER BY id DESC LIMIT 1;", (user_id,))
-            ultimo_mov = cursor.fetchone()
-            cursor.execute("SELECT 'INV' as origen, id, fecha, ticker, monto_total_usd FROM portafolio_inversiones WHERE user_id = %s ORDER BY id DESC LIMIT 1;", (user_id,))
-            ultimo_inv = cursor.fetchone()
-            cursor.execute("SELECT 'TC' as origen, id, fecha, ticker, pnl_usd FROM trades_cerrados WHERE user_id = %s ORDER BY id DESC LIMIT 1;", (user_id,))
-            ultimo_tc = cursor.fetchone()
-            
-            candidatos = []
-            if ultimo_mov: candidatos.append((ultimo_mov[2], 'MOV', ultimo_mov[1], f"Gasto/Ingreso {ultimo_mov[3]} ${ultimo_mov[4]:,.2f} ARS"))
-            if ultimo_inv: candidatos.append((ultimo_inv[2], 'INV', ultimo_inv[1], f"Posición abierta {ultimo_inv[3]} ${ultimo_inv[4]:,.2f} USD"))
-            if ultimo_tc: candidatos.append((ultimo_tc[2], 'TC', ultimo_tc[1], f"Trade cerrado {ultimo_tc[3]} PnL ${ultimo_tc[4]:+,.2f} USD"))
-
-            if not candidatos:
-                return None
-            
-            candidatos.sort(key=lambda x: x[0], reverse=True)
-            sel = candidatos[0]
-            if sel[1] == 'MOV':
-                cursor.execute("DELETE FROM movimientos WHERE id = %s AND user_id = %s;", (sel[2], user_id))
-            elif sel[1] == 'INV':
-                cursor.execute("DELETE FROM portafolio_inversiones WHERE id = %s AND user_id = %s;", (sel[2], user_id))
+        dist_liq_pct = None
+        if p_liq and tipo_pos in ["LONG", "SHORT"] and lev > 1 and spot > 0:
+            if tipo_pos == "LONG":
+                dist_liq_pct = ((spot - p_liq) / spot * 100)
             else:
-                cursor.execute("DELETE FROM trades_cerrados WHERE id = %s AND user_id = %s;", (sel[2], user_id))
-            conn.commit()
-            return sel[3]
+                dist_liq_pct = ((p_liq - spot) / spot * 100)
+            if np.isnan(dist_liq_pct):
+                dist_liq_pct = None
 
-def borrar_todos_los_movimientos(user_id: int):
-    with get_db_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute("DELETE FROM movimientos WHERE user_id = %s;", (user_id,))
-            cursor.execute("DELETE FROM portafolio_inversiones WHERE user_id = %s;", (user_id,))
-            cursor.execute("DELETE FROM trades_cerrados WHERE user_id = %s;", (user_id,))
-            conn.commit()
+        posiciones.append({
+            "id": inv_id,
+            "ticker": ticker,
+            "tipo_pos": tipo_pos,
+            "lev": lev,
+            "cantidad": cant,
+            "ppc": ppc,
+            "spot": spot,
+            "costo_margen": costo_margen,
+            "valor_actual": valor_actual,
+            "pnl_usd": pnl_usd,
+            "pnl_pct": pnl_pct,
+            "precio_liq": p_liq,
+            "dist_liq_pct": dist_liq_pct,
+            "fecha": fila['fecha']
+        })
 
-def set_presupuesto(user_id: int, categoria: str, monto_limite: float, mes: int = None, anio: int = None):
-    ahora = ahora_argentina()
-    mes = mes or ahora.month
-    anio = anio or ahora.year
-    categoria = categoria.strip().capitalize()
-    with get_db_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute("""
-                INSERT INTO presupuestos (user_id, categoria, monto_limite, mes, anio)
-                VALUES (%s, %s, %s, %s, %s)
-                ON CONFLICT (user_id, categoria, mes, anio)
-                DO UPDATE SET monto_limite = EXCLUDED.monto_limite;
-            """, (user_id, categoria, float(monto_limite), mes, anio))
-            conn.commit()
-    return categoria, monto_limite, mes, anio
+    pnl_total_usd = total_valor_actual - total_margen_invertido
+    pnl_total_pct = (pnl_total_usd / total_margen_invertido * 100) if total_margen_invertido > 0 else 0.0
 
-def crear_objetivo(user_id: int, descripcion: str, tipo: str, monto_objetivo: float, fecha_limite: str = None):
-    tipo = tipo.strip().upper() if tipo else "CAPITAL"
-    with get_db_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(
-                """INSERT INTO objetivos (user_id, descripcion, tipo, monto_objetivo, fecha_limite)
-                   VALUES (%s, %s, %s, %s, %s) RETURNING id;""",
-                (user_id, descripcion, tipo, float(monto_objetivo), fecha_limite)
-            )
-            oid = cursor.fetchone()[0]
-            conn.commit()
-            return oid
+    return {
+        "posiciones": posiciones,
+        "total_invertido": total_margen_invertido,
+        "total_actual": total_valor_actual,
+        "pnl_total_usd": pnl_total_usd,
+        "pnl_total_pct": pnl_total_pct
+    }
 
-# ==================== GRÁFICOS DE TORTA (INVERSIONES Y GASTOS) ====================
 def generar_grafico_distribucion_inversiones(user_id: int):
     resumen = obtener_resumen_portafolio(user_id)
     if not resumen or not resumen["posiciones"]:
         return None
+    
     df = pd.DataFrame(resumen["posiciones"])
     plt.figure(figsize=(7, 6))
     colores = ['#2ca02c', '#1f77b4', '#ff7f0e', '#d62728', '#9467bd', '#8c564b', '#e377c2']
+    
     agrup = df.groupby('ticker')['valor_actual'].sum()
     plt.pie(
         agrup.values,
@@ -1846,31 +1715,393 @@ def generar_grafico_distribucion_inversiones(user_id: int):
     plt.close()
     return buf
 
-def generar_grafico_gastos(user_id: int):
-    with get_db_connection() as conn:
-        df = pd.read_sql("SELECT monto, categoria FROM movimientos WHERE user_id = %s AND tipo = 'GASTO';", conn, params=(user_id,))
-    if df.empty:
-        return None
-    gastos_por_cat = df.groupby('categoria')['monto'].sum().sort_values(ascending=False)
-    plt.figure(figsize=(8, 6))
-    colores = ['#4e79a7', '#f28e2b', '#e15759', '#76b7b2', '#59a14f', '#edc948', '#b07aa1']
-    plt.pie(
-        gastos_por_cat, 
-        labels=gastos_por_cat.index, 
-        autopct='%1.1f%%', 
-        startangle=140, 
-        colors=colores[:len(gastos_por_cat)],
-        wedgeprops=dict(width=0.6, edgecolor='w')
-    )
-    plt.title('Distribución de Gastos por Categoría (ARS)', fontsize=14, pad=20)
-    plt.tight_layout()
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png', dpi=200)
-    buf.seek(0)
-    plt.close()
-    return buf
+# ==================== MÉTRICAS DE RIESGO Y PERFORMANCE TRADING ====================
+def calcular_max_drawdown(serie_pnl):
+    if serie_pnl is None or len(serie_pnl) < 2:
+        return 0.0, 0.0
+    peak = serie_pnl.expanding(min_periods=1).max()
+    dd = (serie_pnl - peak)
+    max_dd = float(dd.min())
+    max_dd_pct = float((dd / peak.replace(0, np.nan)).min() * 100) if peak.max() != 0 else 0.0
+    return max_dd, max_dd_pct
 
-# ==================== SISTEMA DE ALERTAS ROBUSTO ====================
+def calcular_metricas_riesgo_completas(user_id: int):
+    resultado = {
+        "pnl_realizado": 0.0,
+        "cant_trades": 0,
+        "win_rate": 0.0,
+        "profit_factor": 0.0,
+        "expectancy": 0.0,
+        "avg_win": 0.0,
+        "avg_loss": 0.0,
+        "max_drawdown_usd": 0.0,
+        "max_drawdown_pct": 0.0,
+        "sharpe_aprox": 0.0,
+        "tiempo_promedio_dias": 0.0,
+        "posiciones_riesgo": [],
+        "texto": ""
+    }
+
+    try:
+        with get_db_connection() as conn:
+            df_tc = pd.read_sql(
+                "SELECT fecha, ticker, tipo_posicion, pnl_usd, roi_pct, monto_invertido FROM trades_cerrados WHERE user_id = %s ORDER BY fecha ASC;",
+                conn, params=(user_id,)
+            )
+            df_inv = pd.read_sql(
+                "SELECT id, fecha, ticker, monto_total_usd, tipo_posicion, apalancamiento, precio_liquidacion, precio_compra FROM portafolio_inversiones WHERE user_id = %s;",
+                conn, params=(user_id,)
+            )
+
+        if not df_tc.empty:
+            resultado["pnl_realizado"] = float(df_tc['pnl_usd'].sum())
+            resultado["cant_trades"] = len(df_tc)
+            ganadores = df_tc[df_tc['pnl_usd'] > 0]
+            perdedores = df_tc[df_tc['pnl_usd'] < 0]
+            resultado["win_rate"] = (len(ganadores) / len(df_tc) * 100) if len(df_tc) > 0 else 0.0
+            suma_gan = float(ganadores['pnl_usd'].sum()) if not ganadores.empty else 0.0
+            suma_per = abs(float(perdedores['pnl_usd'].sum())) if not perdedores.empty else 0.0
+            resultado["profit_factor"] = (suma_gan / suma_per) if suma_per > 0 else (suma_gan if suma_gan > 0 else 0.0)
+            resultado["avg_win"] = float(ganadores['pnl_usd'].mean()) if not ganadores.empty else 0.0
+            resultado["avg_loss"] = float(perdedores['pnl_usd'].mean()) if not perdedores.empty else 0.0
+            resultado["expectancy"] = (resultado["win_rate"]/100 * resultado["avg_win"]) + ((1 - resultado["win_rate"]/100) * resultado["avg_loss"])
+
+            df_tc['fecha_d'] = pd.to_datetime(df_tc['fecha']).dt.tz_localize(None).dt.floor('D')
+            pnl_diario = df_tc.groupby('fecha_d')['pnl_usd'].sum().cumsum()
+            if len(pnl_diario) >= 2:
+                mdd, mdd_pct = calcular_max_drawdown(pnl_diario)
+                resultado["max_drawdown_usd"] = mdd
+                resultado["max_drawdown_pct"] = mdd_pct
+
+            retornos = df_tc.groupby('fecha_d')['pnl_usd'].sum()
+            if len(retornos) > 5 and retornos.std() > 0:
+                resultado["sharpe_aprox"] = float((retornos.mean() / retornos.std()) * np.sqrt(252))
+
+        if not df_inv.empty:
+            ahora = datetime.now()
+            dias = []
+            for _, row in df_inv.iterrows():
+                f = pd.to_datetime(row['fecha']).tz_localize(None)
+                dias.append((ahora - f).days)
+            resultado["tiempo_promedio_dias"] = float(np.mean(dias)) if dias else 0.0
+
+            resumen = obtener_resumen_portafolio(user_id)
+            if resumen:
+                for p in resumen["posiciones"]:
+                    if p.get("dist_liq_pct") is not None and p["dist_liq_pct"] < UMBRAL_LIQUIDACION_PCT:
+                        resultado["posiciones_riesgo"].append(p)
+
+        lineas = []
+        lineas.append("📊 MÉTRICAS DE RIESGO Y PERFORMANCE (TRADING)")
+        lineas.append("")
+        lineas.append("🏆 Trades Cerrados")
+        lineas.append(f"• PnL Realizado: ${resultado['pnl_realizado']:+,.2f} USD")
+        lineas.append(f"• Operaciones: {resultado['cant_trades']}  |  Win Rate: {resultado['win_rate']:.1f}%")
+        lineas.append(f"• Profit Factor: {resultado['profit_factor']:.2f}")
+        lineas.append(f"• Expectancy: ${resultado['expectancy']:+,.2f} por trade")
+        lineas.append(f"• Promedio ganancia: ${resultado['avg_win']:+,.2f}  |  Promedio pérdida: ${resultado['avg_loss']:+,.2f}")
+        lineas.append("")
+        lineas.append("📉 Riesgo")
+        lineas.append(f"• Max Drawdown: ${resultado['max_drawdown_usd']:+,.2f} USD ({resultado['max_drawdown_pct']:.1f}%)")
+        lineas.append(f"• Sharpe aproximado (anualizado): {resultado['sharpe_aprox']:.2f}")
+        lineas.append(f"• Tiempo promedio en posición: {resultado['tiempo_promedio_dias']:.0f} días")
+        
+        if resultado["posiciones_riesgo"]:
+            lineas.append("")
+            lineas.append("⚠️ Posiciones cerca de liquidación")
+            for p in resultado["posiciones_riesgo"]:
+                lineas.append(f"• {p['ticker']} [{p['tipo_pos']} {p['lev']:.0f}x] — Distancia: {p['dist_liq_pct']:.1f}% | Liq: ${p['precio_liq']:,.2f}")
+
+        resultado["texto"] = "\n".join(lineas)
+        return resultado
+    except Exception as e:
+        logger.error(f"Error calculando métricas de riesgo: {e}", exc_info=True)
+        resultado["texto"] = "No se pudieron calcular las métricas de riesgo en este momento."
+        return resultado
+
+def _serie_spy_ret(fecha_start: str):
+    for sym in ("SPY", "SPY.US", "^GSPC"):
+        try:
+            h = yf.Ticker(sym).history(start=fecha_start, auto_adjust=True)
+            if h is None or h.empty or "Close" not in h.columns:
+                continue
+            s = h["Close"].replace([np.inf, -np.inf], np.nan).dropna()
+            if len(s) < 2:
+                continue
+            base = float(s.iloc[0])
+            last = float(s.iloc[-1])
+            if not np.isfinite(base) or not np.isfinite(last) or base <= 0:
+                continue
+            ret = last / base - 1.0
+            if not np.isfinite(ret):
+                continue
+            return ret
+        except Exception as e:
+            logger.warning(f"SPY {sym} falló: {e}")
+            continue
+    return None
+
+def calcular_rendimiento_periodo(user_id: int, periodo: str = "ytd"):
+    hoy = datetime.now()
+    primera_fecha = "2025-05-01"
+    with get_db_connection() as conn:
+        df_tc = pd.read_sql("SELECT fecha, pnl_usd, monto_invertido FROM trades_cerrados WHERE user_id = %s ORDER BY fecha ASC;", conn, params=(user_id,))
+        df_inv = pd.read_sql("SELECT fecha, monto_total_usd FROM portafolio_inversiones WHERE user_id = %s ORDER BY fecha ASC;", conn, params=(user_id,))
+
+    if not df_tc.empty:
+        primera_fecha = df_tc['fecha'].min().strftime('%Y-%m-%d')
+    elif not df_inv.empty:
+        primera_fecha = df_inv['fecha'].min().strftime('%Y-%m-%d')
+
+    fecha_start, desc = resolver_fecha_inicio(periodo, primera_fecha)
+    start_dt = pd.to_datetime(fecha_start)
+
+    pnl_realizado = 0.0
+    if not df_tc.empty:
+        df_tc["fecha"] = pd.to_datetime(df_tc["fecha"])
+        sub = df_tc.loc[df_tc["fecha"] >= start_dt]
+        pnl_realizado = float(sub["pnl_usd"].sum()) if not sub.empty else 0.0
+
+    resumen = obtener_resumen_portafolio(user_id)
+    pnl_flot = float(resumen["pnl_total_usd"]) if resumen else 0.0
+    cap_abierto = float(resumen["total_invertido"]) if resumen else 0.0
+    valor_actual = float(resumen["total_actual"]) if resumen else 0.0
+    pnl_total = pnl_realizado + pnl_flot
+
+    cap_tc_pico = float(df_tc['monto_invertido'].max()) if not df_tc.empty and 'monto_invertido' in df_tc and pd.notnull(df_tc['monto_invertido'].max()) else 2000.0
+    capital_ref = max(cap_abierto, cap_tc_pico, 2500.0)
+
+    ret_pct = (pnl_total / capital_ref * 100.0) if capital_ref > 0 else 0.0
+
+    dias = max(1, (hoy - start_dt.to_pydatetime()).days)
+    años = dias / 365.25
+    base_cagr = 1.0 + (pnl_total / capital_ref) if capital_ref > 0 else 1.0
+    if años > 0 and np.isfinite(base_cagr) and base_cagr > 0:
+        cagr = (base_cagr ** (1 / años) - 1) * 100.0
+    else:
+        cagr = ret_pct
+    if not np.isfinite(ret_pct):
+        ret_pct = 0.0
+    if not np.isfinite(cagr):
+        cagr = ret_pct
+
+    spy_ret = _serie_spy_ret(fecha_start)
+    spy_pct = (spy_ret * 100.0) if spy_ret is not None and np.isfinite(spy_ret) else None
+    alpha = (ret_pct - spy_pct) if spy_pct is not None else None
+
+    lineas = [
+        f"📈 RENDIMIENTO — {desc}",
+        "",
+        f"• Retorno de cartera: {ret_pct:+.2f}%",
+        f"• CAGR aprox.: {cagr:+.2f}%",
+    ]
+    if spy_pct is not None:
+        signo_alpha = "+" if alpha >= 0 else ""
+        lineas.append(f"• SPY (Benchmark): {spy_pct:+.2f}%")
+        lineas.append(f"• Alpha vs SPY: {signo_alpha}{alpha:.2f} pp")
+    else:
+        lineas.append("• SPY: sin dato válido en este período")
+
+    lineas.extend([
+        "",
+        f"• PnL realizado en el período: ${pnl_realizado:+,.2f} USD",
+        f"• PnL flotante actual: ${pnl_flot:+,.2f} USD",
+        f"• PnL total (realizado + flotante): ${pnl_total:+,.2f} USD",
+        f"• Capital abierto ahora: ${cap_abierto:,.2f} USD",
+        f"• Capital base de referencia: ${capital_ref:,.2f} USD",
+        f"• Valor actual abierto: ${valor_actual:,.2f} USD",
+        "",
+        "Nota: el cálculo porcentual pondera el PnL neto del período contra la base de capital de la cuenta, manteniendo consistencia total con la curva gráfica."
+    ])
+    return "\n".join(lineas)
+
+def resumen_compacto_para_ia(user_id: int) -> str:
+    resumen = obtener_resumen_portafolio(user_id)
+    with get_db_connection() as conn:
+        df_tc = pd.read_sql(
+            "SELECT COUNT(*) AS n, COALESCE(SUM(pnl_usd),0) AS pnl FROM trades_cerrados WHERE user_id = %s;",
+            conn, params=(user_id,),
+        )
+        df_mov = pd.read_sql(
+            "SELECT tipo, COUNT(*) n, COALESCE(SUM(monto),0) tot FROM movimientos WHERE user_id = %s GROUP BY tipo;",
+            conn, params=(user_id,),
+        )
+        df_ids = pd.read_sql(
+            "SELECT id, ticker, tipo_posicion, apalancamiento, monto_total_usd FROM portafolio_inversiones WHERE user_id = %s ORDER BY id DESC LIMIT 12;",
+            conn, params=(user_id,),
+        )
+        df_last_mov = pd.read_sql(
+            "SELECT fecha, tipo, monto, categoria, descripcion FROM movimientos WHERE user_id = %s ORDER BY fecha DESC LIMIT 5;",
+            conn, params=(user_id,)
+        )
+    n_tc = int(df_tc["n"].iloc[0]) if not df_tc.empty else 0
+    pnl_tc = float(df_tc["pnl"].iloc[0]) if not df_tc.empty else 0.0
+    lineas = [
+        f"Trades cerrados: {n_tc} | PnL realizado ${pnl_tc:+,.2f} USD",
+    ]
+    if resumen:
+        lineas.append(
+            f"Abiertas: {len(resumen['posiciones'])} | Capital ${resumen['total_invertido']:,.2f} | Valor ${resumen['total_actual']:,.2f} | Flotante ${resumen['pnl_total_usd']:+,.2f}"
+        )
+        for p in resumen["posiciones"][:10]:
+            lineas.append(
+                f"ID {p['id']} {p['ticker']} {p['tipo_pos']} {p['lev']:.0f}x margen ${p['costo_margen']:,.0f} PPC ${p['ppc']:,.2f} Spot ${p['spot']:,.2f} PnL {p['pnl_usd']:+.0f}"
+            )
+    elif not df_ids.empty:
+        for _, r in df_ids.iterrows():
+            lineas.append(f"ID {int(r['id'])} {r['ticker']} {r['tipo_posicion']} ${float(r['monto_total_usd']):,.0f}")
+    if not df_mov.empty:
+        for _, r in df_mov.iterrows():
+            lineas.append(f"Movimientos {r['tipo']}: {int(r['n'])} / ${float(r['tot']):,.0f} ARS")
+    if not df_last_mov.empty:
+        lineas.append("Últimos gastos/ingresos:")
+        for _, m in df_last_mov.iterrows():
+            lineas.append(f"  {m['tipo']} ${float(m['monto']):,.0f} ARS en {m['categoria']} ({m['descripcion']})")
+    return "\n".join(lineas)
+
+def llamar_gemini(prompt: str, system_instruction: str) -> str:
+    response = ai_client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
+        config={"system_instruction": system_instruction},
+    )
+    return response.text or ""
+
+# ==================== PRESUPUESTOS ====================
+def set_presupuesto(user_id: int, categoria: str, monto_limite: float, mes: int = None, anio: int = None):
+    ahora = ahora_argentina()
+    mes = mes or ahora.month
+    anio = anio or ahora.year
+    categoria = categoria.strip().capitalize()
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                INSERT INTO presupuestos (user_id, categoria, monto_limite, mes, anio)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (user_id, categoria, mes, anio)
+                DO UPDATE SET monto_limite = EXCLUDED.monto_limite;
+            """, (user_id, categoria, float(monto_limite), mes, anio))
+            conn.commit()
+    return categoria, monto_limite, mes, anio
+
+def obtener_progreso_presupuestos(user_id: int, mes: int = None, anio: int = None):
+    ahora = ahora_argentina()
+    mes = mes or ahora.month
+    anio = anio or ahora.year
+
+    with get_db_connection() as conn:
+        df_pres = pd.read_sql(
+            "SELECT categoria, monto_limite FROM presupuestos WHERE user_id = %s AND mes = %s AND anio = %s;",
+            conn, params=(user_id, mes, anio)
+        )
+        df_gastos = pd.read_sql(
+            """SELECT categoria, SUM(monto) as gastado 
+               FROM movimientos 
+               WHERE user_id = %s AND tipo = 'GASTO' 
+               AND EXTRACT(MONTH FROM fecha) = %s AND EXTRACT(YEAR FROM fecha) = %s
+               GROUP BY categoria;""",
+            conn, params=(user_id, mes, anio)
+        )
+
+    if df_pres.empty:
+        return None, "No tenés presupuestos cargados para este mes. Decime por ejemplo: 'Presupuesto Comida 180000'"
+
+    gastos_dict = dict(zip(df_gastos['categoria'], df_gastos['gastado'])) if not df_gastos.empty else {}
+    lineas = [f"📅 PRESUPUESTOS — {mes:02d}/{anio}"]
+    lineas.append("")
+    total_limite = 0.0
+    total_gastado = 0.0
+
+    for _, row in df_pres.iterrows():
+        cat = row['categoria']
+        limite = float(row['monto_limite'])
+        gastado = float(gastos_dict.get(cat, 0.0))
+        pct = (gastado / limite * 100) if limite > 0 else 0.0
+        restante = limite - gastado
+        emoji = "🟢" if pct < 70 else ("🟡" if pct < 95 else "🔴")
+        barra = "▰" * int(min(pct, 100) // 10) + "▱" * (10 - int(min(pct, 100) // 10))
+        lineas.append(f"{emoji} {cat}")
+        lineas.append(f"   {barra} {pct:.0f}%")
+        lineas.append(f"   Gastado: ${gastado:,.0f} / ${limite:,.0f}  →  Resta: ${restante:,.0f}")
+        lineas.append("")
+        total_limite += limite
+        total_gastado += gastado
+
+    pct_total = (total_gastado / total_limite * 100) if total_limite > 0 else 0.0
+    lineas.append(f"📦 Total del mes: ${total_gastado:,.0f} / ${total_limite:,.0f} ({pct_total:.0f}%)")
+    return "\n".join(lineas), None
+
+# ==================== OBJETIVOS FINANCIEROS ====================
+def crear_objetivo(user_id: int, descripcion: str, tipo: str, monto_objetivo: float, fecha_limite: str = None):
+    tipo = tipo.strip().upper() if tipo else "CAPITAL"
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """INSERT INTO objetivos (user_id, descripcion, tipo, monto_objetivo, fecha_limite)
+                   VALUES (%s, %s, %s, %s, %s) RETURNING id;""",
+                (user_id, descripcion, tipo, float(monto_objetivo), fecha_limite)
+            )
+            oid = cursor.fetchone()[0]
+            conn.commit()
+            return oid
+
+def obtener_progreso_objetivos(user_id: int):
+    with get_db_connection() as conn:
+        df = pd.read_sql(
+            "SELECT id, descripcion, tipo, monto_objetivo, fecha_limite FROM objetivos WHERE user_id = %s AND activo = TRUE ORDER BY fecha_creacion;",
+            conn, params=(user_id,)
+        )
+    if df.empty:
+        return "No tenés objetivos activos. Podés crear uno diciendo por ejemplo:\n• 'Quiero llegar a 5000 usd de capital'\n• 'Objetivo: ganar 1000 usd este año'"
+
+    resumen = obtener_resumen_portafolio(user_id)
+    capital_actual = float(resumen['total_actual']) if (resumen and pd.notnull(resumen.get('total_actual')) and not np.isnan(resumen.get('total_actual'))) else 0.0
+
+    with get_db_connection() as conn:
+        df_tc = pd.read_sql("SELECT COALESCE(SUM(pnl_usd), 0) as pnl FROM trades_cerrados WHERE user_id = %s;", conn, params=(user_id,))
+    pnl_realizado = float(df_tc['pnl'].iloc[0]) if (not df_tc.empty and pd.notnull(df_tc['pnl'].iloc[0]) and not np.isnan(df_tc['pnl'].iloc[0])) else 0.0
+
+    lineas = ["🎯 TUS OBJETIVOS FINANCIEROS", ""]
+    for _, row in df.iterrows():
+        oid = int(row['id'])
+        desc = row['descripcion']
+        tipo = str(row['tipo']).strip().upper() if pd.notnull(row['tipo']) else "CAPITAL"
+        objetivo = float(row['monto_objetivo']) if (pd.notnull(row['monto_objetivo']) and float(row['monto_objetivo']) > 0) else 1.0
+        f_lim = row['fecha_limite'].strftime('%Y-%m-%d') if pd.notnull(row['fecha_limite']) else "Sin fecha"
+
+        if tipo in ["PNL", "GANANCIA", "TRADES"]:
+            actual = pnl_realizado
+        else:
+            actual = capital_actual
+
+        if actual is None or np.isnan(actual):
+            actual = 0.0
+
+        pct = (actual / objetivo * 100) if objetivo > 0 else 0.0
+        if np.isnan(pct):
+            pct = 0.0
+        pct_clamped = max(0.0, min(100.0, pct))
+
+        emoji = "🟢" if pct_clamped >= 100 else ("🟡" if pct_clamped >= 50 else "🔵")
+        bloques_llenos = int(round(pct_clamped / 10))
+        bloques_vacios = 10 - bloques_llenos
+        barra = "▰" * bloques_llenos + "▱" * bloques_vacios
+
+        lineas.append(f"{emoji} {desc}")
+        lineas.append(f"   {barra} {pct:.1f}%")
+        lineas.append(f"   Actual: ${actual:,.2f} / Objetivo: ${objetivo:,.2f}")
+        lineas.append(f"   Fecha límite: {f_lim}  (ID {oid})")
+        lineas.append("")
+
+    return "\n".join(lineas)
+
+def desactivar_objetivo(user_id: int, oid: int):
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("UPDATE objetivos SET activo = FALSE WHERE id = %s AND user_id = %s;", (oid, user_id))
+            conn.commit()
+
+# ==================== SISTEMA DE ALERTAS INTELIGENTE ====================
 def _hash_alerta(tipo: str, clave: str, detalle: str = "") -> str:
     raw = f"{tipo}|{clave}|{detalle}"
     return hashlib.sha256(raw.encode()).hexdigest()[:32]
@@ -1897,6 +2128,7 @@ def registrar_alerta_enviada(user_id: int, tipo: str, clave: str, hash_a: str):
 
 def generar_alertas_para_usuario(user_id: int) -> list:
     alertas = []
+
     resumen = obtener_resumen_portafolio(user_id)
     if resumen:
         for p in resumen["posiciones"]:
@@ -1906,7 +2138,7 @@ def generar_alertas_para_usuario(user_id: int) -> list:
                 h = _hash_alerta("liquidacion", clave, "")
                 if not alerta_ya_enviada(user_id, h, horas_ventana=12):
                     alertas.append({
-                        "texto": f"⚠️ *LIQUIDACIÓN CERCANA*\n{p['ticker']} [{p['tipo_pos']} {p['lev']:.0f}x]\nDistancia actual: {dist:.1f}%\nPrecio liq: ${p['precio_liq']:,.2f} | Spot: ${p['spot']:,.2f}",
+                        "texto": f"⚠️ LIQUIDACIÓN CERCANA\n{p['ticker']} [{p['tipo_pos']} {p['lev']:.0f}x]\nDistancia actual: {dist:.1f}%\nPrecio liq: ${p['precio_liq']:,.2f} | Spot: ${p['spot']:,.2f}",
                         "tipo": "liquidacion",
                         "clave": clave,
                         "hash": h
@@ -1930,7 +2162,7 @@ def generar_alertas_para_usuario(user_id: int) -> list:
                         h = _hash_alerta("poc_test", clave, "")
                         if not alerta_ya_enviada(user_id, h, horas_ventana=24):
                             alertas.append({
-                                "texto": f"🎯 *TESTEO DE POC INSTITUCIONAL*\n{tk} está testeando su POC de volumen en ${poc:,.2f} (Precio: ${p_act:,.2f}). Zona de alta reacción.",
+                                "texto": f"🎯 TESTEO DE POC INSTITUCIONAL\n{tk} está testeando su POC de volumen en ${poc:,.2f} (Precio: ${p_act:,.2f}). Zona de alta reacción.",
                                 "tipo": "poc_test",
                                 "clave": clave,
                                 "hash": h
@@ -1941,7 +2173,7 @@ def generar_alertas_para_usuario(user_id: int) -> list:
                         h = _hash_alerta("choch", clave, "")
                         if not alerta_ya_enviada(user_id, h, horas_ventana=24):
                             alertas.append({
-                                "texto": f"🟢 *CAMBIO DE ESTRUCTURA*\n{tk} rompió un techo/máximo importante en ${p_act:,.2f}. Es posible un cambio a tendencia alcista.",
+                                "texto": f"🟢 CAMBIO DE ESTRUCTURA\n{tk} rompió un techo/máximo importante en ${p_act:,.2f}. Es posible un cambio a tendencia alcista.",
                                 "tipo": "choch",
                                 "clave": clave,
                                 "hash": h
@@ -1951,7 +2183,7 @@ def generar_alertas_para_usuario(user_id: int) -> list:
                         h = _hash_alerta("choch", clave, "")
                         if not alerta_ya_enviada(user_id, h, horas_ventana=24):
                             alertas.append({
-                                "texto": f"🔴 *CAMBIO DE ESTRUCTURA*\n{tk} rompió un piso/mínimo importante en ${p_act:,.2f}. Es posible un cambio a tendencia bajista.",
+                                "texto": f"🔴 CAMBIO DE ESTRUCTURA\n{tk} rompió un piso/mínimo importante en ${p_act:,.2f}. Es posible un cambio a tendencia bajista.",
                                 "tipo": "choch",
                                 "clave": clave,
                                 "hash": h
@@ -1980,13 +2212,16 @@ def generar_alertas_para_usuario(user_id: int) -> list:
                                 h3m = d.get('3 meses')
                                 h1y = d.get('1 año')
                                 lineas_stat = []
-                                if h15: lineas_stat.append(f"15d: {h15['win_rate']:.0f}% WR ({h15['avg_ret']:+.1f}%)")
-                                if h3m: lineas_stat.append(f"3m: {h3m['win_rate']:.0f}% WR ({h3m['avg_ret']:+.1f}%)")
-                                if h1y: lineas_stat.append(f"1a: {h1y['win_rate']:.0f}% WR ({h1y['avg_ret']:+.1f}%)")
+                                if h15:
+                                    lineas_stat.append(f"15d: {h15['win_rate']:.0f}% WR ({h15['avg_ret']:+.1f}%)")
+                                if h3m:
+                                    lineas_stat.append(f"3m: {h3m['win_rate']:.0f}% WR ({h3m['avg_ret']:+.1f}%)")
+                                if h1y:
+                                    lineas_stat.append(f"1a: {h1y['win_rate']:.0f}% WR ({h1y['avg_ret']:+.1f}%)")
                                 extra_stat = "\n📊 Histórico: " + " | ".join(lineas_stat)
 
                             alertas.append({
-                                "texto": f"📡 *SEÑAL TÉCNICA (Diario)*\n{tk} — RSI {rsi:.1f}\n{diag}{extra_stat}",
+                                "texto": f"📡 SEÑAL TÉCNICA (Diario)\n{tk} — RSI {rsi:.1f}\n{diag}{extra_stat}",
                                 "tipo": "rsi_senal",
                                 "clave": clave,
                                 "hash": h
@@ -1996,8 +2231,22 @@ def generar_alertas_para_usuario(user_id: int) -> list:
 
     try:
         with get_db_connection() as conn:
-            df_hoy = pd.read_sql("SELECT SUM(monto) as total FROM movimientos WHERE user_id = %s AND tipo = 'GASTO' AND fecha::date = CURRENT_DATE;", conn, params=(user_id,))
-            df_prom = pd.read_sql("""SELECT AVG(diario) as promedio FROM (SELECT fecha::date as d, SUM(monto) as diario FROM movimientos WHERE user_id = %s AND tipo = 'GASTO' AND fecha > NOW() - INTERVAL '30 days' GROUP BY fecha::date) t;""", conn, params=(user_id,))
+            df_hoy = pd.read_sql(
+                """SELECT SUM(monto) as total FROM movimientos 
+                   WHERE user_id = %s AND tipo = 'GASTO' 
+                   AND fecha::date = CURRENT_DATE;""",
+                conn, params=(user_id,)
+            )
+            df_prom = pd.read_sql(
+                """SELECT AVG(diario) as promedio FROM (
+                     SELECT fecha::date as d, SUM(monto) as diario 
+                     FROM movimientos 
+                     WHERE user_id = %s AND tipo = 'GASTO' 
+                     AND fecha > NOW() - INTERVAL '30 days'
+                     GROUP BY fecha::date
+                   ) t;""",
+                conn, params=(user_id,)
+            )
         total_hoy = float(df_hoy['total'].iloc[0]) if not df_hoy.empty and pd.notnull(df_hoy['total'].iloc[0]) else 0.0
         prom = float(df_prom['promedio'].iloc[0]) if not df_prom.empty and pd.notnull(df_prom['promedio'].iloc[0]) else 0.0
         if prom > 0 and total_hoy > prom * UMBRAL_GASTO_INUSUAL:
@@ -2005,7 +2254,7 @@ def generar_alertas_para_usuario(user_id: int) -> list:
             h = _hash_alerta("gasto_inusual", clave, "")
             if not alerta_ya_enviada(user_id, h, horas_ventana=20):
                 alertas.append({
-                    "texto": f"💸 *GASTO INUSUAL HOY*\nGastaste ${total_hoy:,.0f} ARS\nPromedio diario (30d): ${prom:,.0f} ARS\n({total_hoy/prom:.1f}x el promedio)",
+                    "texto": f"💸 GASTO INUSUAL HOY\nGastaste ${total_hoy:,.0f} ARS\nPromedio diario (30d): ${prom:,.0f} ARS\n({total_hoy/prom:.1f}x el promedio)",
                     "tipo": "gasto_inusual",
                     "clave": clave,
                     "hash": h
@@ -2015,36 +2264,382 @@ def generar_alertas_para_usuario(user_id: int) -> list:
 
     return alertas
 
-async def tarea_alertas_whatsapp():
+async def tarea_alertas_periodicas(app):
     await asyncio.sleep(60)
     while True:
         try:
-            if en_horario_alertas() and MI_NUMERO_WHATSAPP:
-                alertas = await asyncio.to_thread(generar_alertas_para_usuario, LUCHO_USER_ID)
-                if alertas:
-                    mensajes = ["🔔 *ALERTAS DE TU CARTERA*\n"]
-                    for a in alertas:
-                        mensajes.append(a["texto"])
-                        mensajes.append("")
-                        await asyncio.to_thread(registrar_alerta_enviada, LUCHO_USER_ID, a["tipo"], a["clave"], a["hash"])
-                    texto_final = "\n".join(mensajes).strip()
-                    enviar_mensaje_whatsapp(MI_NUMERO_WHATSAPP, texto_final)
+            if en_horario_alertas():
+                def _obtener_usuarios():
+                    with get_db_connection() as conn:
+                        with conn.cursor() as cursor:
+                            cursor.execute("""
+                                SELECT DISTINCT user_id FROM (
+                                    SELECT user_id FROM portafolio_inversiones
+                                    UNION
+                                    SELECT user_id FROM movimientos
+                                    UNION
+                                    SELECT user_id FROM trades_cerrados
+                                ) u WHERE user_id IS NOT NULL;
+                            """)
+                            return [r[0] for r in cursor.fetchall()]
+
+                usuarios = await asyncio.to_thread(_obtener_usuarios)
+
+                for uid in usuarios:
+                    alertas = await asyncio.to_thread(generar_alertas_para_usuario, uid)
+                    if alertas:
+                        mensajes = ["🔔 ALERTAS DE TU CARTERA\n"]
+                        for a in alertas:
+                            mensajes.append(a["texto"])
+                            mensajes.append("")
+                            await asyncio.to_thread(registrar_alerta_enviada, uid, a["tipo"], a["clave"], a["hash"])
+                        texto_final = "\n".join(mensajes).strip()
+                        try:
+                            await app.bot.send_message(chat_id=uid, text=texto_final)
+                            logger.info(f"Alertas enviadas a user {uid}: {len(alertas)}")
+                        except Exception as e:
+                            logger.error(f"No se pudo enviar alerta a {uid}: {e}")
+            else:
+                logger.info("Fuera de horario de alertas, se omite ciclo.")
         except Exception as e:
-            logger.error(f"Error en tarea de alertas WhatsApp: {e}")
+            logger.error(f"Error en tarea de alertas: {e}", exc_info=True)
+
         await asyncio.sleep(ALERTA_INTERVALO_HORAS * 3600)
 
-# ==================== ENRUTADOR PRINCIPAL ====================
-async def procesar_mensaje_whatsapp(sender_phone: str, user_msg: str):
-    user_id = LUCHO_USER_ID
+# ==================== SYSTEM INSTRUCTION PARA IA ====================
+SYSTEM_INSTRUCTION = """
+Eres el copiloto y asesor financiero institucional del usuario.
+Tienes acceso al CONTEXTO COMPACTO de sus finanzas (posiciones abiertas, trades cerrados, gastos e ingresos en ARS).
+
+REGLAS DE ACTUACIÓN:
+1. SI EL USUARIO PIDE UN GRÁFICO, RENDIMIENTO O MÉTRICA COMPLEJA:
+   No calcules números pesados ni inventes cifras. Derívalo directamente al script de Python emitiendo en una línea:
+   COMANDO: [comando_correspondiente]
+   
+   Comandos del sistema:
+   - COMANDO: /gastos (radiografía completa de finanzas, promedios mensuales, ahorro y gastos hormiga)
+   - COMANDO: /spy [periodo] (comparativa con S&P 500: ytd, todo, 3m, 6m, 1y)
+   - COMANDO: /grafico [periodo] (curva USD)
+   - COMANDO: /activos [tickers] [periodo] (comparativa base 100)
+   - COMANDO: /analisis [TICKER] [timeframe] (análisis técnico algorítmico)
+   - COMANDO: /resumen (balance de posiciones abiertas y PnL)
+   - COMANDO: /riesgo (métricas institucionales de trading y riesgo)
+   - COMANDO: /mes (presupuestos del mes)
+   - COMANDO: /objetivos (metas de ahorro/capital)
+   - COMANDO: /precio [TICKER] (cotización en vivo)
+   - COMANDO: /excel (descargar planilla)
+
+2. SI EL USUARIO REGISTRA O MODIFICA:
+   - Registro Gasto/Ingreso ARS: REGISTRO_ARS: [TIPO]|[MONTO]|[CATEGORIA]|[DESCRIPCION]|[FECHA]
+   - Registro Inversión abierta: REGISTRO_INV: [TICKER]|[MARGEN]|[PPC]|[CANTIDAD]|[FECHA]|[TIPO_POS]|[LEV]|[LIQ]
+   - Registro Trade cerrado: REGISTRO_TRADE_CERRADO: [TICKER]|[PNL]|[TIPO_POS]|[ROI]|[MONTO]|[DESC]|[FECHA]
+   - Cerrar posición abierta: ACCION: CERRAR_POSICION|[ID]|[PNL_MANUAL]|[PRECIO_SALIDA]
+   - Agregar margen: ACCION: AGREGAR_MARGEN|[ID]|[MONTO_EXTRA]
+   - Borrados: ACCION: BORRAR_INVERSION_ID|[ID] / ACCION: BORRAR_MOVIMIENTO_ID|[ID] / ACCION: BORRAR_ULTIMO
+
+3. SI EL USUARIO PREGUNTA COSAS ESPECÍFICAS DE SU CARTERA O HISTORIAL:
+   (Ej: "¿a qué precio compré MELI?", "¿cuánto gané en Bitcoin?", "¿cuál fue mi último gasto?"):
+   Respóndele con precisión y de forma concisa usando los datos del CONTEXTO DEL USUARIO.
+"""
+
+# ==================== COMANDOS RÁPIDOS ====================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 ¡Hola! Soy tu copiloto financiero cuantitativo.\n\n"
+        "📈 Trading e Inversiones (0 tokens)\n"
+        "• /spy        →  Rendimiento % vs S&P 500\n"
+        "• /spy todo   →  Rendimiento % vs SPY desde el inicio\n"
+        "• /grafico    →  Curva de PnL en USD\n"
+        "• /activos    →  Comparativa relativa de activos\n"
+        "• /analisis   →  Análisis técnico algorítmico\n"
+        "• /riesgo     →  Drawdown, Win Rate, Expectancy\n"
+        "• /resumen    →  Balance consolidado de cartera\n\n"
+        "💵 Finanzas Personales (ARS)\n"
+        "• /gastos     →  Promedios mensuales, Tasa de Ahorro y Gastos Hormiga\n"
+        "• /mes        →  Presupuestos y control del mes\n"
+        "• /objetivos  →  Progreso de metas financieras\n"
+        "• /excel      →  Exportar planilla completa\n\n"
+        "También podés hablarme en lenguaje natural."
+    )
+
+def extraer_periodo(texto: str) -> str:
+    tlow = (texto or "").lower()
+    if re.search(r"\b(todo|max|historico|histórico|desde el inicio|desde siempre|total)\b", tlow):
+        return "todo"
+    for key in ["ytd", "mtd", "wtd", "1y", "1a", "3m", "6m", "1m", "2m", "2y", "3y", "5y"]:
+        if re.search(r"\b" + re.escape(key) + r"\b", tlow):
+            return key
+    m = re.search(r"(\d+)\s*(mes|meses|dia|dias|año|anos|ano|años)", tlow)
+    if m:
+        return m.group(0)
+    if "este año" in tlow or "este ano" in tlow:
+        return "ytd"
+    return ""
+
+async def enviar_grafico_cartera(update: Update, user_id: int, periodo: str = "", modo: str = "usd"):
+    buf = generar_grafico_evolucion_cartera_consolidada(user_id, periodo, modo=modo)
+    if buf:
+        if modo in ("pct", "percent", "%", "spy"):
+            cap = f"📊 Cartera vs SPY en % ({periodo or 'histórico'})"
+        else:
+            cap = f"📈 Cartera en USD ({periodo or 'histórico'}) — PnL del período"
+        await update.message.reply_photo(photo=buf, caption=cap)
+    else:
+        await update.message.reply_text("No hay datos suficientes para la curva.")
+
+async def enviar_grafico_activos(update: Update, user_id: int, periodo: str = "", tickers=None):
+    buf = generar_grafico_evolucion_por_activos(user_id, periodo, tickers)
+    if buf:
+        extra = f" ({', '.join(tickers)})" if tickers else ""
+        await update.message.reply_photo(photo=buf, caption=f"📊 Rendimiento relativo base 100{extra}")
+    else:
+        await update.message.reply_text("No hay suficientes activos que coincidan.")
+
+async def intentar_comando_local(update: Update, user_id: int, user_msg: str) -> bool:
+    raw = (user_msg or "").strip()
+    low = raw.lower().strip()
+    if low.startswith("/"):
+        low = low[1:]
+        raw = raw[1:] if raw.startswith("/") else raw
+
+    partes = raw.split()
+    cmd = partes[0].lower() if partes else ""
+    args = " ".join(partes[1:]) if len(partes) > 1 else ""
+    periodo = extraer_periodo(raw)
+
+    if cmd in ("help", "ayuda", "comandos"):
+        await start(update, None)
+        return True
+    if cmd in ("resumen", "cartera", "balance"):
+        await cmd_resumen(update, None)
+        return True
+    if cmd in ("gastos", "finanzas", "hormiga", "promedios") or re.search(r"\b(gasto(s)? hormiga|promedio(s)? de gasto(s)?|radiograf[ií]a)\b", low):
+        await update.message.reply_text(calcular_metricas_finanzas_completas(user_id))
+        return True
+    if cmd in ("ytd", "rendimiento"):
+        await update.message.reply_text(calcular_rendimiento_periodo(user_id, periodo or "ytd"))
+        return True
+    if cmd in ("cagr", "alpha"):
+        per = periodo or "ytd"
+        await update.message.reply_text(calcular_rendimiento_periodo(user_id, per))
+        return True
+    if cmd in ("spy", "benchmark"):
+        await enviar_grafico_cartera(update, user_id, periodo or "ytd", modo="pct")
+        await update.message.reply_text(calcular_rendimiento_periodo(user_id, periodo or "ytd"))
+        return True
+    if cmd in ("grafico", "gráfico", "curva", "evolucion", "evolución"):
+        if re.search(r"activo", low):
+            tks = [x.strip().upper() for x in re.split(r"[\s,]+", args) if x.strip() and x.lower() not in ("ytd","mtd","1y","3m","6m","1m","todo")]
+            tks = [x for x in tks if re.match(r"^[A-Z0-9]{1,12}$", x)]
+            await enviar_grafico_activos(update, user_id, periodo, tks or None)
+        elif re.search(r"spy|%|porcent", low):
+            await enviar_grafico_cartera(update, user_id, periodo or "ytd", modo="pct")
+        else:
+            await enviar_grafico_cartera(update, user_id, periodo, modo="usd")
+        return True
+    if cmd in ("activos", "comparar"):
+        tks = [x.strip().upper() for x in re.split(r"[\s,]+", args) if x.strip()]
+        tks = [x for x in tks if re.match(r"^[A-Z0-9]{1,12}$", x) and x.lower() not in ("YTD", "TODO")]
+        await enviar_grafico_activos(update, user_id, periodo, tks or None)
+        return True
+    if cmd in ("precio", "coti", "cotizacion", "cotización"):
+        tk = args.split()[0].upper() if args else ""
+        if not tk:
+            await update.message.reply_text("Usá: /precio BTC")
+            return True
+        datos = consultar_datos_mercado(tk)
+        if not datos:
+            await update.message.reply_text(f"No encontré precio para {tk}.")
+            return True
+        signo = "+" if datos["var_pct"] >= 0 else ""
+        em = "🟢" if datos["var_pct"] >= 0 else "🔴"
+        await update.message.reply_text(
+            f"📈 {datos['ticker']}\n• ${datos['precio']:,.2f}  {em} {signo}{datos['var_pct']:.2f}%"
+        )
+        return True
+    if cmd == "excel":
+        excel_buf = generar_excel_completo(user_id)
+        if excel_buf:
+            await update.message.reply_document(document=excel_buf, filename="Finanzas_Consolidadas.xlsx")
+        else:
+            await update.message.reply_text("No hay datos para exportar.")
+        return True
+    if cmd == "torta":
+        buf = generar_grafico_distribucion_inversiones(user_id)
+        if buf:
+            await update.message.reply_photo(photo=buf, caption="Distribución abierta")
+        return True
+    if cmd in ("analisis", "análisis", "at", "tecnico", "técnico"):
+        tk = ""
+        tf_at = "diario"
+        if "4h" in low:
+            tf_at = "4h"
+        elif "sem" in low:
+            tf_at = "semanal"
+        for tok in args.split():
+            u = tok.upper().replace(",", "")
+            if u in ("DIARIO", "SEMANAL", "4H", "FIBO", "FIBONACCI"):
+                continue
+            if re.match(r"^[A-Z0-9]{1,12}$", u):
+                tk = u
+                break
+        if not tk:
+            await update.message.reply_text("Usá: /analisis BTC  o  /analisis MELI semanal")
+            return True
+        con_fibo = "fibo" in low
+        buf_img, info_at = generar_grafico_analisis_tecnico(tk, tf_at, con_fibo, con_fibo)
+        if buf_img and info_at and not isinstance(info_at, str):
+            await update.message.reply_photo(photo=buf_img, caption=f"📈 {tk} ({tf_at}) POC + Pivots + RSI")
+            await update.message.reply_text(formatear_reporte_tecnico(info_at))
+        else:
+            await update.message.reply_text(f"No pude analizar {tk}.")
+        return True
+
+    m_an = re.match(r"^(?:(?:analiza(?:me)?|an[aá]lisis(?:\s+t[eé]cnico)?|c[oó]mo\s+ves|at)\s+)?([a-zA-Z0-9]{2,10})(?:\s+(diario|semanal|4h))?$", low)
+    if m_an:
+        posible_tk = m_an.group(1).upper()
+        palabras_comunes = {"HOLA", "BUENAS", "GRACIAS", "OK", "RESET", "AYUDA", "MES", "GASTOS", "RESUMEN", "CARTERA", "OBJETIVOS", "RIESGO", "FINANZAS", "HORMIGA"}
+        if posible_tk not in palabras_comunes and not posible_tk.isdigit():
+            tk = posible_tk
+            tf_at = m_an.group(2) or "diario"
+            con_fibo = "fibo" in low
+            buf_img, info_at = generar_grafico_analisis_tecnico(tk, tf_at, con_fibo, con_fibo)
+            if buf_img and info_at and not isinstance(info_at, str):
+                await update.message.reply_photo(photo=buf_img, caption=f"📈 {tk} ({tf_at}) POC + Pivots + RSI")
+                await update.message.reply_text(formatear_reporte_tecnico(info_at))
+            else:
+                await update.message.reply_text(f"No pude analizar {tk}.")
+            return True
+
+    if re.search(r"\b(ytd|year to date|este año|este ano)\b", low) and not re.search(r"registr|anot|guarde|gan[eé]|gast[eé]", low):
+        if re.search(r"graf|curva|evoluc|vs|spy", low):
+            await enviar_grafico_cartera(update, user_id, "ytd", modo="pct")
+        await update.message.reply_text(calcular_rendimiento_periodo(user_id, "ytd"))
+        return True
+    if re.search(r"\b(cagr|alpha)\b", low):
+        await update.message.reply_text(calcular_rendimiento_periodo(user_id, periodo or "ytd"))
+        return True
+    if re.search(r"(vs\s*spy|contra el spy|compar(a|ame|ar).*spy|benchmark)", low):
+        await enviar_grafico_cartera(update, user_id, periodo or "ytd", modo="pct")
+        await update.message.reply_text(calcular_rendimiento_periodo(user_id, periodo or "ytd"))
+        return True
+    if re.search(r"(grafico|gráfico|curva|evoluci[oó]n).*(cartera|consolidat|total)", low) or low in ("grafico", "gráfico", "curva cartera"):
+        await enviar_grafico_cartera(update, user_id, periodo)
+        return True
+    if re.search(r"(grafico|gráfico|curva|evoluci[oó]n|compar).*(activo|activos|meli|nvda|ggal)", low):
+        tks = re.findall(r"\b(MELI|NU|GGAL|SUPV|NVDA|BTC|SOL|ETH|MSFT|META|YPF|VIST|AAPL|AMD|TSLA|NEXO)\b", raw, re.I)
+        await enviar_grafico_activos(update, user_id, periodo, [x.upper() for x in tks] or None)
+        return True
+    if re.search(r"^(c[oó]mo viene(n)? mi(s)? (cartera|posiciones)|estado de (la )?cartera)$", low):
+        await cmd_resumen(update, None)
+        return True
+
+    return False
+
+async def cmd_borrar_todo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("DELETE FROM movimientos WHERE user_id = %s;", (user_id,))
+            cursor.execute("DELETE FROM portafolio_inversiones WHERE user_id = %s;", (user_id,))
+            cursor.execute("DELETE FROM trades_cerrados WHERE user_id = %s;", (user_id,))
+            conn.commit()
+    await update.message.reply_text("🗑️ Tu base de datos, cartera y trades cerrados han sido reseteados.")
+
+async def cmd_resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    resumen = obtener_resumen_portafolio(user_id)
+    
+    with get_db_connection() as conn:
+        df_tc = pd.read_sql("SELECT SUM(pnl_usd) as pnl_tot, COUNT(id) as total_c FROM trades_cerrados WHERE user_id = %s;", conn, params=(user_id,))
+    pnl_realizado = float(df_tc['pnl_tot'].iloc[0]) if not df_tc.empty and pd.notnull(df_tc['pnl_tot'].iloc[0]) else 0.0
+    cant_c = int(df_tc['total_c'].iloc[0]) if not df_tc.empty and pd.notnull(df_tc['total_c'].iloc[0]) else 0
+    
+    if not resumen and cant_c == 0:
+        await update.message.reply_text("📉 No tienes activos ni trades cargados todavía.")
+        return
+
+    total_inv = resumen['total_invertido'] if resumen else 0.0
+    total_act = resumen['total_actual'] if resumen else 0.0
+    pnl_flot = resumen['pnl_total_usd'] if resumen else 0.0
+    pnl_global = pnl_flot + pnl_realizado
+
+    em_flot = "🟢" if pnl_flot >= 0 else "🔴"
+    em_real = "🟢" if pnl_realizado >= 0 else "🔴"
+    em_glob = "🟢" if pnl_global >= 0 else "🔴"
+
+    msg = (
+        f"💼 ESTADO DE TU CARTERA\n\n"
+        f"• Capital abierto: ${total_inv:,.2f} USD\n"
+        f"• Valor actual: ${total_act:,.2f} USD\n"
+        f"• PnL flotante: {em_flot} {pnl_flot:+,.2f} USD\n"
+        f"• PnL realizado: {em_real} {pnl_realizado:+,.2f} USD ({cant_c} ops)\n"
+        f"• RESULTADO NETO GLOBAL: {em_glob} {pnl_global:+,.2f} USD\n"
+    )
+
+    if resumen and resumen["posiciones"]:
+        msg += "\n📊 Posiciones abiertas:\n"
+        for pos in resumen["posiciones"]:
+            pnl_s = "+" if pos["pnl_usd"] >= 0 else ""
+            em = "🟢" if pos["pnl_usd"] >= 0 else "🔴"
+            lev_tag = f"[{pos['tipo_pos']} {pos['lev']:.0f}x]" if pos['tipo_pos'] != "SPOT" else "[SPOT]"
+            dist = f" | Dist. liq: {pos['dist_liq_pct']:.1f}%" if pos.get("dist_liq_pct") is not None else ""
+            msg += (
+                f"\n▪️ ID {pos['id']}  {pos['ticker']} {lev_tag}\n"
+                f"   Margen ${pos['costo_margen']:,.0f}  |  PPC ${pos['ppc']:,.2f}  |  Spot ${pos['spot']:,.2f}\n"
+                f"   PnL {em} {pnl_s}${pos['pnl_usd']:,.2f} ({pnl_s}{pos['pnl_pct']:.1f}%){dist}"
+            )
+    await update.message.reply_text(msg)
+
+async def cmd_riesgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    metricas = calcular_metricas_riesgo_completas(user_id)
+    await update.message.reply_text(metricas["texto"])
+
+async def cmd_mes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    texto, err = obtener_progreso_presupuestos(user_id)
+    if err:
+        ahora = ahora_argentina()
+        with get_db_connection() as conn:
+            df = pd.read_sql(
+                """SELECT categoria, SUM(monto) as total FROM movimientos 
+                   WHERE user_id = %s AND tipo = 'GASTO' 
+                   AND EXTRACT(MONTH FROM fecha) = %s AND EXTRACT(YEAR FROM fecha) = %s
+                   GROUP BY categoria ORDER BY total DESC;""",
+                conn, params=(user_id, ahora.month, ahora.year)
+            )
+        if df.empty:
+            await update.message.reply_text("No hay gastos registrados este mes ni presupuestos cargados.")
+        else:
+            lineas = [f"📅 GASTOS DEL MES {ahora.month:02d}/{ahora.year}", ""]
+            total = 0.0
+            for _, r in df.iterrows():
+                lineas.append(f"• {r['categoria']}: ${float(r['total']):,.0f}")
+                total += float(r['total'])
+            lineas.append(f"\nTotal: ${total:,.0f} ARS")
+            lineas.append("\n💡 Tip: definí presupuestos diciendo 'Presupuesto Comida 180000'")
+            await update.message.reply_text("\n".join(lineas))
+    else:
+        await update.message.reply_text(texto)
+
+async def cmd_objetivos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    texto = obtener_progreso_objetivos(user_id)
+    await update.message.reply_text(texto)
+
+async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user_msg = update.message.text
 
     # 1. Filtro local ultra rápido (0 tokens)
     try:
-        if await intentar_comando_local_whatsapp(sender_phone, user_id, user_msg):
+        if await intentar_comando_local(update, user_id, user_msg):
             return
     except Exception as e:
-        logger.error(f"Error comando local WhatsApp: {e}", exc_info=True)
+        logger.error(f"Error comando local: {e}", exc_info=True)
 
-    # 2. Copiloto Cognitivo con Gemini
+    # 2. Copiloto Cognitivo + Router
     try:
         contexto = resumen_compacto_para_ia(user_id)
         prompt = f"""CONTEXTO DEL USUARIO:
@@ -2052,9 +2647,9 @@ async def procesar_mensaje_whatsapp(sender_phone: str, user_msg: str):
 
 MENSAJE DEL USUARIO:
 "{user_msg}"
-
+"""
         reply = llamar_gemini(prompt, SYSTEM_INSTRUCTION)
-
+        
         m_cmd = re.search(r"COMANDO:\s*(\S+)(?:[^\S\r\n]+([^\r\n]+))?", reply)
         cmd_para_ejecutar = None
         if m_cmd:
@@ -2080,7 +2675,7 @@ MENSAJE DEL USUARIO:
             signo_p = "+" if p >= 0 else ""
             roi_s = f" ({r:+.2f}%)" if r else ""
             f_txt = f" — {f}" if f else ""
-            reply = f"{reply}\n\n🏆 *Trade cerrado registrado*: {t} [{tp}] | PnL {signo_p}${p:,.2f} USD{roi_s}{f_txt} (ID {tid})".strip()
+            reply = f"{reply}\n\n🏆 Trade cerrado registrado: {t} [{tp}] | PnL {signo_p}${p:,.2f} USD{roi_s}{f_txt} (ID {tid})".strip()
 
         match_inv = re.search(r"REGISTRO_INV:\s*([^\n\r]+)", reply)
         if match_inv:
@@ -2102,7 +2697,7 @@ MENSAJE DEL USUARIO:
             fecha_str = f" — {f_reg}" if f_reg else ""
             lev_str = f" [{pos_t} {lev_t:.0f}x]" if pos_t != "SPOT" else " [SPOT]"
             liq_str = f" | Liq est: ${liq_t:,.2f}" if liq_t else ""
-            reply = f"{reply}\n\n💼 *Guardado como abierto*: {t}{lev_str} | Margen ${m:,.2f} | PPC ${p:,.2f} | Cant {c:,.4f}{liq_str}{fecha_str}".strip()
+            reply = f"{reply}\n\n💼 Guardado como abierto: {t}{lev_str} | Margen ${m:,.2f} | PPC ${p:,.2f} | Cant {c:,.4f}{liq_str}{fecha_str}".strip()
 
         match_ars = re.search(r"REGISTRO_ARS:\s*([^\n\r]+)", reply)
         if match_ars:
@@ -2117,7 +2712,7 @@ MENSAJE DEL USUARIO:
             
             guardar_movimiento(user_id, tipo, monto, categoria, descripcion, f_gasto)
             fecha_str = f" — {f_gasto}" if f_gasto else ""
-            reply = f"{reply}\n\n✅ *Guardado*: {tipo} de ${monto:,.2f} ARS en {categoria}{fecha_str}".strip()
+            reply = f"{reply}\n\n✅ Guardado: {tipo} de ${monto:,.2f} ARS en {categoria}{fecha_str}".strip()
 
         m_close_pos = re.search(r"ACCION: CERRAR_POSICION\|(\d+)(?:\|([^|\n\r]*))?(?:\|([^\n\r]*))?", reply)
         if m_close_pos:
@@ -2130,31 +2725,82 @@ MENSAJE DEL USUARIO:
             if res_cierre:
                 signo_pnl = "+" if res_cierre["pnl_usd"] >= 0 else ""
                 roi_str = f" ({res_cierre['roi_pct']:+.2f}%)" if res_cierre['roi_pct'] else ""
-                reply += f"\n\n🎯 *Trade cerrado*: {res_cierre['ticker']} [{res_cierre['tipo_pos']}] | PnL {signo_pnl}${res_cierre['pnl_usd']:,.2f} USD{roi_str} → ID {res_cierre['tc_id']}"
+                reply += f"\n\n🎯 Trade cerrado: {res_cierre['ticker']} [{res_cierre['tipo_pos']}] | PnL {signo_pnl}${res_cierre['pnl_usd']:,.2f} USD{roi_str} → ID histórico {res_cierre['tc_id']}"
             else:
                 reply += f"\n\n⚠️ No se pudo cerrar: {msg_cierre}"
 
-        texto_limpio = limpiar_estilo_whatsapp(reply)
+        texto_limpio = limpiar_estilo_telegram(reply)
         if texto_limpio:
-            enviar_mensaje_whatsapp(sender_phone, texto_limpio)
+            await update.message.reply_text(texto_limpio)
 
         if cmd_para_ejecutar:
-            await intentar_comando_local_whatsapp(sender_phone, user_id, cmd_para_ejecutar)
+            await intentar_comando_local(update, user_id, cmd_para_ejecutar)
 
     except Exception as e:
-        logger.error(f"Error procesando solicitud WhatsApp: {e}", exc_info=True)
-        enviar_mensaje_whatsapp(sender_phone, f"⚠️ Error: {e}")
+        logger.error(f"Error: {e}", exc_info=True)
+        await update.message.reply_text(f"Hubo un error: {e}")
 
-# ==================== MAIN ====================
+async def cmd_ytd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    per = extraer_periodo(update.message.text or "ytd") or "ytd"
+    await update.message.reply_text(calcular_rendimiento_periodo(user_id, per))
+
+async def cmd_cagr(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    per = extraer_periodo(update.message.text or "ytd") or "ytd"
+    await update.message.reply_text(calcular_rendimiento_periodo(user_id, per))
+
+async def cmd_spy_alias(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await intentar_comando_local(update, update.effective_user.id, update.message.text or "/spy")
+
+async def cmd_grafico_alias(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await intentar_comando_local(update, update.effective_user.id, update.message.text or "/grafico")
+
+async def cmd_activos_alias(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await intentar_comando_local(update, update.effective_user.id, update.message.text or "/activos")
+
+async def cmd_precio_alias(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await intentar_comando_local(update, update.effective_user.id, update.message.text or "/precio")
+
+async def cmd_excel_alias(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await intentar_comando_local(update, update.effective_user.id, "/excel")
+
+async def cmd_analisis_alias(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await intentar_comando_local(update, update.effective_user.id, update.message.text or "/analisis")
+
+async def cmd_gastos_alias(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await intentar_comando_local(update, update.effective_user.id, "/gastos")
+
 async def main():
-    global loop_principal
-    loop_principal = asyncio.get_running_loop()
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("reset", cmd_borrar_todo))
+    app.add_handler(CommandHandler("resumen", cmd_resumen))
+    app.add_handler(CommandHandler("riesgo", cmd_riesgo))
+    app.add_handler(CommandHandler("mes", cmd_mes))
+    app.add_handler(CommandHandler("objetivos", cmd_objetivos))
+    app.add_handler(CommandHandler("gastos", cmd_gastos_alias))
+    app.add_handler(CommandHandler("finanzas", cmd_gastos_alias))
+    app.add_handler(CommandHandler("hormiga", cmd_gastos_alias))
+    app.add_handler(CommandHandler("help", start))
+    app.add_handler(CommandHandler("ayuda", start))
+    app.add_handler(CommandHandler("cartera", cmd_resumen))
+    app.add_handler(CommandHandler("ytd", cmd_ytd))
+    app.add_handler(CommandHandler("cagr", cmd_cagr))
+    app.add_handler(CommandHandler("spy", cmd_spy_alias))
+    app.add_handler(CommandHandler("grafico", cmd_grafico_alias))
+    app.add_handler(CommandHandler("activos", cmd_activos_alias))
+    app.add_handler(CommandHandler("precio", cmd_precio_alias))
+    app.add_handler(CommandHandler("excel", cmd_excel_alias))
+    app.add_handler(CommandHandler("analisis", cmd_analisis_alias))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, responder))
     
-    threading.Thread(target=run_web_server, daemon=True).start()
-    logger.info("Servidor web iniciado en Render.")
-
-    asyncio.create_task(tarea_alertas_whatsapp())
-
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(drop_pending_updates=True)
+    
+    asyncio.create_task(tarea_alertas_periodicas(app))
+    
     while True:
         await asyncio.sleep(3600)
 
