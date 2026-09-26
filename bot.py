@@ -327,12 +327,12 @@ def guardar_movimiento(user_id: int, tipo: str, monto: float, categoria: str, de
 # ==================== MOTOR CUANTITATIVO DE FINANZAS PERSONALES (ARS) ====================
 def calcular_metricas_finanzas_completas(user_id: int, meses_lookback: int = 6):
     """
-    Calcula métricas de finanzas personales separando consumo real vs. ahorro/inversión:
-    - Excluye pases a USDT, ahorro e inversión del costo de vida.
-    - Promedios mensuales de ingreso, costo de vida y capacidad neta de ahorro.
-    - Tasa de ahorro real (% del ingreso preservado).
-    - Gastos Hormiga y Ley de Pareto aplicados exclusivamente sobre el consumo real.
-    - Desvío MoM y Runway de cobertura en meses.
+    Calcula de forma nativa en Python métricas completas de finanzas personales:
+    - Separa Gastos de Consumo Real vs Pases a Inversión/Ahorro en USD.
+    - Promedios mensuales de ingreso, costo de vida y superávit neto.
+    - Tasa de ahorro histórica real (Savings Rate %).
+    - Detección cuantitativa de Gastos Hormiga y Ley de Pareto sobre el consumo real.
+    - Desvío MoM y Runway institucional.
     """
     with get_db_connection() as conn:
         df_mov = pd.read_sql(
@@ -450,10 +450,11 @@ def calcular_metricas_finanzas_completas(user_id: int, meses_lookback: int = 6):
     return "\n".join(lineas)
 
 # ==================== RENDIMIENTO MENSUAL EXACTO (CONSISTENTE CON /SPY) ====================
-def calcular_rendimiento_por_meses(user_id: int):
+def calcular_rendimiento_por_meses(user_id: int, anio: int = None):
     """
     Calcula el rendimiento porcentual mensual exacto de la cartera de trading.
     Utiliza idéntica base de capital ponderada que /spy y la curva consolidada.
+    Si se especifica anio (ej. 2026), filtra únicamente los meses de ese año.
     """
     with get_db_connection() as conn:
         df_tc = pd.read_sql(
@@ -473,6 +474,12 @@ def calcular_rendimiento_por_meses(user_id: int):
     capital_ref = max(cap_abierto, cap_tc_pico, 2500.0)
 
     df_tc['fecha'] = pd.to_datetime(df_tc['fecha'])
+
+    if anio is not None:
+        df_tc = df_tc[df_tc['fecha'].dt.year == anio]
+        if df_tc.empty:
+            return f"No tenés trades cerrados registrados en el año {anio}."
+
     df_tc['periodo'] = df_tc['fecha'].dt.to_period('M')
 
     agrupado = df_tc.groupby('periodo').agg(
@@ -496,8 +503,9 @@ def calcular_rendimiento_por_meses(user_id: int):
         7: "Jul", 8: "Ago", 9: "Sep", 10: "Oct", 11: "Nov", 12: "Dic"
     }
 
+    titulo_anio = f" ({anio})" if anio else " (Histórico)"
     lineas = [
-        "📅 RENDIMIENTO MENSUAL DE CARTERA",
+        f"📅 RENDIMIENTO MENSUAL DE CARTERA{titulo_anio}",
         f"• Base de capital de referencia: ${capital_ref:,.2f} USD",
         ""
     ]
@@ -529,7 +537,8 @@ def calcular_rendimiento_por_meses(user_id: int):
     ret_total = (pnl_acumulado / capital_ref) * 100.0
     signo_tot = "+" if ret_total >= 0 else ""
     lineas.append("")
-    lineas.append(f"🏆 Total histórico acumulado: {signo_tot}{ret_total:.2f}% ({signo_tot}${pnl_acumulado:,.2f} USD)")
+    tag_tot = f"Total {anio}" if anio else "Total histórico acumulado"
+    lineas.append(f"🏆 {tag_tot}: {signo_tot}{ret_total:.2f}% ({signo_tot}${pnl_acumulado:,.2f} USD)")
 
     return "\n".join(lineas)
 
@@ -2415,7 +2424,7 @@ async def tarea_alertas_periodicas(app):
                         with conn.cursor() as cursor:
                             cursor.execute("""
                                 SELECT DISTINCT user_id FROM (
-                                    SELECT user_id FROM portafolio_inversIONES
+                                    SELECT user_id FROM portafolio_inversiones
                                     UNION
                                     SELECT user_id FROM movimientos
                                     UNION
@@ -2557,7 +2566,14 @@ async def intentar_comando_local(update: Update, user_id: int, user_msg: str) ->
         await cmd_resumen(update, None)
         return True
     if cmd in ("mensual", "meses", "mesames") or re.search(r"\b(rendimiento mensual|como me fue cada mes|mes a mes|tasa mensual)\b", low):
-        await update.message.reply_text(calcular_rendimiento_por_meses(user_id))
+        anio_filtro = None
+        m_anio = re.search(r"\b(202\d)\b", low)
+        if m_anio:
+            anio_filtro = int(m_anio.group(1))
+        elif re.search(r"\b(este a[ñn]o|ytd|actual)\b", low):
+            anio_filtro = datetime.now().year
+            
+        await update.message.reply_text(calcular_rendimiento_por_meses(user_id, anio_filtro))
         return True
     if cmd in ("gastos", "finanzas", "hormiga", "promedios") or re.search(r"\b(gasto(s)? hormiga|promedio(s)? de gasto(s)?|radiograf[ií]a)\b", low):
         await update.message.reply_text(calcular_metricas_finanzas_completas(user_id))
@@ -2641,7 +2657,7 @@ async def intentar_comando_local(update: Update, user_id: int, user_msg: str) ->
             await update.message.reply_text(f"No pude analizar {tk}.")
         return True
 
-    m_an = re.match(r"^(?:(?:analiza(?:me)?|an[aá]lisis(?:\\s+t[eé]cnico)?|c[oó]mo\\s+ves|at)\\s+)?([a-zA-Z0-9]{2,10})(?:\\s+(diario|semanal|4h))?$", low)
+    m_an = re.match(r"^(?:(?:analiza(?:me)?|an[aá]lisis(?:\\s+t[eé]cnico)?|c[oó]mo\\s+ves|at)\s+)?([a-zA-Z0-9]{2,10})(?:\\s+(diario|semanal|4h))?$", low)
     if m_an:
         posible_tk = m_an.group(1).upper()
         palabras_comunes = {"HOLA", "BUENAS", "GRACIAS", "OK", "RESET", "AYUDA", "MES", "GASTOS", "RESUMEN", "CARTERA", "OBJETIVOS", "RIESGO", "FINANZAS", "HORMIGA", "MENSUAL"}
@@ -2699,7 +2715,7 @@ async def cmd_resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with get_db_connection() as conn:
         df_tc = pd.read_sql("SELECT SUM(pnl_usd) as pnl_tot, COUNT(id) as total_c FROM trades_cerrados WHERE user_id = %s;", conn, params=(user_id,))
     pnl_realizado = float(df_tc['pnl_tot'].iloc[0]) if not df_tc.empty and pd.notnull(df_tc['pnl_tot'].iloc[0]) else 0.0
-    cant_c = int(df_tc['total_c'].iloc[0]) if not df_tc.empty and pd.notnull(df_tc['total_c'].iloc[0]) else 0
+    cant_c = int(df_tc['total_c'].iloc[0]) if not df_tc.empty and pd.notnull(df_tc['total_c'].iloc[0]) else 0.0
     
     if not resumen and cant_c == 0:
         await update.message.reply_text("📉 No tienes activos ni trades cargados todavía.")
@@ -2895,7 +2911,7 @@ async def cmd_cagr(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(calcular_rendimiento_periodo(user_id, per))
 
 async def cmd_mensual_alias(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await intentar_comando_local(update, update.effective_user.id, "/mensual")
+    await intentar_comando_local(update, update.effective_user.id, update.message.text or "/mensual")
 
 async def cmd_spy_alias(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await intentar_comando_local(update, update.effective_user.id, update.message.text or "/spy")
