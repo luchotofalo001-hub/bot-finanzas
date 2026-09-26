@@ -303,16 +303,36 @@ def resolver_fecha_inicio(periodo_str: str, fecha_compra_db: str = None):
     
     return (hoy - timedelta(days=180)).strftime('%Y-%m-%d'), "Últimos 6 meses"
 
+# ==================== OPERACIONES DE MOVIMIENTOS ARS ====================
+def guardar_movimiento(user_id: int, tipo: str, monto: float, categoria: str, descripcion: str, fecha_str: str = None):
+    tipo = tipo.strip().upper()
+    categoria = categoria.strip().capitalize()
+    descripcion = descripcion.strip()
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            if fecha_str:
+                cursor.execute(
+                    """INSERT INTO movimientos (user_id, fecha, tipo, monto, categoria, descripcion)
+                       VALUES (%s, %s, %s, %s, %s, %s);""",
+                    (user_id, fecha_str, tipo, float(monto), categoria, descripcion)
+                )
+            else:
+                cursor.execute(
+                    """INSERT INTO movimientos (user_id, fecha, tipo, monto, categoria, descripcion)
+                       VALUES (%s, NOW(), %s, %s, %s, %s);""",
+                    (user_id, tipo, float(monto), categoria, descripcion)
+                )
+            conn.commit()
+
 # ==================== MOTOR CUANTITATIVO DE FINANZAS PERSONALES (ARS) ====================
 def calcular_metricas_finanzas_completas(user_id: int, meses_lookback: int = 6):
     """
-    Calcula de forma nativa en Python métricas completas de finanzas personales:
-    - Promedios mensuales de ingreso, gasto y superávit neto.
-    - Tasa de ahorro histórica (Savings Rate %).
-    - Detección cuantitativa de Gastos Hormiga (frecuencia, volumen y % del gasto).
-    - Regla de Pareto (categorías que concentran el 80% de salidas).
-    - Desvío MoM (Mes actual vs Promedio histórico).
-    - Runway estimado (Meses de vida cubiertos por patrimonio).
+    Calcula métricas de finanzas personales separando consumo real vs. ahorro/inversión:
+    - Excluye pases a USDT, ahorro e inversión del costo de vida.
+    - Promedios mensuales de ingreso, costo de vida y capacidad neta de ahorro.
+    - Tasa de ahorro real (% del ingreso preservado).
+    - Gastos Hormiga y Ley de Pareto aplicados exclusivamente sobre el consumo real.
+    - Desvío MoM y Runway de cobertura en meses.
     """
     with get_db_connection() as conn:
         df_mov = pd.read_sql(
@@ -330,67 +350,77 @@ def calcular_metricas_finanzas_completas(user_id: int, meses_lookback: int = 6):
     df_mov['fecha'] = pd.to_datetime(df_mov['fecha'])
     df_mov['mes_periodo'] = df_mov['fecha'].dt.to_period('M')
     
-    df_gastos = df_mov[df_mov['tipo'] == 'GASTO'].copy()
+    df_gastos_totales = df_mov[df_mov['tipo'] == 'GASTO'].copy()
     df_ingresos = df_mov[df_mov['tipo'] == 'INGRESO'].copy()
 
-    if df_gastos.empty and df_ingresos.empty:
+    if df_gastos_totales.empty and df_ingresos.empty:
         return "No hay registros suficientes de ingresos o gastos."
 
     cant_meses_reales = max(1, df_mov['mes_periodo'].nunique())
     
-    tot_gastos = float(df_gastos['monto'].sum()) if not df_gastos.empty else 0.0
-    tot_ingresos = float(df_ingresos['monto'].sum()) if not df_ingresos.empty else 0.0
+    tags_inversion = {'inversion', 'inversión', 'ahorro', 'usdt', 'crypto', 'cripto', 'broker', 'dolares', 'dólares'}
     
-    prom_gasto_mensual = tot_gastos / cant_meses_reales
-    prom_ingreso_mensual = tot_ingresos / cant_meses_reales
-    superavit_mensual_prom = prom_ingreso_mensual - prom_gasto_mensual
-    
-    tasa_ahorro_pct = ((tot_ingresos - tot_gastos) / tot_ingresos * 100.0) if tot_ingresos > 0 else 0.0
+    def es_pase_inversion(row):
+        cat = str(row['categoria']).lower().strip()
+        desc = str(row['descripcion']).lower().strip()
+        return cat in tags_inversion or any(t in desc for t in tags_inversion)
 
-    # 1. Gastos Hormiga (compras menores o iguales a UMBRAL_GASTO_HORMIGA_ARS)
-    df_hormiga = df_gastos[df_gastos['monto'] <= UMBRAL_GASTO_HORMIGA_ARS]
+    es_inversion = df_gastos_totales.apply(es_pase_inversion, axis=1) if not df_gastos_totales.empty else pd.Series(dtype=bool)
+    
+    df_consumo = df_gastos_totales[~es_inversion].copy() if not df_gastos_totales.empty else pd.DataFrame()
+    df_pases_inv = df_gastos_totales[es_inversion].copy() if not df_gastos_totales.empty else pd.DataFrame()
+
+    tot_ingresos = float(df_ingresos['monto'].sum()) if not df_ingresos.empty else 0.0
+    tot_consumo = float(df_consumo['monto'].sum()) if not df_consumo.empty else 0.0
+    tot_pases_inv = float(df_pases_inv['monto'].sum()) if not df_pases_inv.empty else 0.0
+    
+    prom_ingreso_mensual = tot_ingresos / cant_meses_reales
+    prom_consumo_mensual = tot_consumo / cant_meses_reales
+    prom_pases_inv = tot_pases_inv / cant_meses_reales
+    
+    superavit_mensual_prom = prom_ingreso_mensual - prom_consumo_mensual
+    tasa_ahorro_pct = ((tot_ingresos - tot_consumo) / tot_ingresos * 100.0) if tot_ingresos > 0 else 0.0
+
+    df_hormiga = df_consumo[df_consumo['monto'] <= UMBRAL_GASTO_HORMIGA_ARS] if not df_consumo.empty else pd.DataFrame()
     tot_hormiga = float(df_hormiga['monto'].sum()) if not df_hormiga.empty else 0.0
     prom_hormiga_mes = tot_hormiga / cant_meses_reales
-    pct_hormiga_sobre_gastos = (tot_hormiga / tot_gastos * 100.0) if tot_gastos > 0 else 0.0
+    pct_hormiga_sobre_consumo = (tot_hormiga / tot_consumo * 100.0) if tot_consumo > 0 else 0.0
     compras_hormiga_por_mes = len(df_hormiga) / cant_meses_reales
 
-    # 2. Desglose Pareto por categorías
-    cat_totales = df_gastos.groupby('categoria')['monto'].sum().sort_values(ascending=False) if not df_gastos.empty else pd.Series()
+    cat_totales = df_consumo.groupby('categoria')['monto'].sum().sort_values(ascending=False) if not df_consumo.empty else pd.Series()
     
-    # 3. Desvío MoM (Mes actual vs Promedio)
     periodo_actual = pd.Period(ahora_argentina(), freq='M')
-    df_mes_actual = df_gastos[df_gastos['mes_periodo'] == periodo_actual]
-    gasto_mes_actual = float(df_mes_actual['monto'].sum()) if not df_mes_actual.empty else 0.0
+    df_mes_actual = df_consumo[df_consumo['mes_periodo'] == periodo_actual] if not df_consumo.empty else pd.DataFrame()
+    consumo_mes_actual = float(df_mes_actual['monto'].sum()) if not df_mes_actual.empty else 0.0
     dia_del_mes = ahora_argentina().day
     dias_en_mes = 30
-    proyeccion_mes_actual = (gasto_mes_actual / dia_del_mes * dias_en_mes) if dia_del_mes > 0 else gasto_mes_actual
-    desvio_pct_vs_prom = ((proyeccion_mes_actual - prom_gasto_mensual) / prom_gasto_mensual * 100.0) if prom_gasto_mensual > 0 else 0.0
+    proyeccion_mes_actual = (consumo_mes_actual / dia_del_mes * dias_en_mes) if dia_del_mes > 0 else consumo_mes_actual
+    desvio_pct_vs_prom = ((proyeccion_mes_actual - prom_consumo_mensual) / prom_consumo_mensual * 100.0) if prom_consumo_mensual > 0 else 0.0
 
-    # 4. Runway (Meses de vida cubiertos por patrimonio abierto)
     resumen_cartera = obtener_resumen_portafolio(user_id)
     patrimonio_usd = float(resumen_cartera['total_actual']) if resumen_cartera else 0.0
-    # Estimación de runway asumiendo un tipo de cambio implícito de referencia (aprox 1250-1300 ARS/USD)
     patrimonio_ars_aprox = patrimonio_usd * 1300.0
-    runway_meses = (patrimonio_ars_aprox / prom_gasto_mensual) if prom_gasto_mensual > 0 else 0.0
+    runway_meses = (patrimonio_ars_aprox / prom_consumo_mensual) if prom_consumo_mensual > 0 else 0.0
 
     lineas = [
         f"📊 RADIOGRAFÍA FINANCIERA (Últimos {cant_meses_reales} meses)",
         "",
         "💵 Flujo de Caja y Ahorro",
-        f"• Ingresos promedio: ${prom_ingreso_mensual:,.0f} ARS/mes",
-        f"• Gastos promedio:   ${prom_gasto_mensual:,.0f} ARS/mes",
-        f"• Superávit neto:    ${superavit_mensual_prom:+,.0f} ARS/mes",
-        f"• Tasa de ahorro:    {tasa_ahorro_pct:.1f}% del ingreso"
+        f"• Ingresos promedio:       ${prom_ingreso_mensual:,.0f} ARS/mes",
+        f"• Costo de vida (consumo): ${prom_consumo_mensual:,.0f} ARS/mes",
+        f"• Derivado a USDT/Ahorro:  ${prom_pases_inv:,.0f} ARS/mes",
+        f"• Capacidad neta de ahorro: ${superavit_mensual_prom:+,.0f} ARS/mes",
+        f"• Tasa de ahorro real:     {tasa_ahorro_pct:.1f}% del ingreso"
     ]
 
     em_ahorro = "🟢 Excelente capacidad de capitalización" if tasa_ahorro_pct >= 30 else ("🟡 Ahorro moderado" if tasa_ahorro_pct >= 10 else "🔴 Margen de ahorro muy ajustado")
     lineas.append(f"• Diagnóstico: {em_ahorro}")
 
     lineas.append("")
-    lineas.append("🐜 Análisis de Gastos Hormiga (≤ $15.000 ARS)")
+    lineas.append("🐜 Gastos Hormiga en Consumo (≤ $15.000 ARS)")
     lineas.append(f"• Fuga total acumulada: ${tot_hormiga:,.0f} ARS ({len(df_hormiga)} compras)")
-    lineas.append(f"• Impacto mensual:      ${prom_hormiga_mes:,.0f} ARS/mes ({pct_hormiga_sobre_gastos:.1f}% del total)")
-    lineas.append(f"• Frecuencia:           ~{compras_hormiga_por_mes:.0f} micro-compras al mes")
+    lineas.append(f"• Impacto mensual:      ${prom_hormiga_mes:,.0f} ARS/mes ({pct_hormiga_sobre_consumo:.1f}% de tus gastos de vida)")
+    lineas.append(f"• Frecuencia:           ~{compras_hormiga_por_mes:.0f} compras chicas al mes")
     
     if not df_hormiga.empty:
         top_h_cat = df_hormiga.groupby('categoria')['monto'].sum().sort_values(ascending=False).head(3)
@@ -398,25 +428,129 @@ def calcular_metricas_finanzas_completas(user_id: int, meses_lookback: int = 6):
         lineas.append(f"• Principales focos:    {top_str}")
 
     lineas.append("")
-    lineas.append("🏆 Salidas Principales (Ley de Pareto)")
+    lineas.append("🏆 Salidas Principales de Consumo (Ley de Pareto)")
     acum = 0.0
     for cat, val in cat_totales.head(4).items():
-        pct = (val / tot_gastos * 100.0) if tot_gastos > 0 else 0.0
+        pct = (val / tot_consumo * 100.0) if tot_consumo > 0 else 0.0
         prom_cat = val / cant_meses_reales
         lineas.append(f"• {cat:<14} → ${prom_cat:,.0f} ARS/mes ({pct:.1f}%)")
         acum += pct
-    lineas.append(f"   (Estas categorías explican el {acum:.0f}% de tus gastos totales)")
+    if tot_consumo > 0:
+        lineas.append(f"   (Estas categorías explican el {acum:.0f}% de tus gastos reales de vida)")
 
     lineas.append("")
     lineas.append("⏱️ Control del Mes en Curso y Runway")
     signo_d = "+" if desvio_pct_vs_prom >= 0 else ""
     em_d = "🔴" if desvio_pct_vs_prom > 15 else ("🟢" if desvio_pct_vs_prom < -5 else "🟡")
-    lineas.append(f"• Gastado este mes:     ${gasto_mes_actual:,.0f} ARS (Día {dia_del_mes})")
+    lineas.append(f"• Consumido este mes:   ${consumo_mes_actual:,.0f} ARS (Día {dia_del_mes})")
     lineas.append(f"• Ritmo proyectado:     {em_d} {signo_d}{desvio_pct_vs_prom:.1f}% vs promedio histórico")
     if runway_meses > 0:
-        lineas.append(f"• Runway de respaldo:   {runway_meses:.1f} meses de gastos cubiertos con tu cartera")
+        lineas.append(f"• Runway de respaldo:   {runway_meses:.1f} meses de costo de vida cubiertos con tu cartera")
 
     return "\n".join(lineas)
+
+# ==================== RENDIMIENTO MENSUAL EXACTO (CONSISTENTE CON /SPY) ====================
+def calcular_rendimiento_por_meses(user_id: int):
+    """
+    Calcula el rendimiento porcentual mensual exacto de la cartera de trading.
+    Utiliza idéntica base de capital ponderada que /spy y la curva consolidada.
+    """
+    with get_db_connection() as conn:
+        df_tc = pd.read_sql(
+            "SELECT fecha, pnl_usd, monto_invertido FROM trades_cerrados WHERE user_id = %s ORDER BY fecha ASC;",
+            conn, params=(user_id,)
+        )
+        df_inv = pd.read_sql(
+            "SELECT monto_total_usd FROM portafolio_inversiones WHERE user_id = %s;",
+            conn, params=(user_id,)
+        )
+
+    if df_tc.empty:
+        return "No tenés historial de trades cerrados para calcular rendimientos mensuales."
+
+    cap_abierto = float(df_inv['monto_total_usd'].sum()) if not df_inv.empty else 0.0
+    cap_tc_pico = float(df_tc['monto_invertido'].max()) if 'monto_invertido' in df_tc and pd.notnull(df_tc['monto_invertido'].max()) else 2000.0
+    capital_ref = max(cap_abierto, cap_tc_pico, 2500.0)
+
+    df_tc['fecha'] = pd.to_datetime(df_tc['fecha'])
+    df_tc['periodo'] = df_tc['fecha'].dt.to_period('M')
+
+    agrupado = df_tc.groupby('periodo').agg(
+        pnl_mes=('pnl_usd', 'sum'),
+        cant_ops=('pnl_usd', 'count'),
+        ganadores=('pnl_usd', lambda s: (s > 0).sum())
+    ).reset_index()
+
+    fecha_min = df_tc['fecha'].min().strftime('%Y-%m-%d')
+    spy_hist = None
+    try:
+        hspy = yf.Ticker("SPY").history(start=fecha_min, auto_adjust=True)
+        if hspy is not None and not hspy.empty:
+            spy_hist = hspy['Close'].dropna()
+            spy_hist.index = pd.to_datetime(spy_hist.index).tz_localize(None)
+    except Exception:
+        spy_hist = None
+
+    mapa_meses = {
+        1: "Ene", 2: "Feb", 3: "Mar", 4: "Abr", 5: "May", 6: "Jun",
+        7: "Jul", 8: "Ago", 9: "Sep", 10: "Oct", 11: "Nov", 12: "Dic"
+    }
+
+    lineas = [
+        "📅 RENDIMIENTO MENSUAL DE CARTERA",
+        f"• Base de capital de referencia: ${capital_ref:,.2f} USD",
+        ""
+    ]
+
+    for _, row in agrupado.iterrows():
+        periodo = row['periodo']
+        nombre_mes = f"{mapa_meses.get(periodo.month, str(periodo.month))} {periodo.year}"
+        pnl_m = float(row['pnl_mes'])
+        ret_pct = (pnl_m / capital_ref) * 100.0
+        
+        signo = "+" if ret_pct >= 0 else ""
+        emoji = "🟢" if ret_pct > 0 else ("🔴" if ret_pct < 0 else "⚪")
+        wr = (row['ganadores'] / row['cant_ops'] * 100) if row['cant_ops'] > 0 else 0.0
+
+        extra_spy = ""
+        if spy_hist is not None:
+            mask_m = (spy_hist.index.year == periodo.year) & (spy_hist.index.month == periodo.month)
+            sub_spy = spy_hist.loc[mask_m]
+            if len(sub_spy) >= 2:
+                r_spy = (sub_spy.iloc[-1] / sub_spy.iloc[0] - 1.0) * 100.0
+                signo_s = "+" if r_spy >= 0 else ""
+                extra_spy = f" | SPY: {signo_s}{r_spy:.1f}%"
+
+        lineas.append(
+            f"{emoji} {nombre_mes:<8} → {signo}{ret_pct:>5.2f}% ({signo}${pnl_m:>7,.2f} USD) | {row['cant_ops']} ops (WR: {wr:.0f}%){extra_spy}"
+        )
+
+    pnl_acumulado = float(df_tc['pnl_usd'].sum())
+    ret_total = (pnl_acumulado / capital_ref) * 100.0
+    signo_tot = "+" if ret_total >= 0 else ""
+    lineas.append("")
+    lineas.append(f"🏆 Total histórico acumulado: {signo_tot}{ret_total:.2f}% ({signo_tot}${pnl_acumulado:,.2f} USD)")
+
+    return "\n".join(lineas)
+
+# ==================== EXPORTACIÓN A EXCEL ====================
+def generar_excel_completo(user_id: int):
+    try:
+        with get_db_connection() as conn:
+            df_mov = pd.read_sql("SELECT fecha, tipo, monto, categoria, descripcion FROM movimientos WHERE user_id = %s ORDER BY fecha DESC;", conn, params=(user_id,))
+            df_inv = pd.read_sql("SELECT fecha, ticker, cantidad, precio_compra, monto_total_usd, tipo_posicion, apalancamiento, precio_liquidacion FROM portafolio_inversiones WHERE user_id = %s ORDER BY fecha DESC;", conn, params=(user_id,))
+            df_tc = pd.read_sql("SELECT fecha, fecha_apertura, ticker, tipo_posicion, pnl_usd, roi_pct, monto_invertido, descripcion FROM trades_cerrados WHERE user_id = %s ORDER BY fecha DESC;", conn, params=(user_id,))
+
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine='openpyxl') as writer:
+            df_mov.to_excel(writer, sheet_name='Movimientos_ARS', index=False)
+            df_inv.to_excel(writer, sheet_name='Cartera_Abierta', index=False)
+            df_tc.to_excel(writer, sheet_name='Trades_Cerrados', index=False)
+        buf.seek(0)
+        return buf
+    except Exception as e:
+        logger.error(f"Error generando Excel: {e}")
+        return None
 
 # ==================== GRÁFICO CONSOLIDADO: EVOLUCIÓN CARTERA ====================
 def generar_grafico_evolucion_cartera_consolidada(user_id: int, periodo_solicitado: str = "", modo: str = "usd"):
@@ -812,15 +946,12 @@ def calcular_pivots_y_niveles(df, ventana=4):
         last_high = ult_highs[-1]
         last_low = ult_lows[-1]
         
-        # 1. Roturas activas en tiempo real:
         if precio_actual < last_low:
             estructura_txt = f"🔴 Se rompió un piso/mínimo importante (${last_low:,.2f}) — Presión bajista activa"
             estructura_bias = "choch_bajista"
         elif precio_actual > last_high:
             estructura_txt = f"🟢 Se rompió un techo/máximo importante (${last_high:,.2f}) — Posible giro alcista"
             estructura_bias = "choch_alcista"
-            
-        # 2. Si no hay rotura activa hoy, evaluar la tendencia de los picos y valles:
         elif len(ult_highs) >= 2 and len(ult_lows) >= 2:
             if ult_highs[-1] < ult_highs[-2] and ult_lows[-1] < ult_lows[-2]:
                 estructura_txt = "Estructura BAJISTA sólida (Máximos y mínimos descendentes)"
@@ -1801,20 +1932,21 @@ def calcular_metricas_riesgo_completas(user_id: int):
                     if p.get("dist_liq_pct") is not None and p["dist_liq_pct"] < UMBRAL_LIQUIDACION_PCT:
                         resultado["posiciones_riesgo"].append(p)
 
-        lineas = []
-        lineas.append("📊 MÉTRICAS DE RIESGO Y PERFORMANCE (TRADING)")
-        lineas.append("")
-        lineas.append("🏆 Trades Cerrados")
-        lineas.append(f"• PnL Realizado: ${resultado['pnl_realizado']:+,.2f} USD")
-        lineas.append(f"• Operaciones: {resultado['cant_trades']}  |  Win Rate: {resultado['win_rate']:.1f}%")
-        lineas.append(f"• Profit Factor: {resultado['profit_factor']:.2f}")
-        lineas.append(f"• Expectancy: ${resultado['expectancy']:+,.2f} por trade")
-        lineas.append(f"• Promedio ganancia: ${resultado['avg_win']:+,.2f}  |  Promedio pérdida: ${resultado['avg_loss']:+,.2f}")
-        lineas.append("")
-        lineas.append("📉 Riesgo")
-        lineas.append(f"• Max Drawdown: ${resultado['max_drawdown_usd']:+,.2f} USD ({resultado['max_drawdown_pct']:.1f}%)")
-        lineas.append(f"• Sharpe aproximado (anualizado): {resultado['sharpe_aprox']:.2f}")
-        lineas.append(f"• Tiempo promedio en posición: {resultado['tiempo_promedio_dias']:.0f} días")
+        lineas = [
+            "📊 MÉTRICAS DE RIESGO Y PERFORMANCE (TRADING)",
+            "",
+            "🏆 Trades Cerrados",
+            f"• PnL Realizado: ${resultado['pnl_realizado']:+,.2f} USD",
+            f"• Operaciones: {resultado['cant_trades']}  |  Win Rate: {resultado['win_rate']:.1f}%",
+            f"• Profit Factor: {resultado['profit_factor']:.2f}",
+            f"• Expectancy: ${resultado['expectancy']:+,.2f} por trade",
+            f"• Promedio ganancia: ${resultado['avg_win']:+,.2f}  |  Promedio pérdida: ${resultado['avg_loss']:+,.2f}",
+            "",
+            "📉 Riesgo",
+            f"• Max Drawdown: ${resultado['max_drawdown_usd']:+,.2f} USD ({resultado['max_drawdown_pct']:.1f}%)",
+            f"• Sharpe aproximado (anualizado): {resultado['sharpe_aprox']:.2f}",
+            f"• Tiempo promedio en posición: {resultado['tiempo_promedio_dias']:.0f} días"
+        ]
         
         if resultado["posiciones_riesgo"]:
             lineas.append("")
@@ -2017,8 +2149,7 @@ def obtener_progreso_presupuestos(user_id: int, mes: int = None, anio: int = Non
         return None, "No tenés presupuestos cargados para este mes. Decime por ejemplo: 'Presupuesto Comida 180000'"
 
     gastos_dict = dict(zip(df_gastos['categoria'], df_gastos['gastado'])) if not df_gastos.empty else {}
-    lineas = [f"📅 PRESUPUESTOS — {mes:02d}/{anio}"]
-    lineas.append("")
+    lineas = [f"📅 PRESUPUESTOS — {mes:02d}/{anio}", ""]
     total_limite = 0.0
     total_gastado = 0.0
 
@@ -2284,7 +2415,7 @@ async def tarea_alertas_periodicas(app):
                         with conn.cursor() as cursor:
                             cursor.execute("""
                                 SELECT DISTINCT user_id FROM (
-                                    SELECT user_id FROM portafolio_inversiones
+                                    SELECT user_id FROM portafolio_inversIONES
                                     UNION
                                     SELECT user_id FROM movimientos
                                     UNION
@@ -2327,7 +2458,8 @@ REGLAS DE ACTUACIÓN:
    COMANDO: [comando_correspondiente]
    
    Comandos del sistema:
-   - COMANDO: /gastos (radiografía completa de finanzas, promedios mensuales, ahorro y gastos hormiga)
+   - COMANDO: /mensual (cuando el usuario pida rendimientos mes a mes, tasa de ganancias mensual o desglose en %)
+   - COMANDO: /gastos (radiografía completa de finanzas, promedios mensuales, ahorro real y gastos hormiga)
    - COMANDO: /spy [periodo] (comparativa con S&P 500: ytd, todo, 3m, 6m, 1y)
    - COMANDO: /grafico [periodo] (curva USD)
    - COMANDO: /activos [tickers] [periodo] (comparativa base 100)
@@ -2359,13 +2491,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📈 Trading e Inversiones (0 tokens)\n"
         "• /spy        →  Rendimiento % vs S&P 500\n"
         "• /spy todo   →  Rendimiento % vs SPY desde el inicio\n"
+        "• /mensual    →  Rendimiento % mes a mes (con WR y vs SPY)\n"
         "• /grafico    →  Curva de PnL en USD\n"
         "• /activos    →  Comparativa relativa de activos\n"
         "• /analisis   →  Análisis técnico algorítmico\n"
         "• /riesgo     →  Drawdown, Win Rate, Expectancy\n"
         "• /resumen    →  Balance consolidado de cartera\n\n"
         "💵 Finanzas Personales (ARS)\n"
-        "• /gastos     →  Promedios mensuales, Tasa de Ahorro y Gastos Hormiga\n"
+        "• /gastos     →  Costo de vida, Tasa de Ahorro y Gastos Hormiga\n"
         "• /mes        →  Presupuestos y control del mes\n"
         "• /objetivos  →  Progreso de metas financieras\n"
         "• /excel      →  Exportar planilla completa\n\n"
@@ -2422,6 +2555,9 @@ async def intentar_comando_local(update: Update, user_id: int, user_msg: str) ->
         return True
     if cmd in ("resumen", "cartera", "balance"):
         await cmd_resumen(update, None)
+        return True
+    if cmd in ("mensual", "meses", "mesames") or re.search(r"\b(rendimiento mensual|como me fue cada mes|mes a mes|tasa mensual)\b", low):
+        await update.message.reply_text(calcular_rendimiento_por_meses(user_id))
         return True
     if cmd in ("gastos", "finanzas", "hormiga", "promedios") or re.search(r"\b(gasto(s)? hormiga|promedio(s)? de gasto(s)?|radiograf[ií]a)\b", low):
         await update.message.reply_text(calcular_metricas_finanzas_completas(user_id))
@@ -2505,10 +2641,10 @@ async def intentar_comando_local(update: Update, user_id: int, user_msg: str) ->
             await update.message.reply_text(f"No pude analizar {tk}.")
         return True
 
-    m_an = re.match(r"^(?:(?:analiza(?:me)?|an[aá]lisis(?:\s+t[eé]cnico)?|c[oó]mo\s+ves|at)\s+)?([a-zA-Z0-9]{2,10})(?:\s+(diario|semanal|4h))?$", low)
+    m_an = re.match(r"^(?:(?:analiza(?:me)?|an[aá]lisis(?:\\s+t[eé]cnico)?|c[oó]mo\\s+ves|at)\\s+)?([a-zA-Z0-9]{2,10})(?:\\s+(diario|semanal|4h))?$", low)
     if m_an:
         posible_tk = m_an.group(1).upper()
-        palabras_comunes = {"HOLA", "BUENAS", "GRACIAS", "OK", "RESET", "AYUDA", "MES", "GASTOS", "RESUMEN", "CARTERA", "OBJETIVOS", "RIESGO", "FINANZAS", "HORMIGA"}
+        palabras_comunes = {"HOLA", "BUENAS", "GRACIAS", "OK", "RESET", "AYUDA", "MES", "GASTOS", "RESUMEN", "CARTERA", "OBJETIVOS", "RIESGO", "FINANZAS", "HORMIGA", "MENSUAL"}
         if posible_tk not in palabras_comunes and not posible_tk.isdigit():
             tk = posible_tk
             tf_at = m_an.group(2) or "diario"
@@ -2642,14 +2778,12 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_msg = update.message.text
 
-    # 1. Filtro local ultra rápido (0 tokens)
     try:
         if await intentar_comando_local(update, user_id, user_msg):
             return
     except Exception as e:
         logger.error(f"Error comando local: {e}", exc_info=True)
 
-    # 2. Copiloto Cognitivo + Router
     try:
         contexto = resumen_compacto_para_ia(user_id)
         prompt = f"""CONTEXTO DEL USUARIO:
@@ -2760,6 +2894,9 @@ async def cmd_cagr(update: Update, context: ContextTypes.DEFAULT_TYPE):
     per = extraer_periodo(update.message.text or "ytd") or "ytd"
     await update.message.reply_text(calcular_rendimiento_periodo(user_id, per))
 
+async def cmd_mensual_alias(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await intentar_comando_local(update, update.effective_user.id, "/mensual")
+
 async def cmd_spy_alias(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await intentar_comando_local(update, update.effective_user.id, update.message.text or "/spy")
 
@@ -2788,6 +2925,7 @@ async def main():
     app.add_handler(CommandHandler("resumen", cmd_resumen))
     app.add_handler(CommandHandler("riesgo", cmd_riesgo))
     app.add_handler(CommandHandler("mes", cmd_mes))
+    app.add_handler(CommandHandler("mensual", cmd_mensual_alias))
     app.add_handler(CommandHandler("objetivos", cmd_objetivos))
     app.add_handler(CommandHandler("gastos", cmd_gastos_alias))
     app.add_handler(CommandHandler("finanzas", cmd_gastos_alias))
