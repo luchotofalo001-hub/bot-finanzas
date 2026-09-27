@@ -59,6 +59,9 @@ UMBRAL_GASTO_HORMIGA_ARS = 15000.0
 
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
+# Estado en memoria para importaciones interactivas de extractos
+importaciones_activas = {}
+
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL)
 
@@ -324,16 +327,92 @@ def guardar_movimiento(user_id: int, tipo: str, monto: float, categoria: str, de
                 )
             conn.commit()
 
+# ==================== PARSER DE EXTRACTOS BANCARIOS (EXCEL) ====================
+def parsear_extracto_bancario(file_bytes: bytes) -> list:
+    """Lee un extracto bancario en Excel (.xlsx / .xls) y extrae las transacciones normalizadas."""
+    try:
+        df_raw = pd.read_excel(io.BytesIO(file_bytes), header=None)
+    except Exception:
+        return []
+
+    header_idx = None
+    for idx, row in df_raw.iterrows():
+        row_str = " ".join([str(v).lower() for v in row if pd.notnull(v)])
+        if ("fecha" in row_str or "date" in row_str) and any(w in row_str for w in ["concepto", "descripcion", "detalle", "importe", "monto", "debito", "movimiento", "saldo"]):
+            header_idx = idx
+            break
+
+    if header_idx is not None:
+        df = df_raw.iloc[header_idx + 1:].copy()
+        df.columns = [str(c).strip().lower() for c in df_raw.iloc[header_idx]]
+    else:
+        df = df_raw.copy()
+        df.columns = [str(c).strip().lower() for c in df.columns]
+
+    cols = list(df.columns)
+    col_fecha = next((c for c in cols if any(k in c for k in ["fecha", "date"])), None)
+    col_desc = next((c for c in cols if any(k in c for k in ["concepto", "descrip", "detalle", "movimiento", "referencia"])), None)
+    col_deb = next((c for c in cols if any(k in c for k in ["debito", "débito", "egreso", "salida"])), None)
+    col_cred = next((c for c in cols if any(k in c for k in ["credito", "crédito", "ingreso", "entrada"])), None)
+    col_monto = next((c for c in cols if any(k in c for k in ["importe", "monto", "total"])), None)
+
+    movimientos = []
+    for _, r in df.iterrows():
+        f_raw = r[col_fecha] if col_fecha and pd.notnull(r[col_fecha]) else None
+        desc_val = str(r[col_desc]).strip() if col_desc and pd.notnull(r[col_desc]) else "Sin concepto"
+        if pd.isnull(f_raw) or str(f_raw).lower() in ["nan", "none", "fecha", ""]:
+            continue
+
+        try:
+            f_limpia = pd.to_datetime(f_raw).strftime('%Y-%m-%d')
+        except Exception:
+            f_cand = str(f_raw).split()[0]
+            f_limpia = f_cand if re.match(r"^\d{4}-\d{2}-\d{2}$", f_cand) else ahora_argentina().strftime('%Y-%m-%d')
+
+        monto = 0.0
+        tipo = "GASTO"
+
+        def _limpiar_num(val):
+            s = str(val).replace("$", "").replace("ARS", "").replace(" ", "").strip()
+            if "," in s and "." in s:
+                if s.find(".") < s.find(","):
+                    s = s.replace(".", "").replace(",", ".")
+                else:
+                    s = s.replace(",", "")
+            elif "," in s:
+                s = s.replace(",", ".")
+            return float(s)
+
+        if col_deb and col_cred:
+            val_deb = _limpiar_num(r[col_deb]) if pd.notnull(r[col_deb]) and str(r[col_deb]).strip() != "" else 0.0
+            val_cred = _limpiar_num(r[col_cred]) if pd.notnull(r[col_cred]) and str(r[col_cred]).strip() != "" else 0.0
+            if val_deb and abs(val_deb) > 0:
+                monto = abs(val_deb)
+                tipo = "GASTO"
+            elif val_cred and abs(val_cred) > 0:
+                monto = abs(val_cred)
+                tipo = "INGRESO"
+        elif col_monto:
+            val_m = _limpiar_num(r[col_monto]) if pd.notnull(r[col_monto]) and str(r[col_monto]).strip() != "" else 0.0
+            if val_m < 0:
+                monto = abs(val_m)
+                tipo = "GASTO"
+            elif val_m > 0:
+                monto = val_m
+                tipo = "INGRESO"
+
+        if monto > 0:
+            movimientos.append({
+                "fecha": f_limpia,
+                "concepto": desc_val,
+                "monto": monto,
+                "tipo": tipo
+            })
+
+    return movimientos
+
 # ==================== MOTOR CUANTITATIVO DE FINANZAS PERSONALES (ARS) ====================
 def calcular_metricas_finanzas_completas(user_id: int, meses_lookback: int = 6):
-    """
-    Calcula de forma nativa en Python métricas completas de finanzas personales:
-    - Separa Gastos de Consumo Real vs Pases a Inversión/Ahorro en USD.
-    - Promedios mensuales de ingreso, costo de vida y superávit neto.
-    - Tasa de ahorro histórica real (Savings Rate %).
-    - Detección cuantitativa de Gastos Hormiga y Ley de Pareto sobre el consumo real.
-    - Desvío MoM y Runway institucional.
-    """
     with get_db_connection() as conn:
         df_mov = pd.read_sql(
             """SELECT fecha, tipo, monto, categoria, descripcion 
@@ -451,11 +530,6 @@ def calcular_metricas_finanzas_completas(user_id: int, meses_lookback: int = 6):
 
 # ==================== RENDIMIENTO MENSUAL EXACTO (CONSISTENTE CON /SPY) ====================
 def calcular_rendimiento_por_meses(user_id: int, anio: int = None):
-    """
-    Calcula el rendimiento porcentual mensual exacto de la cartera de trading.
-    Utiliza idéntica base de capital ponderada que /spy y la curva consolidada.
-    Si se especifica anio (ej. 2026), filtra únicamente los meses de ese año.
-    """
     with get_db_connection() as conn:
         df_tc = pd.read_sql(
             "SELECT fecha, pnl_usd, monto_invertido FROM trades_cerrados WHERE user_id = %s ORDER BY fecha ASC;",
@@ -954,13 +1028,17 @@ def calcular_pivots_y_niveles(df, ventana=4):
     if ult_highs and ult_lows:
         last_high = ult_highs[-1]
         last_low = ult_lows[-1]
-        
-        if precio_actual < last_low:
+        prev_close = float(df['Close'].dropna().iloc[-2]) if len(df) > 1 else precio_actual
+
+        # 1. Roturas reales que ocurrieron en la última vela:
+        if prev_close >= last_low and precio_actual < last_low:
             estructura_txt = f"🔴 Se rompió un piso/mínimo importante (${last_low:,.2f}) — Presión bajista activa"
             estructura_bias = "choch_bajista"
-        elif precio_actual > last_high:
+        elif prev_close <= last_high and precio_actual > last_high:
             estructura_txt = f"🟢 Se rompió un techo/máximo importante (${last_high:,.2f}) — Posible giro alcista"
             estructura_bias = "choch_alcista"
+
+        # 2. Si no es un quiebre nuevo, evaluar la tendencia de fondo:
         elif len(ult_highs) >= 2 and len(ult_lows) >= 2:
             if ult_highs[-1] < ult_highs[-2] and ult_lows[-1] < ult_lows[-2]:
                 estructura_txt = "Estructura BAJISTA sólida (Máximos y mínimos descendentes)"
@@ -2256,7 +2334,7 @@ def _hash_alerta(tipo: str, clave: str, detalle: str = "") -> str:
     raw = f"{tipo}|{clave}|{detalle}"
     return hashlib.sha256(raw.encode()).hexdigest()[:32]
 
-def alerta_ya_enviada(user_id: int, hash_a: str, horas_ventana: int = 12) -> bool:
+def alerta_ya_enviada(user_id: int, hash_a: str, horas_ventana: int = 72) -> bool:
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
@@ -2278,6 +2356,7 @@ def registrar_alerta_enviada(user_id: int, tipo: str, clave: str, hash_a: str):
 
 def generar_alertas_para_usuario(user_id: int) -> list:
     alertas = []
+    es_fin_de_semana = ahora_argentina().weekday() >= 5
 
     resumen = obtener_resumen_portafolio(user_id)
     if resumen:
@@ -2296,6 +2375,11 @@ def generar_alertas_para_usuario(user_id: int) -> list:
 
     if resumen:
         tickers = list({p['ticker'] for p in resumen["posiciones"] if p['ticker'] not in ["USDT", "USDC", "DAI", "USD"]})
+        
+        # En fin de semana, ignorar acciones tradicionales cerradas
+        if es_fin_de_semana:
+            tickers = [t for t in tickers if t in CRIPTOS_COMUNES or t.endswith("-USD")]
+
         for tk in tickers[:8]:
             try:
                 _, info = generar_grafico_analisis_tecnico(tk, "diario")
@@ -2310,7 +2394,7 @@ def generar_alertas_para_usuario(user_id: int) -> list:
                     if poc and not np.isnan(poc) and abs(p_act - poc) / p_act <= 0.008:
                         clave = f"{tk}_test_poc"
                         h = _hash_alerta("poc_test", clave, "")
-                        if not alerta_ya_enviada(user_id, h, horas_ventana=24):
+                        if not alerta_ya_enviada(user_id, h, horas_ventana=48):
                             alertas.append({
                                 "texto": f"🎯 TESTEO DE POC INSTITUCIONAL\n{tk} está testeando su POC de volumen en ${poc:,.2f} (Precio: ${p_act:,.2f}). Zona de alta reacción.",
                                 "tipo": "poc_test",
@@ -2321,7 +2405,7 @@ def generar_alertas_para_usuario(user_id: int) -> list:
                     if bias == "choch_alcista":
                         clave = f"{tk}_choch_up"
                         h = _hash_alerta("choch", clave, "")
-                        if not alerta_ya_enviada(user_id, h, horas_ventana=24):
+                        if not alerta_ya_enviada(user_id, h, horas_ventana=72):
                             alertas.append({
                                 "texto": f"🟢 CAMBIO DE ESTRUCTURA\n{tk} rompió un techo/máximo importante en ${p_act:,.2f}. Es posible un cambio a tendencia alcista.",
                                 "tipo": "choch",
@@ -2331,7 +2415,7 @@ def generar_alertas_para_usuario(user_id: int) -> list:
                     elif bias == "choch_bajista":
                         clave = f"{tk}_choch_down"
                         h = _hash_alerta("choch", clave, "")
-                        if not alerta_ya_enviada(user_id, h, horas_ventana=24):
+                        if not alerta_ya_enviada(user_id, h, horas_ventana=72):
                             alertas.append({
                                 "texto": f"🔴 CAMBIO DE ESTRUCTURA\n{tk} rompió un piso/mínimo importante en ${p_act:,.2f}. Es posible un cambio a tendencia bajista.",
                                 "tipo": "choch",
@@ -2354,7 +2438,7 @@ def generar_alertas_para_usuario(user_id: int) -> list:
                     if tipo_senal:
                         clave = f"{tk}_{tipo_senal}"
                         h = _hash_alerta("rsi_senal", clave, "")
-                        if not alerta_ya_enviada(user_id, h, horas_ventana=18):
+                        if not alerta_ya_enviada(user_id, h, horas_ventana=72):
                             extra_stat = ""
                             if hist and hist.get('desglose'):
                                 d = {x['horizonte']: x for x in hist['desglose']}
@@ -2489,9 +2573,124 @@ REGLAS DE ACTUACIÓN:
    - Borrados: ACCION: BORRAR_INVERSION_ID|[ID] / ACCION: BORRAR_MOVIMIENTO_ID|[ID] / ACCION: BORRAR_ULTIMO
 
 3. SI EL USUARIO PREGUNTA COSAS ESPECÍFICAS DE SU CARTERA O HISTORIAL:
-   (Ej: "¿a qué precio compré MELI?", "¿cuánto gané en Bitcoin?", "¿cuál fue mi último gasto?"):
    Respóndele con precisión y de forma concisa usando los datos del CONTEXTO DEL USUARIO.
 """
+
+# ==================== FLUJO INTERACTIVO DE IMPORTACIÓN DE EXCEL ====================
+async def manejar_documento_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    doc = update.message.document
+    nombre_archivo = doc.file_name.lower()
+
+    if not (nombre_archivo.endswith(".xlsx") or nombre_archivo.endswith(".xls")):
+        await update.message.reply_text("Por favor enviame un archivo Excel válido (.xlsx o .xls).")
+        return
+
+    await update.message.reply_text("📥 Leyendo extracto bancario...")
+    archivo = await context.bot.get_file(doc.file_id)
+    archivo_bytes = await archivo.download_as_bytearray()
+
+    movimientos = parsear_extracto_bancario(bytes(archivo_bytes))
+    if not movimientos:
+        await update.message.reply_text("⚠️ No pude encontrar movimientos legibles en el extracto. Verificá que el archivo tenga columnas de Fecha, Concepto e Importe/Débito/Crédito.")
+        return
+
+    importaciones_activas[user_id] = {
+        "items": movimientos,
+        "idx": 0,
+        "guardados": 0,
+        "omitidos": 0
+    }
+
+    await presentar_siguiente_movimiento(update, user_id)
+
+async def presentar_siguiente_movimiento(update: Update, user_id: int):
+    sesion = importaciones_activas.get(user_id)
+    if not sesion:
+        return
+
+    idx = sesion["idx"]
+    items = sesion["items"]
+
+    if idx >= len(items):
+        g = sesion["guardados"]
+        o = sesion["omitidos"]
+        del importaciones_activas[user_id]
+        await update.message.reply_text(
+            f"✅ ¡Importación completada!\n\n"
+            f"• Registrados en tu historial: {g}\n"
+            f"• Descartados / omitidos: {o}\n\n"
+            f"Podés ver tu nuevo estado con /gastos o /mes."
+        )
+        return
+
+    item = items[idx]
+    em = "🔴 GASTO" if item["tipo"] == "GASTO" else "🟢 INGRESO"
+    msg = (
+        f"📄 Movimiento {idx + 1} de {len(items)}:\n\n"
+        f"• Fecha: {item['fecha']}\n"
+        f"• Tipo: {em}\n"
+        f"• Monto: ${item['monto']:,.2f} ARS\n"
+        f"• Concepto del banco: {item['concepto']}\n\n"
+        f"¿Querés registrarlo? Respondeme por ejemplo:\n"
+        f"• 'Supermercado, compra semanal'\n"
+        f"• O simplemente 'No', 'Paso' u 'Omitir' para saltearlo.\n"
+        f"• O 'Cancelar' para frenar toda la importación."
+    )
+    await update.message.reply_text(msg)
+
+async def procesar_respuesta_importacion(update: Update, user_id: int, user_text: str) -> bool:
+    sesion = importaciones_activas.get(user_id)
+    if not sesion:
+        return False
+
+    tlow = user_text.strip().lower()
+    if tlow in ("cancelar", "abortar", "salir", "detener"):
+        del importaciones_activas[user_id]
+        await update.message.reply_text("🛑 Importación cancelada.")
+        return True
+
+    idx = sesion["idx"]
+    item = sesion["items"][idx]
+
+    if tlow in ("no", "paso", "omitir", "saltear", "descartar", "nop"):
+        sesion["omitidos"] += 1
+        sesion["idx"] += 1
+        await presentar_siguiente_movimiento(update, user_id)
+        return True
+
+    # Usamos Gemini para normalizar la categoría y descripción dada la respuesta del usuario
+    prompt = f"""El usuario recibió este movimiento de su banco:
+Tipo: {item['tipo']}
+Monto: {item['monto']} ARS
+Fecha: {item['fecha']}
+Concepto original del banco: "{item['concepto']}"
+
+El usuario respondió: "{user_text}"
+
+Determina la categoría y descripción final de forma limpia y profesional.
+Responde ÚNICAMENTE en este formato exacto:
+CATEGORIA|DESCRIPCION
+
+Ejemplo:
+Comida|Supermercado Coto compra semanal
+"""
+    try:
+        res = llamar_gemini(prompt, "Eres un clasificador contable profesional. Devuelve solo CATEGORIA|DESCRIPCION.")
+        partes = [p.strip() for p in res.strip().split("|")]
+        cat_final = partes[0].capitalize() if len(partes) > 0 and partes[0] else "Varios"
+        desc_final = partes[1] if len(partes) > 1 and partes[1] else item["concepto"]
+    except Exception:
+        cat_final = "Varios"
+        desc_final = user_text.strip()
+
+    guardar_movimiento(user_id, item["tipo"], item["monto"], cat_final, desc_final, item["fecha"])
+    sesion["guardados"] += 1
+    sesion["idx"] += 1
+
+    await update.message.reply_text(f"✅ Guardado como {cat_final}: {desc_final}")
+    await presentar_siguiente_movimiento(update, user_id)
+    return True
 
 # ==================== COMANDOS RÁPIDOS ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2510,7 +2709,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /gastos     →  Costo de vida, Tasa de Ahorro y Gastos Hormiga\n"
         "• /mes        →  Presupuestos y control del mes\n"
         "• /objetivos  →  Progreso de metas financieras\n"
-        "• /excel      →  Exportar planilla completa\n\n"
+        "• /excel      →  Exportar planilla completa\n"
+        "• Envía un archivo Excel (.xlsx) con tu extracto bancario para clasificar gastos uno a uno.\n\n"
         "También podés hablarme en lenguaje natural."
     )
 
@@ -2715,7 +2915,7 @@ async def cmd_resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with get_db_connection() as conn:
         df_tc = pd.read_sql("SELECT SUM(pnl_usd) as pnl_tot, COUNT(id) as total_c FROM trades_cerrados WHERE user_id = %s;", conn, params=(user_id,))
     pnl_realizado = float(df_tc['pnl_tot'].iloc[0]) if not df_tc.empty and pd.notnull(df_tc['pnl_tot'].iloc[0]) else 0.0
-    cant_c = int(df_tc['total_c'].iloc[0]) if not df_tc.empty and pd.notnull(df_tc['total_c'].iloc[0]) else 0.0
+    cant_c = int(df_tc['total_c'].iloc[0]) if not df_tc.empty and pd.notnull(df_tc['total_c'].iloc[0]) else 0
     
     if not resumen and cant_c == 0:
         await update.message.reply_text("📉 No tienes activos ni trades cargados todavía.")
@@ -2794,12 +2994,19 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_msg = update.message.text
 
+    # 1. Si hay una sesión activa de importación de extracto, responderle a esa sesión
+    if user_id in importaciones_activas:
+        if await procesar_respuesta_importacion(update, user_id, user_msg):
+            return
+
+    # 2. Filtro local ultra rápido (0 tokens)
     try:
         if await intentar_comando_local(update, user_id, user_msg):
             return
     except Exception as e:
         logger.error(f"Error comando local: {e}", exc_info=True)
 
+    # 3. Copiloto Cognitivo + Router
     try:
         contexto = resumen_compacto_para_ia(user_id)
         prompt = f"""CONTEXTO DEL USUARIO:
@@ -2957,6 +3164,10 @@ async def main():
     app.add_handler(CommandHandler("precio", cmd_precio_alias))
     app.add_handler(CommandHandler("excel", cmd_excel_alias))
     app.add_handler(CommandHandler("analisis", cmd_analisis_alias))
+    
+    # Handler para recibir archivos Excel del banco
+    app.add_handler(MessageHandler(filters.Document.ALL, manejar_documento_excel))
+    # Handler de texto y mensajes
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, responder))
     
     await app.initialize()
