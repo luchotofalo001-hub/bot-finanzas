@@ -141,6 +141,16 @@ def init_db():
                         fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     );
                 """)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS mapeo_conceptos (
+                        id SERIAL PRIMARY KEY,
+                        user_id BIGINT,
+                        patron_clave VARCHAR(100),
+                        categoria VARCHAR(50),
+                        descripcion_limpia TEXT,
+                        UNIQUE(user_id, patron_clave)
+                    );
+                """)
 
                 cursor.execute("ALTER TABLE movimientos ADD COLUMN IF NOT EXISTS user_id BIGINT;")
                 cursor.execute("ALTER TABLE portafolio_inversiones ADD COLUMN IF NOT EXISTS user_id BIGINT;")
@@ -184,6 +194,41 @@ def limpiar_estilo_telegram(texto: str) -> str:
     texto = re.sub(r"\n\s*---\s*\n", "\n\n", texto)
     texto = re.sub(r"\n{3,}", "\n\n", texto)
     return texto.strip()
+
+# ==================== APRENDIZAJE Y MAPEO DE CONCEPTOS BANCARIOS ====================
+def extraer_clave_comercio(concepto_crudo: str) -> str:
+    texto = str(concepto_crudo).upper()
+    texto = re.sub(r"\d{4}X+\d{2,4}", "", texto)
+    texto = re.sub(r"\b(COMPRA|DEBITO|CREDITO|TARJ|SUC|MERPAGO\*|MP\*|PAGO|TRANSFERENCIA)\b", "", texto)
+    texto = re.sub(r"[^A-Z0-9\s]", " ", texto)
+    partes = [p.strip() for p in texto.split() if len(p.strip()) >= 4]
+    return partes[0] if partes else concepto_crudo.strip().upper()[:30]
+
+def buscar_clasificacion_previa(user_id: int, concepto: str):
+    clave = extraer_clave_comercio(concepto)
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT categoria, descripcion_limpia FROM mapeo_conceptos WHERE user_id = %s AND patron_clave = %s;",
+                (user_id, clave)
+            )
+            res = cursor.fetchone()
+            if res:
+                return res[0], res[1], clave
+    return None, None, clave
+
+def guardar_aprendizaje_concepto(user_id: int, clave: str, categoria: str, descripcion: str):
+    if not clave or len(clave) < 3:
+        return
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                INSERT INTO mapeo_conceptos (user_id, patron_clave, categoria, descripcion_limpia)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (user_id, patron_clave)
+                DO UPDATE SET categoria = EXCLUDED.categoria, descripcion_limpia = EXCLUDED.descripcion_limpia;
+            """, (user_id, clave, categoria, descripcion))
+            conn.commit()
 
 # ==================== CONSULTAS DE MERCADO EN VIVO ====================
 CRIPTOS_COMUNES = {
@@ -329,7 +374,6 @@ def guardar_movimiento(user_id: int, tipo: str, monto: float, categoria: str, de
 
 # ==================== PARSER DE EXTRACTOS BANCARIOS (EXCEL) ====================
 def parsear_extracto_bancario(file_bytes: bytes) -> list:
-    """Lee un extracto bancario en Excel (.xlsx / .xls) y extrae las transacciones normalizadas."""
     try:
         df_raw = pd.read_excel(io.BytesIO(file_bytes), header=None)
     except Exception:
@@ -1030,7 +1074,7 @@ def calcular_pivots_y_niveles(df, ventana=4):
         last_low = ult_lows[-1]
         prev_close = float(df['Close'].dropna().iloc[-2]) if len(df) > 1 else precio_actual
 
-        # 1. Roturas reales que ocurrieron en la última vela:
+        # 1. Roturas reales ocurridas en la última vela:
         if prev_close >= last_low and precio_actual < last_low:
             estructura_txt = f"🔴 Se rompió un piso/mínimo importante (${last_low:,.2f}) — Presión bajista activa"
             estructura_bias = "choch_bajista"
@@ -1038,7 +1082,7 @@ def calcular_pivots_y_niveles(df, ventana=4):
             estructura_txt = f"🟢 Se rompió un techo/máximo importante (${last_high:,.2f}) — Posible giro alcista"
             estructura_bias = "choch_alcista"
 
-        # 2. Si no es un quiebre nuevo, evaluar la tendencia de fondo:
+        # 2. Si no es quiebre nuevo, evaluar tendencia de fondo:
         elif len(ult_highs) >= 2 and len(ult_lows) >= 2:
             if ult_highs[-1] < ult_highs[-2] and ult_lows[-1] < ult_lows[-2]:
                 estructura_txt = "Estructura BAJISTA sólida (Máximos y mínimos descendentes)"
@@ -2599,7 +2643,11 @@ async def manejar_documento_excel(update: Update, context: ContextTypes.DEFAULT_
         "items": movimientos,
         "idx": 0,
         "guardados": 0,
-        "omitidos": 0
+        "omitidos": 0,
+        "esperando_recordar": False,
+        "patron_pendiente": None,
+        "cat_pendiente": None,
+        "desc_pendiente": None
     }
 
     await presentar_siguiente_movimiento(update, user_id)
@@ -2626,16 +2674,36 @@ async def presentar_siguiente_movimiento(update: Update, user_id: int):
 
     item = items[idx]
     em = "🔴 GASTO" if item["tipo"] == "GASTO" else "🟢 INGRESO"
+    
+    cat_sug, desc_sug, clave = buscar_clasificacion_previa(user_id, item["concepto"])
+    item["cat_sug"] = cat_sug
+    item["desc_sug"] = desc_sug
+    item["clave_patron"] = clave
+
+    if cat_sug:
+        opciones_txt = (
+            f"🏷️ Clasificación sugerida: {cat_sug} ({desc_sug})\n\n"
+            f"¿Querés registrarlo con esta categoría?\n"
+            f"• Respondé 'Si' u 'Ok' para guardarlo directo.\n"
+            f"• O escribí otra categoría si preferís cambiarla.\n"
+            f"• O 'No', 'Paso' u 'Omitir' para no guardarlo.\n"
+            f"• O 'Cancelar' para frenar la importación."
+        )
+    else:
+        opciones_txt = (
+            f"¿Querés registrarlo? Respondeme por ejemplo:\n"
+            f"• 'Panaderia, compra de pan'\n"
+            f"• O simplemente 'No', 'Paso' u 'Omitir' para no guardarlo.\n"
+            f"• O 'Cancelar' para frenar la importación."
+        )
+
     msg = (
         f"📄 Movimiento {idx + 1} de {len(items)}:\n\n"
         f"• Fecha: {item['fecha']}\n"
         f"• Tipo: {em}\n"
         f"• Monto: ${item['monto']:,.2f} ARS\n"
         f"• Concepto del banco: {item['concepto']}\n\n"
-        f"¿Querés registrarlo? Respondeme por ejemplo:\n"
-        f"• 'Supermercado, compra semanal'\n"
-        f"• O simplemente 'No', 'Paso' u 'Omitir' para saltearlo.\n"
-        f"• O 'Cancelar' para frenar toda la importación."
+        f"{opciones_txt}"
     )
     await update.message.reply_text(msg)
 
@@ -2650,6 +2718,27 @@ async def procesar_respuesta_importacion(update: Update, user_id: int, user_text
         await update.message.reply_text("🛑 Importación cancelada.")
         return True
 
+    # 1. Si estábamos esperando que el usuario elija si recordar o no el patrón
+    if sesion.get("esperando_recordar"):
+        clave = sesion["patron_pendiente"]
+        cat = sesion["cat_pendiente"]
+        desc = sesion["desc_pendiente"]
+
+        if tlow in ("si", "sí", "s", "yes", "dale", "ok", "guardalo", "recordar"):
+            guardar_aprendizaje_concepto(user_id, clave, cat, desc)
+            await update.message.reply_text(f"🧠 ¡Listo! Recordaré que '{clave}' suele ser {cat}.")
+        else:
+            await update.message.reply_text("👌 Perfecto, no lo guardo como regla fija.")
+
+        sesion["esperando_recordar"] = False
+        sesion["patron_pendiente"] = None
+        sesion["cat_pendiente"] = None
+        sesion["desc_pendiente"] = None
+        sesion["idx"] += 1
+        await presentar_siguiente_movimiento(update, user_id)
+        return True
+
+    # 2. Flujo normal de cada movimiento
     idx = sesion["idx"]
     item = sesion["items"][idx]
 
@@ -2659,35 +2748,66 @@ async def procesar_respuesta_importacion(update: Update, user_id: int, user_text
         await presentar_siguiente_movimiento(update, user_id)
         return True
 
-    # Usamos Gemini para normalizar la categoría y descripción dada la respuesta del usuario
-    prompt = f"""El usuario recibió este movimiento de su banco:
+    cat_sug = item.get("cat_sug")
+    desc_sug = item.get("desc_sug")
+    clave = item.get("clave_patron")
+
+    # Si el usuario confirma la sugerencia aprendida
+    if cat_sug and tlow in ("si", "sí", "ok", "dale", "guardalo", "s", "yes", "confirmo"):
+        cat_final = cat_sug
+        desc_final = desc_sug
+        guardar_movimiento(user_id, item["tipo"], item["monto"], cat_final, desc_final, item["fecha"])
+        sesion["guardados"] += 1
+        sesion["idx"] += 1
+        await update.message.reply_text(f"✅ Guardado como {cat_final}: {desc_final}")
+        await presentar_siguiente_movimiento(update, user_id)
+        return True
+
+    # Si es una categoría nueva o sobreescrita por el usuario
+    prompt = f"""El usuario recibió este movimiento bancario:
 Tipo: {item['tipo']}
 Monto: {item['monto']} ARS
 Fecha: {item['fecha']}
-Concepto original del banco: "{item['concepto']}"
+Concepto original: "{item['concepto']}"
 
-El usuario respondió: "{user_text}"
+El usuario indicó: "{user_text}"
 
-Determina la categoría y descripción final de forma limpia y profesional.
-Responde ÚNICAMENTE en este formato exacto:
+Determina la categoría y descripción final de forma concisa.
+Responde ÚNICAMENTE en este formato:
 CATEGORIA|DESCRIPCION
 
 Ejemplo:
-Comida|Supermercado Coto compra semanal
+Nafta|Estación de servicio YPF
 """
     try:
         res = llamar_gemini(prompt, "Eres un clasificador contable profesional. Devuelve solo CATEGORIA|DESCRIPCION.")
         partes = [p.strip() for p in res.strip().split("|")]
         cat_final = partes[0].capitalize() if len(partes) > 0 and partes[0] else "Varios"
-        desc_final = partes[1] if len(partes) > 1 and partes[1] else item["concepto"]
+        desc_final = partes[1] if len(partes) > 1 and partes[1] else user_text.strip()
     except Exception:
         cat_final = "Varios"
         desc_final = user_text.strip()
 
+    # Guardamos el movimiento en la base de datos
     guardar_movimiento(user_id, item["tipo"], item["monto"], cat_final, desc_final, item["fecha"])
     sesion["guardados"] += 1
-    sesion["idx"] += 1
 
+    # Preguntamos si desea recordar el patrón para el futuro
+    if clave and len(clave) >= 3 and clave != cat_sug:
+        sesion["esperando_recordar"] = True
+        sesion["patron_pendiente"] = clave
+        sesion["cat_pendiente"] = cat_final
+        sesion["desc_pendiente"] = desc_final
+
+        await update.message.reply_text(
+            f"✅ Guardado como {cat_final}: {desc_final}\n\n"
+            f"¿Querés que recuerde que '{clave}' es siempre '{cat_final}' para próximos extractos?\n"
+            f"• Respondé 'Si' para guardarlo en la memoria.\n"
+            f"• O 'No' si solo fue esta vez puntual."
+        )
+        return True
+
+    sesion["idx"] += 1
     await update.message.reply_text(f"✅ Guardado como {cat_final}: {desc_final}")
     await presentar_siguiente_movimiento(update, user_id)
     return True
@@ -2905,8 +3025,9 @@ async def cmd_borrar_todo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cursor.execute("DELETE FROM movimientos WHERE user_id = %s;", (user_id,))
             cursor.execute("DELETE FROM portafolio_inversiones WHERE user_id = %s;", (user_id,))
             cursor.execute("DELETE FROM trades_cerrados WHERE user_id = %s;", (user_id,))
+            cursor.execute("DELETE FROM mapeo_conceptos WHERE user_id = %s;", (user_id,))
             conn.commit()
-    await update.message.reply_text("🗑️ Tu base de datos, cartera y trades cerrados han sido reseteados.")
+    await update.message.reply_text("🗑️ Tu base de datos, cartera, trades cerrados y patrones aprendidos han sido reseteados.")
 
 async def cmd_resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
