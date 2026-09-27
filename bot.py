@@ -57,6 +57,7 @@ ALERTA_INTERVALO_HORAS = 3
 UMBRAL_LIQUIDACION_PCT = 15.0
 UMBRAL_GASTO_INUSUAL = 2.2
 UMBRAL_GASTO_HORMIGA_ARS = 15000.0
+UMBRAL_AUTO_APROBAR = 3  # Si se confirmó 3 o más veces, se registra directo sin preguntar
 
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
@@ -149,10 +150,12 @@ def init_db():
                         patron_clave VARCHAR(100),
                         categoria VARCHAR(50),
                         descripcion_limpia TEXT,
+                        usos_exitosos INTEGER DEFAULT 1,
                         UNIQUE(user_id, patron_clave)
                     );
                 """)
 
+                cursor.execute("ALTER TABLE mapeo_conceptos ADD COLUMN IF NOT EXISTS usos_exitosos INTEGER DEFAULT 1;")
                 cursor.execute("ALTER TABLE movimientos ADD COLUMN IF NOT EXISTS user_id BIGINT;")
                 cursor.execute("ALTER TABLE portafolio_inversiones ADD COLUMN IF NOT EXISTS user_id BIGINT;")
                 cursor.execute("ALTER TABLE portafolio_inversiones ADD COLUMN IF NOT EXISTS tipo_posicion VARCHAR(10) DEFAULT 'SPOT';")
@@ -164,12 +167,8 @@ def init_db():
                 cursor.execute("UPDATE movimientos SET user_id = %s WHERE user_id IS NULL;", (LUCHO_TELEGRAM_ID,))
                 cursor.execute("UPDATE portafolio_inversiones SET user_id = %s WHERE user_id IS NULL;", (LUCHO_TELEGRAM_ID,))
                 cursor.execute("UPDATE trades_cerrados SET user_id = %s WHERE user_id IS NULL;", (LUCHO_TELEGRAM_ID,))
-
-                cursor.execute("UPDATE portafolio_inversiones SET tipo_posicion = 'SPOT' WHERE tipo_posicion IS NULL OR TRIM(tipo_posicion) = '';")
-                cursor.execute("UPDATE portafolio_inversiones SET apalancamiento = 1 WHERE apalancamiento IS NULL OR apalancamiento <= 0;")
-                cursor.execute("UPDATE portafolio_inversiones SET precio_compra = monto_total_usd / cantidad WHERE (precio_compra IS NULL OR precio_compra <= 0) AND cantidad > 0;")
                 conn.commit()
-        logger.info("Tablas inicializadas y normalizadas.")
+        logger.info("Base de datos inicializada correctamente.")
     except Exception as e:
         logger.error(f"Error en init_db: {e}")
 
@@ -196,51 +195,119 @@ def limpiar_estilo_telegram(texto: str) -> str:
     texto = re.sub(r"\n{3,}", "\n\n", texto)
     return texto.strip()
 
+# ==================== NORMALIZACIÓN DE CATEGORÍAS ====================
+MAPA_CANONICO_CATEGORIAS = {
+    "tarjetas de credito": "Tarjeta de crédito",
+    "tarjetas de crédito": "Tarjeta de crédito",
+    "tarjeta de credito": "Tarjeta de crédito",
+    "tarjeta de crédito": "Tarjeta de crédito",
+    "tarjetas": "Tarjeta de crédito",
+    "supermercados": "Supermercado",
+    "servicios basicos": "Servicios",
+    "servicios básicos": "Servicios",
+    "transferencia familiar": "Transferencias",
+    "ingresos familiares": "Transferencias",
+    "devolucion": "Devoluciones",
+    "devolución": "Devoluciones",
+    "panaderia": "Comida",
+    "panadería": "Comida",
+    "bazar": "Hogar",
+}
+
+def normalizar_categoria(cat: str) -> str:
+    c_low = cat.strip().lower()
+    return MAPA_CANONICO_CATEGORIAS.get(c_low, cat.strip().capitalize())
+
 # ==================== APRENDIZAJE Y MAPEO DE CONCEPTOS BANCARIOS ====================
+PALABRAS_PROHIBIDAS_PATRON = {
+    "COMPRA", "DEBITO", "CREDITO", "TARJ", "TARJETA", "SUC", "SUCURSAL", "PAGO", "PAGOS",
+    "TRANSFERENCIA", "TRANSFERENCIAS", "TERCERO", "TERCEROS", "DEBIN", "RECURRENTE", "RECURRENTES",
+    "ACREDITAMIENTO", "ACREDITACION", "HABERES", "SERVICIO", "SERVICIOS", "ANULACION", "ANULACIONES",
+    "DEVOLUCION", "DEVO", "DEV", "ELECTRON", "GALICIA", "BANCO", "COELSA", "PERCEPCION", "RETENCION",
+    "IMPUESTO", "IMPUESTOS", "VARIOS", "RESUMEN", "EXTRACTO", "STATEMENT", "SHOPPER", "PAYU", "MERPAGO",
+    "MERCADOPAGO", "MERCADO", "VENTA", "DOLARES", "MONEDA", "EXTRANJERA", "OPERACION", "VIAJES", "BUSES",
+    "INTERES", "CAPITALIZADO", "PROMOCION", "REINTEGRO", "REINTEGROS"
+}
+
 def extraer_clave_comercio(concepto_crudo: str) -> str:
     texto = str(concepto_crudo).upper()
-    texto = re.sub(r"\d{4}X+\d{2,4}", "", texto)
-    texto = re.sub(r"\b(COMPRA|DEBITO|CREDITO|TARJ|SUC|MERPAGO\*|MP\*|PAGO|TRANSFERENCIA|PAGO CON QR|PAGO DE SERVICIO)\b", "", texto)
+    texto = re.sub(r"\d{4}X+\d{2,4}", " ", texto)
+    texto = re.sub(r"\b\d{6,}\b", " ", texto)
     texto = re.sub(r"[^A-Z0-9\s]", " ", texto)
-    partes = [p.strip() for p in texto.split() if len(p.strip()) >= 4]
-    return partes[0] if partes else concepto_crudo.strip().upper()[:30]
+
+    tokens = texto.split()
+    tokens_utiles = [t for t in tokens if t not in PALABRAS_PROHIBIDAS_PATRON and len(t) >= 3 and not t.isdigit()]
+
+    if not tokens_utiles:
+        return ""
+
+    if "UBER" in tokens_utiles:
+        return "UBER"
+    if "SUBE" in tokens_utiles:
+        return "SUBE"
+    if "FARMACITY" in tokens_utiles:
+        return "FARMACITY"
+    if "PEDIDOSYA" in tokens_utiles:
+        return "PEDIDOSYA"
+    if "CINEMARK" in tokens_utiles:
+        return "CINEMARK"
+    if "METROGAS" in tokens_utiles:
+        return "METROGAS"
+    if "EDESUR" in tokens_utiles:
+        return "EDESUR"
+    if "HAVAS" in tokens_utiles:
+        return "HAVAS MEDIA"
+    if "FORNODELPAESE" in tokens_utiles:
+        return "FORNODELPAESE"
+    if "PETTISH" in tokens_utiles:
+        return "PETTISH"
+    if "DELFINA" in tokens_utiles and "SILVA" in tokens_utiles:
+        return "DELFINA SILVA"
+    if "UGARRIZA" in tokens_utiles:
+        return "MARINA LUZ (MAMA)"
+
+    return " ".join(tokens_utiles[:2])
 
 def buscar_clasificacion_previa(user_id: int, concepto: str):
     clave = extraer_clave_comercio(concepto)
+    if not clave:
+        return None, None, "", 0
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
-                "SELECT categoria, descripcion_limpia FROM mapeo_conceptos WHERE user_id = %s AND patron_clave = %s;",
+                "SELECT categoria, descripcion_limpia, COALESCE(usos_exitosos, 1) FROM mapeo_conceptos WHERE user_id = %s AND patron_clave = %s;",
                 (user_id, clave)
             )
             res = cursor.fetchone()
             if res:
-                return res[0], res[1], clave
-    return None, None, clave
+                return res[0], res[1], clave, int(res[2])
+    return None, None, clave, 0
 
 def guardar_aprendizaje_concepto(user_id: int, clave: str, categoria: str, descripcion: str):
-    if not clave or len(clave) < 3:
+    if not clave or len(clave) < 3 or clave in PALABRAS_PROHIBIDAS_PATRON:
         return
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute("""
-                INSERT INTO mapeo_conceptos (user_id, patron_clave, categoria, descripcion_limpia)
-                VALUES (%s, %s, %s, %s)
+                INSERT INTO mapeo_conceptos (user_id, patron_clave, categoria, descripcion_limpia, usos_exitosos)
+                VALUES (%s, %s, %s, %s, 1)
                 ON CONFLICT (user_id, patron_clave)
-                DO UPDATE SET categoria = EXCLUDED.categoria, descripcion_limpia = EXCLUDED.descripcion_limpia;
+                DO UPDATE SET 
+                    categoria = EXCLUDED.categoria, 
+                    descripcion_limpia = EXCLUDED.descripcion_limpia,
+                    usos_exitosos = mapeo_conceptos.usos_exitosos + 1;
             """, (user_id, clave, categoria, descripcion))
             conn.commit()
 
-# ==================== CONCILIACIÓN Y CRUCE DE BASE DE DATOS ====================
-def buscar_coincidencia_previa_db(user_id: int, monto: float, fecha_str: str):
-    """
-    Busca si en la base de datos ya se guardó un gasto previo con el mismo monto
-    en una ventana de +/- 3 días (típico débito genérico DEBIN/banco que fondeó este gasto).
-    """
+# ==================== CONCILIACIÓN ENTRE BANCO Y MERCADO PAGO ====================
+def buscar_coincidencia_previa_db(user_id: int, monto: float, fecha_str: str, origen_nuevo: str = "EXCEL"):
+    if origen_nuevo != "PDF_MP":
+        return None
+
     try:
         f_dt = datetime.strptime(fecha_str, "%Y-%m-%d")
-        f_min = (f_dt - timedelta(days=3)).strftime("%Y-%m-%d")
-        f_max = (f_dt + timedelta(days=3)).strftime("%Y-%m-%d")
+        f_min = (f_dt - timedelta(days=2)).strftime("%Y-%m-%d")
+        f_max = (f_dt + timedelta(days=2)).strftime("%Y-%m-%d")
     except Exception:
         f_min, f_max = fecha_str, fecha_str
 
@@ -253,6 +320,7 @@ def buscar_coincidencia_previa_db(user_id: int, monto: float, fecha_str: str):
                   AND tipo = 'GASTO' 
                   AND ABS(monto - %s) < 0.05 
                   AND fecha >= %s::date AND fecha <= %s::date
+                  AND (UPPER(descripcion) LIKE '%%DEBIN%%' OR UPPER(descripcion) LIKE '%%30703088534%%' OR UPPER(descripcion) LIKE '%%MERCADOLIBRE%%')
                 ORDER BY id DESC LIMIT 1;
             """, (user_id, monto, f_min, f_max))
             res = cursor.fetchone()
@@ -273,7 +341,7 @@ def borrar_movimiento_por_id_db(user_id: int, mov_id: int):
             cursor.execute("DELETE FROM movimientos WHERE id = %s AND user_id = %s;", (mov_id, user_id))
             conn.commit()
 
-# ==================== PARSER EXTRACTOS: EXCEL Y PDF MERCADO PAGO ====================
+# ==================== PARSER EXTRACTOS (FECHAS CORREGIDAS DD/MM/YYYY) ====================
 def parsear_extracto_bancario_excel(file_bytes: bytes) -> list:
     try:
         df_raw = pd.read_excel(io.BytesIO(file_bytes), header=None)
@@ -309,7 +377,10 @@ def parsear_extracto_bancario_excel(file_bytes: bytes) -> list:
             continue
 
         try:
-            f_limpia = pd.to_datetime(f_raw).strftime('%Y-%m-%d')
+            if isinstance(f_raw, (datetime, pd.Timestamp)):
+                f_limpia = f_raw.strftime('%Y-%m-%d')
+            else:
+                f_limpia = pd.to_datetime(f_raw, dayfirst=True).strftime('%Y-%m-%d')
         except Exception:
             f_cand = str(f_raw).split()[0]
             f_limpia = f_cand if re.match(r"^\d{4}-\d{2}-\d{2}$", f_cand) else ahora_argentina().strftime('%Y-%m-%d')
@@ -411,15 +482,12 @@ def parsear_extracto_pdf_mercadopago(file_bytes: bytes) -> list:
     for item in movs_crudos:
         desc_low = item["concepto"].lower()
 
-        # 1. Ignorar micro-rendimientos diarios de Mercado Fondo
         if "rendimiento" in desc_low:
             continue
 
-        # 2. Ignorar transferencias a cuentas propias
         if "luciano tofalo" in desc_low:
             continue
 
-        # 3. Ignorar ingreso transitorio si hay salida idéntica con el mismo ID de operación
         if item["tipo"] == "INGRESO":
             hermanos = ids_operacion.get(item["id_op"], [])
             hay_salida_espejo = any(h["tipo"] == "GASTO" and abs(h["monto"] - item["monto"]) < 0.01 for h in hermanos)
@@ -554,7 +622,7 @@ def resolver_fecha_inicio(periodo_str: str, fecha_compra_db: str = None):
 # ==================== OPERACIONES DE MOVIMIENTOS ARS ====================
 def guardar_movimiento(user_id: int, tipo: str, monto: float, categoria: str, descripcion: str, fecha_str: str = None):
     tipo = tipo.strip().upper()
-    categoria = categoria.strip().capitalize()
+    categoria = normalizar_categoria(categoria)
     descripcion = descripcion.strip()
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
@@ -589,34 +657,35 @@ def calcular_metricas_finanzas_completas(user_id: int, meses_lookback: int = 6):
 
     df_mov['fecha'] = pd.to_datetime(df_mov['fecha'])
     df_mov['mes_periodo'] = df_mov['fecha'].dt.to_period('M')
-    
-    df_gastos_totales = df_mov[df_mov['tipo'] == 'GASTO'].copy()
-    df_ingresos = df_mov[df_mov['tipo'] == 'INGRESO'].copy()
+    df_mov['categoria'] = df_mov['categoria'].apply(normalizar_categoria)
 
-    if df_gastos_totales.empty and df_ingresos.empty:
-        return "No hay registros suficientes de ingresos o gastos."
-
-    cant_meses_reales = max(1, df_mov['mes_periodo'].nunique())
-    
     tags_inversion = {'inversion', 'inversión', 'ahorro', 'usdt', 'crypto', 'cripto', 'broker', 'dolares', 'dólares'}
-    
-    def es_pase_inversion(row):
+
+    def es_registro_ahorro(row):
         cat = str(row['categoria']).lower().strip()
         desc = str(row['descripcion']).lower().strip()
         return cat in tags_inversion or any(t in desc for t in tags_inversion)
 
-    es_inversion = df_gastos_totales.apply(es_pase_inversion, axis=1) if not df_gastos_totales.empty else pd.Series(dtype=bool)
-    
-    df_consumo = df_gastos_totales[~es_inversion].copy() if not df_gastos_totales.empty else pd.DataFrame()
-    df_pases_inv = df_gastos_totales[es_inversion].copy() if not df_gastos_totales.empty else pd.DataFrame()
+    df_mov['es_ahorro'] = df_mov.apply(es_registro_ahorro, axis=1)
 
-    tot_ingresos = float(df_ingresos['monto'].sum()) if not df_ingresos.empty else 0.0
+    df_gastos_totales = df_mov[df_mov['tipo'] == 'GASTO'].copy()
+    df_ingresos_totales = df_mov[df_mov['tipo'] == 'INGRESO'].copy()
+
+    df_consumo = df_gastos_totales[~df_gastos_totales['es_ahorro']].copy()
+    df_salidas_ahorro = df_gastos_totales[df_gastos_totales['es_ahorro']].copy()
+
+    df_ingresos_reales = df_ingresos_totales[~df_ingresos_totales['es_ahorro']].copy()
+    df_entradas_ahorro = df_ingresos_totales[df_ingresos_totales['es_ahorro']].copy()
+
+    cant_meses_reales = max(1, df_mov['mes_periodo'].nunique())
+
+    tot_ingresos = float(df_ingresos_reales['monto'].sum()) if not df_ingresos_reales.empty else 0.0
     tot_consumo = float(df_consumo['monto'].sum()) if not df_consumo.empty else 0.0
-    tot_pases_inv = float(df_pases_inv['monto'].sum()) if not df_pases_inv.empty else 0.0
-    
+    tot_ahorro_derivado = float(df_salidas_ahorro['monto'].sum()) if not df_salidas_ahorro.empty else 0.0
+
     prom_ingreso_mensual = tot_ingresos / cant_meses_reales
     prom_consumo_mensual = tot_consumo / cant_meses_reales
-    prom_pases_inv = tot_pases_inv / cant_meses_reales
+    prom_ahorro_derivado = tot_ahorro_derivado / cant_meses_reales
     
     superavit_mensual_prom = prom_ingreso_mensual - prom_consumo_mensual
     tasa_ahorro_pct = ((tot_ingresos - tot_consumo) / tot_ingresos * 100.0) if tot_ingresos > 0 else 0.0
@@ -646,9 +715,9 @@ def calcular_metricas_finanzas_completas(user_id: int, meses_lookback: int = 6):
         f"📊 RADIOGRAFÍA FINANCIERA (Últimos {cant_meses_reales} meses)",
         "",
         "💵 Flujo de Caja y Ahorro",
-        f"• Ingresos promedio:       ${prom_ingreso_mensual:,.0f} ARS/mes",
+        f"• Ingresos habituales:     ${prom_ingreso_mensual:,.0f} ARS/mes",
         f"• Costo de vida (consumo): ${prom_consumo_mensual:,.0f} ARS/mes",
-        f"• Derivado a USDT/Ahorro:  ${prom_pases_inv:,.0f} ARS/mes",
+        f"• Derivado a Ahorro/USDT:  ${prom_ahorro_derivado:,.0f} ARS/mes",
         f"• Capacidad neta de ahorro: ${superavit_mensual_prom:+,.0f} ARS/mes",
         f"• Tasa de ahorro real:     {tasa_ahorro_pct:.1f}% del ingreso"
     ]
@@ -673,7 +742,7 @@ def calcular_metricas_finanzas_completas(user_id: int, meses_lookback: int = 6):
     for cat, val in cat_totales.head(4).items():
         pct = (val / tot_consumo * 100.0) if tot_consumo > 0 else 0.0
         prom_cat = val / cant_meses_reales
-        lineas.append(f"• {cat:<14} → ${prom_cat:,.0f} ARS/mes ({pct:.1f}%)")
+        lineas.append(f"• {cat:<18} → ${prom_cat:,.0f} ARS/mes ({pct:.1f}%)")
         acum += pct
     if tot_consumo > 0:
         lineas.append(f"   (Estas categorías explican el {acum:.0f}% de tus gastos reales de vida)")
@@ -1967,6 +2036,8 @@ def modificar_movimiento_por_id(user_id: int, mov_id: int, campo: str, nuevo_val
                 cursor.execute("UPDATE movimientos SET monto = %s WHERE id = %s AND user_id = %s;", (float(val), mov_id, user_id))
             elif col == "fecha":
                 cursor.execute("UPDATE movimientos SET fecha = %s WHERE id = %s AND user_id = %s;", (val, mov_id, user_id))
+            elif col == "categoria":
+                cursor.execute("UPDATE movimientos SET categoria = %s WHERE id = %s AND user_id = %s;", (normalizar_categoria(val), mov_id, user_id))
             else:
                 cursor.execute(f"UPDATE movimientos SET {col} = %s WHERE id = %s AND user_id = %s;", (val.capitalize(), mov_id, user_id))
             conn.commit()
@@ -2359,7 +2430,7 @@ def set_presupuesto(user_id: int, categoria: str, monto_limite: float, mes: int 
     ahora = ahora_argentina()
     mes = mes or ahora.month
     anio = anio or ahora.year
-    categoria = categoria.strip().capitalize()
+    categoria = normalizar_categoria(categoria)
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute("""
@@ -2393,7 +2464,13 @@ def obtener_progreso_presupuestos(user_id: int, mes: int = None, anio: int = Non
     if df_pres.empty:
         return None, "No tenés presupuestos cargados para este mes. Decime por ejemplo: 'Presupuesto Comida 180000'"
 
-    gastos_dict = dict(zip(df_gastos['categoria'], df_gastos['gastado'])) if not df_gastos.empty else {}
+    df_pres['categoria'] = df_pres['categoria'].apply(normalizar_categoria)
+    if not df_gastos.empty:
+        df_gastos['categoria'] = df_gastos['categoria'].apply(normalizar_categoria)
+        gastos_dict = df_gastos.groupby('categoria')['gastado'].sum().to_dict()
+    else:
+        gastos_dict = {}
+
     lineas = [f"📅 PRESUPUESTOS — {mes:02d}/{anio}", ""]
     total_limite = 0.0
     total_gastado = 0.0
@@ -2534,7 +2611,6 @@ def generar_alertas_para_usuario(user_id: int) -> list:
     if resumen:
         tickers = list({p['ticker'] for p in resumen["posiciones"] if p['ticker'] not in ["USDT", "USDC", "DAI", "USD"]})
         
-        # En fin de semana, ignorar acciones tradicionales cerradas
         if es_fin_de_semana:
             tickers = [t for t in tickers if t in CRIPTOS_COMUNES or t.endswith("-USD")]
 
@@ -2748,7 +2824,8 @@ async def manejar_documento_extracto(update: Update, context: ContextTypes.DEFAU
     archivo = await context.bot.get_file(doc.file_id)
     archivo_bytes = bytes(await archivo.download_as_bytearray())
 
-    if nombre.endswith(".pdf"):
+    tipo_origen = "PDF_MP" if nombre.endswith(".pdf") else "EXCEL"
+    if tipo_origen == "PDF_MP":
         movimientos = parsear_extracto_pdf_mercadopago(archivo_bytes)
     else:
         movimientos = parsear_extracto_bancario_excel(archivo_bytes)
@@ -2758,9 +2835,11 @@ async def manejar_documento_extracto(update: Update, context: ContextTypes.DEFAU
         return
 
     importaciones_activas[user_id] = {
+        "origen": tipo_origen,
         "items": movimientos,
         "idx": 0,
         "guardados": 0,
+        "auto_aprobados": 0,
         "omitidos": 0,
         "reemplazados": 0,
         "esperando_reemplazo": False,
@@ -2778,42 +2857,57 @@ async def presentar_siguiente_movimiento(update: Update, user_id: int):
     if not sesion:
         return
 
-    idx = sesion["idx"]
     items = sesion["items"]
 
-    if idx >= len(items):
+    # Procesar de forma automática movimientos con alta recurrencia histórica
+    while sesion["idx"] < len(items):
+        item = items[sesion["idx"]]
+        cat_sug, desc_sug, clave, usos = buscar_clasificacion_previa(user_id, item["concepto"])
+
+        # Si el concepto se repitió varias veces en meses anteriores, se auto-aprueba
+        if cat_sug and usos >= UMBRAL_AUTO_APROBAR:
+            guardar_movimiento(user_id, item["tipo"], item["monto"], cat_sug, desc_sug, item["fecha"])
+            guardar_aprendizaje_concepto(user_id, clave, cat_sug, desc_sug)
+            sesion["guardados"] += 1
+            sesion["auto_aprobados"] += 1
+            sesion["idx"] += 1
+            continue
+
+        break
+
+    if sesion["idx"] >= len(items):
         g = sesion["guardados"]
+        auto = sesion["auto_aprobados"]
         o = sesion["omitidos"]
         r = sesion["reemplazados"]
         del importaciones_activas[user_id]
         
         reemp_txt = f"\n• Duplicados genéricos reemplazados: {r}" if r > 0 else ""
+        auto_txt = f"\n• Auto-registrados (comercios habituales): {auto}" if auto > 0 else ""
         await update.message.reply_text(
             f"✅ ¡Importación completada!\n\n"
-            f"• Registrados en tu historial: {g}\n"
+            f"• Registrados en tu historial: {g}{auto_txt}\n"
             f"• Descartados / omitidos: {o}{reemp_txt}\n\n"
             f"Podés ver tu nuevo estado con /gastos o /mes."
         )
         return
 
+    idx = sesion["idx"]
     item = items[idx]
     em = "🔴 GASTO" if item["tipo"] == "GASTO" else "🟢 INGRESO"
 
-    # Cruce con la base de datos para detectar si ya hay un débito genérico previo con este monto
-    coincidencia = buscar_coincidencia_previa_db(user_id, item["monto"], item["fecha"])
+    coincidencia = buscar_coincidencia_previa_db(user_id, item["monto"], item["fecha"], sesion.get("origen", "EXCEL"))
     if coincidencia and item["tipo"] == "GASTO":
         sesion["esperando_reemplazo"] = True
         sesion["coincidencia_previa"] = coincidencia
 
         msg = (
             f"🔍 POSIBLE DUPLICADO DETECTADO ({idx + 1}/{len(items)}):\n\n"
-            f"Encontré un movimiento ya registrado en tu banco:\n"
-            f"• Fecha: {coincidencia['fecha']}\n"
-            f"• Monto: ${coincidencia['monto']:,.2f} ARS\n"
-            f"• Detalle actual: {coincidencia['descripcion']} ({coincidencia['categoria']})\n\n"
-            f"En este nuevo extracto figura:\n"
-            f"• {item['concepto']} por ${item['monto']:,.2f} ARS el {item['fecha']}\n\n"
-            f"¿Querés REEMPLAZAR el registro genérico viejo por este nuevo detallado?\n"
+            f"Encontré un débito bancario genérico previo de ${coincidencia['monto']:,.2f} el {coincidencia['fecha']}:\n"
+            f"• '{coincidencia['descripcion']}' ({coincidencia['categoria']})\n\n"
+            f"En Mercado Pago figura la salida real:\n"
+            f"• '{item['concepto']}' por ${item['monto']:,.2f} ARS el {item['fecha']}\n\n"
+            f"¿Querés REEMPLAZAR el débito genérico por esta salida detallada?\n"
             f"• Respondé 'Si' para reemplazarlo (evita duplicar el gasto).\n"
             f"• Respondé 'No' para mantener ambos.\n"
             f"• Respondé 'Omitir' para saltear este movimiento."
@@ -2821,15 +2915,14 @@ async def presentar_siguiente_movimiento(update: Update, user_id: int):
         await update.message.reply_text(msg)
         return
 
-    # Si no hay duplicado, flujo normal de clasificación
-    cat_sug, desc_sug, clave = buscar_clasificacion_previa(user_id, item["concepto"])
+    cat_sug, desc_sug, clave, usos = buscar_clasificacion_previa(user_id, item["concepto"])
     item["cat_sug"] = cat_sug
     item["desc_sug"] = desc_sug
     item["clave_patron"] = clave
 
     if cat_sug:
         opciones_txt = (
-            f"🏷️ Clasificación sugerida: {cat_sug} ({desc_sug})\n\n"
+            f"🏷️ Clasificación sugerida ({usos}/{UMBRAL_AUTO_APROBAR} confirmaciones previas): {cat_sug} ({desc_sug})\n\n"
             f"¿Querés registrarlo con esta categoría?\n"
             f"• Respondé 'Si' u 'Ok' para guardarlo directo.\n"
             f"• O escribí otra categoría si preferís cambiarla.\n"
@@ -2868,7 +2961,7 @@ async def procesar_respuesta_importacion(update: Update, user_id: int, user_text
     idx = sesion["idx"]
     item = sesion["items"][idx]
 
-    # 1. Si estábamos resolviendo si reemplazar un movimiento viejo duplicado
+    # 1. Resolver reemplazo de duplicado
     if sesion.get("esperando_reemplazo"):
         coin = sesion["coincidencia_previa"]
         sesion["esperando_reemplazo"] = False
@@ -2877,7 +2970,7 @@ async def procesar_respuesta_importacion(update: Update, user_id: int, user_text
         if tlow in ("si", "sí", "s", "yes", "dale", "ok", "reemplazar"):
             borrar_movimiento_por_id_db(user_id, coin["id"])
             sesion["reemplazados"] += 1
-            await update.message.reply_text(f"🗑️ Se eliminó el gasto genérico previo de ${coin['monto']:,.2f} (ID {coin['id']}). Procedemos a guardar el detallado.")
+            await update.message.reply_text(f"🗑️ Se eliminó el gasto previo genérico de ${coin['monto']:,.2f} (ID {coin['id']}).")
         elif tlow in ("omitir", "saltear", "descartar"):
             sesion["omitidos"] += 1
             sesion["idx"] += 1
@@ -2886,7 +2979,7 @@ async def procesar_respuesta_importacion(update: Update, user_id: int, user_text
         else:
             await update.message.reply_text("👌 Se mantiene el registro previo. Procedemos a registrar este como adicional.")
 
-    # 2. Si estábamos esperando confirmación de recordar el comercio en memoria
+    # 2. Confirmación de recordar patrón
     if sesion.get("esperando_recordar"):
         clave = sesion["patron_pendiente"]
         cat = sesion["cat_pendiente"]
@@ -2906,7 +2999,7 @@ async def procesar_respuesta_importacion(update: Update, user_id: int, user_text
         await presentar_siguiente_movimiento(update, user_id)
         return True
 
-    # 3. Flujo normal de confirmación o descarte del movimiento
+    # 3. Descarte del movimiento
     if tlow in ("no", "paso", "omitir", "saltear", "descartar", "nop"):
         sesion["omitidos"] += 1
         sesion["idx"] += 1
@@ -2922,6 +3015,7 @@ async def procesar_respuesta_importacion(update: Update, user_id: int, user_text
         cat_final = cat_sug
         desc_final = desc_sug
         guardar_movimiento(user_id, item["tipo"], item["monto"], cat_final, desc_final, item["fecha"])
+        guardar_aprendizaje_concepto(user_id, clave, cat_final, desc_final)
         sesion["guardados"] += 1
         sesion["idx"] += 1
         await update.message.reply_text(f"✅ Guardado como {cat_final}: {desc_final}")
@@ -2947,17 +3041,17 @@ Comida|Café Villa Luro
     try:
         res = llamar_gemini(prompt, "Eres un clasificador contable profesional. Devuelve solo CATEGORIA|DESCRIPCION.")
         partes = [p.strip() for p in res.strip().split("|")]
-        cat_final = partes[0].capitalize() if len(partes) > 0 and partes[0] else "Varios"
+        cat_final = normalizar_categoria(partes[0]) if len(partes) > 0 and partes[0] else "Varios"
         desc_final = partes[1] if len(partes) > 1 and partes[1] else user_text.strip()
     except Exception:
-        cat_final = "Varios"
+        cat_final = normalizar_categoria(user_text)
         desc_final = user_text.strip()
 
     guardar_movimiento(user_id, item["tipo"], item["monto"], cat_final, desc_final, item["fecha"])
     sesion["guardados"] += 1
 
-    # Preguntar si recordar el patrón
-    if clave and len(clave) >= 3 and clave != cat_sug:
+    # Solo preguntamos si recordar si es un COMERCIO O PERSONA REAL (no DEBIN genérico)
+    if clave and len(clave) >= 3 and clave not in PALABRAS_PROHIBIDAS_PATRON and clave != cat_sug:
         sesion["esperando_recordar"] = True
         sesion["patron_pendiente"] = clave
         sesion["cat_pendiente"] = cat_final
@@ -3262,7 +3356,8 @@ async def cmd_mes(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lineas = [f"📅 GASTOS DEL MES {ahora.month:02d}/{ahora.year}", ""]
             total = 0.0
             for _, r in df.iterrows():
-                lineas.append(f"• {r['categoria']}: ${float(r['total']):,.0f}")
+                cat_clean = normalizar_categoria(r['categoria'])
+                lineas.append(f"• {cat_clean}: ${float(r['total']):,.0f}")
                 total += float(r['total'])
             lineas.append(f"\nTotal: ${total:,.0f} ARS")
             lineas.append("\n💡 Tip: definí presupuestos diciendo 'Presupuesto Comida 180000'")
@@ -3355,7 +3450,7 @@ MENSAJE DEL USUARIO:
             partes = [p.strip() for p in linea_ars.split("|")]
             tipo = partes[0]
             monto = float(partes[1])
-            categoria = partes[2]
+            categoria = normalizar_categoria(partes[2])
             descripcion = partes[3]
             f_gasto = partes[4].split()[0] if len(partes) > 4 and partes[4] not in ["0", "", "None"] else None
             
@@ -3447,9 +3542,7 @@ async def main():
     app.add_handler(CommandHandler("excel", cmd_excel_alias))
     app.add_handler(CommandHandler("analisis", cmd_analisis_alias))
     
-    # Manejador de documentos: acepta tanto Excel (.xlsx/.xls) como PDF de Mercado Pago
     app.add_handler(MessageHandler(filters.Document.ALL, manejar_documento_extracto))
-    # Manejador de mensajes de texto
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, responder))
     
     await app.initialize()
