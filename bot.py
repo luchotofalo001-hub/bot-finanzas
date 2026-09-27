@@ -18,6 +18,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+import pypdf
 
 # ==================== LOGS ====================
 logging.basicConfig(
@@ -59,7 +60,7 @@ UMBRAL_GASTO_HORMIGA_ARS = 15000.0
 
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# Estado en memoria para importaciones interactivas de extractos
+# Estado en memoria para importaciones interactivas
 importaciones_activas = {}
 
 def get_db_connection():
@@ -199,7 +200,7 @@ def limpiar_estilo_telegram(texto: str) -> str:
 def extraer_clave_comercio(concepto_crudo: str) -> str:
     texto = str(concepto_crudo).upper()
     texto = re.sub(r"\d{4}X+\d{2,4}", "", texto)
-    texto = re.sub(r"\b(COMPRA|DEBITO|CREDITO|TARJ|SUC|MERPAGO\*|MP\*|PAGO|TRANSFERENCIA)\b", "", texto)
+    texto = re.sub(r"\b(COMPRA|DEBITO|CREDITO|TARJ|SUC|MERPAGO\*|MP\*|PAGO|TRANSFERENCIA|PAGO CON QR|PAGO DE SERVICIO)\b", "", texto)
     texto = re.sub(r"[^A-Z0-9\s]", " ", texto)
     partes = [p.strip() for p in texto.split() if len(p.strip()) >= 4]
     return partes[0] if partes else concepto_crudo.strip().upper()[:30]
@@ -229,6 +230,205 @@ def guardar_aprendizaje_concepto(user_id: int, clave: str, categoria: str, descr
                 DO UPDATE SET categoria = EXCLUDED.categoria, descripcion_limpia = EXCLUDED.descripcion_limpia;
             """, (user_id, clave, categoria, descripcion))
             conn.commit()
+
+# ==================== CONCILIACIÓN Y CRUCE DE BASE DE DATOS ====================
+def buscar_coincidencia_previa_db(user_id: int, monto: float, fecha_str: str):
+    """
+    Busca si en la base de datos ya se guardó un gasto previo con el mismo monto
+    en una ventana de +/- 3 días (típico débito genérico DEBIN/banco que fondeó este gasto).
+    """
+    try:
+        f_dt = datetime.strptime(fecha_str, "%Y-%m-%d")
+        f_min = (f_dt - timedelta(days=3)).strftime("%Y-%m-%d")
+        f_max = (f_dt + timedelta(days=3)).strftime("%Y-%m-%d")
+    except Exception:
+        f_min, f_max = fecha_str, fecha_str
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT id, fecha, tipo, monto, categoria, descripcion 
+                FROM movimientos 
+                WHERE user_id = %s 
+                  AND tipo = 'GASTO' 
+                  AND ABS(monto - %s) < 0.05 
+                  AND fecha >= %s::date AND fecha <= %s::date
+                ORDER BY id DESC LIMIT 1;
+            """, (user_id, monto, f_min, f_max))
+            res = cursor.fetchone()
+            if res:
+                return {
+                    "id": res[0],
+                    "fecha": res[1].strftime("%Y-%m-%d") if hasattr(res[1], "strftime") else str(res[1])[:10],
+                    "tipo": res[2],
+                    "monto": float(res[3]),
+                    "categoria": res[4],
+                    "descripcion": res[5]
+                }
+    return None
+
+def borrar_movimiento_por_id_db(user_id: int, mov_id: int):
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("DELETE FROM movimientos WHERE id = %s AND user_id = %s;", (mov_id, user_id))
+            conn.commit()
+
+# ==================== PARSER EXTRACTOS: EXCEL Y PDF MERCADO PAGO ====================
+def parsear_extracto_bancario_excel(file_bytes: bytes) -> list:
+    try:
+        df_raw = pd.read_excel(io.BytesIO(file_bytes), header=None)
+    except Exception:
+        return []
+
+    header_idx = None
+    for idx, row in df_raw.iterrows():
+        row_str = " ".join([str(v).lower() for v in row if pd.notnull(v)])
+        if ("fecha" in row_str or "date" in row_str) and any(w in row_str for w in ["concepto", "descripcion", "detalle", "importe", "monto", "debito", "movimiento", "saldo"]):
+            header_idx = idx
+            break
+
+    if header_idx is not None:
+        df = df_raw.iloc[header_idx + 1:].copy()
+        df.columns = [str(c).strip().lower() for c in df_raw.iloc[header_idx]]
+    else:
+        df = df_raw.copy()
+        df.columns = [str(c).strip().lower() for c in df.columns]
+
+    cols = list(df.columns)
+    col_fecha = next((c for c in cols if any(k in c for k in ["fecha", "date"])), None)
+    col_desc = next((c for c in cols if any(k in c for k in ["concepto", "descrip", "detalle", "movimiento", "referencia"])), None)
+    col_deb = next((c for c in cols if any(k in c for k in ["debito", "débito", "egreso", "salida"])), None)
+    col_cred = next((c for c in cols if any(k in c for k in ["credito", "crédito", "ingreso", "entrada"])), None)
+    col_monto = next((c for c in cols if any(k in c for k in ["importe", "monto", "total"])), None)
+
+    movimientos = []
+    for _, r in df.iterrows():
+        f_raw = r[col_fecha] if col_fecha and pd.notnull(r[col_fecha]) else None
+        desc_val = str(r[col_desc]).strip() if col_desc and pd.notnull(r[col_desc]) else "Sin concepto"
+        if pd.isnull(f_raw) or str(f_raw).lower() in ["nan", "none", "fecha", ""]:
+            continue
+
+        try:
+            f_limpia = pd.to_datetime(f_raw).strftime('%Y-%m-%d')
+        except Exception:
+            f_cand = str(f_raw).split()[0]
+            f_limpia = f_cand if re.match(r"^\d{4}-\d{2}-\d{2}$", f_cand) else ahora_argentina().strftime('%Y-%m-%d')
+
+        monto = 0.0
+        tipo = "GASTO"
+
+        def _limpiar_num(val):
+            s = str(val).replace("$", "").replace("ARS", "").replace(" ", "").strip()
+            if "," in s and "." in s:
+                if s.find(".") < s.find(","):
+                    s = s.replace(".", "").replace(",", ".")
+                else:
+                    s = s.replace(",", "")
+            elif "," in s:
+                s = s.replace(",", ".")
+            return float(s)
+
+        if col_deb and col_cred:
+            val_deb = _limpiar_num(r[col_deb]) if pd.notnull(r[col_deb]) and str(r[col_deb]).strip() != "" else 0.0
+            val_cred = _limpiar_num(r[col_cred]) if pd.notnull(r[col_cred]) and str(r[col_cred]).strip() != "" else 0.0
+            if val_deb and abs(val_deb) > 0:
+                monto = abs(val_deb)
+                tipo = "GASTO"
+            elif val_cred and abs(val_cred) > 0:
+                monto = abs(val_cred)
+                tipo = "INGRESO"
+        elif col_monto:
+            val_m = _limpiar_num(r[col_monto]) if pd.notnull(r[col_monto]) and str(r[col_monto]).strip() != "" else 0.0
+            if val_m < 0:
+                monto = abs(val_m)
+                tipo = "GASTO"
+            elif val_m > 0:
+                monto = val_m
+                tipo = "INGRESO"
+
+        desc_low = desc_val.lower()
+        if "luciano tofalo" in desc_low:
+            continue
+
+        if monto > 0:
+            movimientos.append({
+                "fecha": f_limpia,
+                "concepto": desc_val,
+                "monto": monto,
+                "tipo": tipo
+            })
+
+    return movimientos
+
+def parsear_extracto_pdf_mercadopago(file_bytes: bytes) -> list:
+    try:
+        reader = pypdf.PdfReader(io.BytesIO(file_bytes))
+        texto_completo = ""
+        for page in reader.pages:
+            t = page.extract_text() or ""
+            texto_completo += t + "\n"
+    except Exception as e:
+        logger.error(f"Error leyendo PDF: {e}")
+        return []
+
+    patron = re.compile(
+        r"(\d{2}-\d{2}-\d{4})\s*\|\s*(.*?)\s*\|\s*(\d+)\s*\|\s*(\$?\s*-?[\d\.,]+)\s*\|\s*\$?\s*[\d\.,]+",
+        re.MULTILINE
+    )
+
+    movs_crudos = []
+    ids_operacion = {}
+
+    for match in patron.finditer(texto_completo):
+        fecha_str, desc, op_id, valor_str = match.groups()
+        desc = " ".join(desc.split())
+
+        val_clean = valor_str.replace("$", "").replace(" ", "").strip()
+        if "," in val_clean and "." in val_clean:
+            val_clean = val_clean.replace(".", "").replace(",", ".")
+        elif "," in val_clean:
+            val_clean = val_clean.replace(",", ".")
+        
+        try:
+            monto = float(val_clean)
+        except Exception:
+            continue
+
+        d, m, y = fecha_str.split("-")
+        fecha_iso = f"{y}-{m}-{d}"
+
+        item = {
+            "fecha": fecha_iso,
+            "concepto": desc,
+            "id_op": op_id,
+            "monto": abs(monto),
+            "tipo": "INGRESO" if monto > 0 else "GASTO"
+        }
+        movs_crudos.append(item)
+        ids_operacion.setdefault(op_id, []).append(item)
+
+    movimientos_finales = []
+    for item in movs_crudos:
+        desc_low = item["concepto"].lower()
+
+        # 1. Ignorar micro-rendimientos diarios de Mercado Fondo
+        if "rendimiento" in desc_low:
+            continue
+
+        # 2. Ignorar transferencias a cuentas propias
+        if "luciano tofalo" in desc_low:
+            continue
+
+        # 3. Ignorar ingreso transitorio si hay salida idéntica con el mismo ID de operación
+        if item["tipo"] == "INGRESO":
+            hermanos = ids_operacion.get(item["id_op"], [])
+            hay_salida_espejo = any(h["tipo"] == "GASTO" and abs(h["monto"] - item["monto"]) < 0.01 for h in hermanos)
+            if hay_salida_espejo:
+                continue
+
+        movimientos_finales.append(item)
+
+    return movimientos_finales
 
 # ==================== CONSULTAS DE MERCADO EN VIVO ====================
 CRIPTOS_COMUNES = {
@@ -371,89 +571,6 @@ def guardar_movimiento(user_id: int, tipo: str, monto: float, categoria: str, de
                     (user_id, tipo, float(monto), categoria, descripcion)
                 )
             conn.commit()
-
-# ==================== PARSER DE EXTRACTOS BANCARIOS (EXCEL) ====================
-def parsear_extracto_bancario(file_bytes: bytes) -> list:
-    try:
-        df_raw = pd.read_excel(io.BytesIO(file_bytes), header=None)
-    except Exception:
-        return []
-
-    header_idx = None
-    for idx, row in df_raw.iterrows():
-        row_str = " ".join([str(v).lower() for v in row if pd.notnull(v)])
-        if ("fecha" in row_str or "date" in row_str) and any(w in row_str for w in ["concepto", "descripcion", "detalle", "importe", "monto", "debito", "movimiento", "saldo"]):
-            header_idx = idx
-            break
-
-    if header_idx is not None:
-        df = df_raw.iloc[header_idx + 1:].copy()
-        df.columns = [str(c).strip().lower() for c in df_raw.iloc[header_idx]]
-    else:
-        df = df_raw.copy()
-        df.columns = [str(c).strip().lower() for c in df.columns]
-
-    cols = list(df.columns)
-    col_fecha = next((c for c in cols if any(k in c for k in ["fecha", "date"])), None)
-    col_desc = next((c for c in cols if any(k in c for k in ["concepto", "descrip", "detalle", "movimiento", "referencia"])), None)
-    col_deb = next((c for c in cols if any(k in c for k in ["debito", "débito", "egreso", "salida"])), None)
-    col_cred = next((c for c in cols if any(k in c for k in ["credito", "crédito", "ingreso", "entrada"])), None)
-    col_monto = next((c for c in cols if any(k in c for k in ["importe", "monto", "total"])), None)
-
-    movimientos = []
-    for _, r in df.iterrows():
-        f_raw = r[col_fecha] if col_fecha and pd.notnull(r[col_fecha]) else None
-        desc_val = str(r[col_desc]).strip() if col_desc and pd.notnull(r[col_desc]) else "Sin concepto"
-        if pd.isnull(f_raw) or str(f_raw).lower() in ["nan", "none", "fecha", ""]:
-            continue
-
-        try:
-            f_limpia = pd.to_datetime(f_raw).strftime('%Y-%m-%d')
-        except Exception:
-            f_cand = str(f_raw).split()[0]
-            f_limpia = f_cand if re.match(r"^\d{4}-\d{2}-\d{2}$", f_cand) else ahora_argentina().strftime('%Y-%m-%d')
-
-        monto = 0.0
-        tipo = "GASTO"
-
-        def _limpiar_num(val):
-            s = str(val).replace("$", "").replace("ARS", "").replace(" ", "").strip()
-            if "," in s and "." in s:
-                if s.find(".") < s.find(","):
-                    s = s.replace(".", "").replace(",", ".")
-                else:
-                    s = s.replace(",", "")
-            elif "," in s:
-                s = s.replace(",", ".")
-            return float(s)
-
-        if col_deb and col_cred:
-            val_deb = _limpiar_num(r[col_deb]) if pd.notnull(r[col_deb]) and str(r[col_deb]).strip() != "" else 0.0
-            val_cred = _limpiar_num(r[col_cred]) if pd.notnull(r[col_cred]) and str(r[col_cred]).strip() != "" else 0.0
-            if val_deb and abs(val_deb) > 0:
-                monto = abs(val_deb)
-                tipo = "GASTO"
-            elif val_cred and abs(val_cred) > 0:
-                monto = abs(val_cred)
-                tipo = "INGRESO"
-        elif col_monto:
-            val_m = _limpiar_num(r[col_monto]) if pd.notnull(r[col_monto]) and str(r[col_monto]).strip() != "" else 0.0
-            if val_m < 0:
-                monto = abs(val_m)
-                tipo = "GASTO"
-            elif val_m > 0:
-                monto = val_m
-                tipo = "INGRESO"
-
-        if monto > 0:
-            movimientos.append({
-                "fecha": f_limpia,
-                "concepto": desc_val,
-                "monto": monto,
-                "tipo": tipo
-            })
-
-    return movimientos
 
 # ==================== MOTOR CUANTITATIVO DE FINANZAS PERSONALES (ARS) ====================
 def calcular_metricas_finanzas_completas(user_id: int, meses_lookback: int = 6):
@@ -1074,15 +1191,12 @@ def calcular_pivots_y_niveles(df, ventana=4):
         last_low = ult_lows[-1]
         prev_close = float(df['Close'].dropna().iloc[-2]) if len(df) > 1 else precio_actual
 
-        # 1. Roturas reales ocurridas en la última vela:
         if prev_close >= last_low and precio_actual < last_low:
             estructura_txt = f"🔴 Se rompió un piso/mínimo importante (${last_low:,.2f}) — Presión bajista activa"
             estructura_bias = "choch_bajista"
         elif prev_close <= last_high and precio_actual > last_high:
             estructura_txt = f"🟢 Se rompió un techo/máximo importante (${last_high:,.2f}) — Posible giro alcista"
             estructura_bias = "choch_alcista"
-
-        # 2. Si no es quiebre nuevo, evaluar tendencia de fondo:
         elif len(ult_highs) >= 2 and len(ult_lows) >= 2:
             if ult_highs[-1] < ult_highs[-2] and ult_lows[-1] < ult_lows[-2]:
                 estructura_txt = "Estructura BAJISTA sólida (Máximos y mínimos descendentes)"
@@ -2620,23 +2734,27 @@ REGLAS DE ACTUACIÓN:
    Respóndele con precisión y de forma concisa usando los datos del CONTEXTO DEL USUARIO.
 """
 
-# ==================== FLUJO INTERACTIVO DE IMPORTACIÓN DE EXCEL ====================
-async def manejar_documento_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ==================== FLUJO INTERACTIVO DE IMPORTACIÓN Y CONCILIACIÓN ====================
+async def manejar_documento_extracto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     doc = update.message.document
-    nombre_archivo = doc.file_name.lower()
+    nombre = doc.file_name.lower()
 
-    if not (nombre_archivo.endswith(".xlsx") or nombre_archivo.endswith(".xls")):
-        await update.message.reply_text("Por favor enviame un archivo Excel válido (.xlsx o .xls).")
+    if not (nombre.endswith(".xlsx") or nombre.endswith(".xls") or nombre.endswith(".pdf")):
+        await update.message.reply_text("Por favor enviame un archivo Excel (.xlsx / .xls) de tu banco o un PDF de Mercado Pago.")
         return
 
-    await update.message.reply_text("📥 Leyendo extracto bancario...")
+    await update.message.reply_text("📥 Leyendo y procesando documento...")
     archivo = await context.bot.get_file(doc.file_id)
-    archivo_bytes = await archivo.download_as_bytearray()
+    archivo_bytes = bytes(await archivo.download_as_bytearray())
 
-    movimientos = parsear_extracto_bancario(bytes(archivo_bytes))
+    if nombre.endswith(".pdf"):
+        movimientos = parsear_extracto_pdf_mercadopago(archivo_bytes)
+    else:
+        movimientos = parsear_extracto_bancario_excel(archivo_bytes)
+
     if not movimientos:
-        await update.message.reply_text("⚠️ No pude encontrar movimientos legibles en el extracto. Verificá que el archivo tenga columnas de Fecha, Concepto e Importe/Débito/Crédito.")
+        await update.message.reply_text("⚠️ No se encontraron movimientos válidos en el archivo. Verificá que sea un extracto legible.")
         return
 
     importaciones_activas[user_id] = {
@@ -2644,6 +2762,9 @@ async def manejar_documento_excel(update: Update, context: ContextTypes.DEFAULT_
         "idx": 0,
         "guardados": 0,
         "omitidos": 0,
+        "reemplazados": 0,
+        "esperando_reemplazo": False,
+        "coincidencia_previa": None,
         "esperando_recordar": False,
         "patron_pendiente": None,
         "cat_pendiente": None,
@@ -2663,18 +2784,44 @@ async def presentar_siguiente_movimiento(update: Update, user_id: int):
     if idx >= len(items):
         g = sesion["guardados"]
         o = sesion["omitidos"]
+        r = sesion["reemplazados"]
         del importaciones_activas[user_id]
+        
+        reemp_txt = f"\n• Duplicados genéricos reemplazados: {r}" if r > 0 else ""
         await update.message.reply_text(
             f"✅ ¡Importación completada!\n\n"
             f"• Registrados en tu historial: {g}\n"
-            f"• Descartados / omitidos: {o}\n\n"
+            f"• Descartados / omitidos: {o}{reemp_txt}\n\n"
             f"Podés ver tu nuevo estado con /gastos o /mes."
         )
         return
 
     item = items[idx]
     em = "🔴 GASTO" if item["tipo"] == "GASTO" else "🟢 INGRESO"
-    
+
+    # Cruce con la base de datos para detectar si ya hay un débito genérico previo con este monto
+    coincidencia = buscar_coincidencia_previa_db(user_id, item["monto"], item["fecha"])
+    if coincidencia and item["tipo"] == "GASTO":
+        sesion["esperando_reemplazo"] = True
+        sesion["coincidencia_previa"] = coincidencia
+
+        msg = (
+            f"🔍 POSIBLE DUPLICADO DETECTADO ({idx + 1}/{len(items)}):\n\n"
+            f"Encontré un movimiento ya registrado en tu banco:\n"
+            f"• Fecha: {coincidencia['fecha']}\n"
+            f"• Monto: ${coincidencia['monto']:,.2f} ARS\n"
+            f"• Detalle actual: {coincidencia['descripcion']} ({coincidencia['categoria']})\n\n"
+            f"En este nuevo extracto figura:\n"
+            f"• {item['concepto']} por ${item['monto']:,.2f} ARS el {item['fecha']}\n\n"
+            f"¿Querés REEMPLAZAR el registro genérico viejo por este nuevo detallado?\n"
+            f"• Respondé 'Si' para reemplazarlo (evita duplicar el gasto).\n"
+            f"• Respondé 'No' para mantener ambos.\n"
+            f"• Respondé 'Omitir' para saltear este movimiento."
+        )
+        await update.message.reply_text(msg)
+        return
+
+    # Si no hay duplicado, flujo normal de clasificación
     cat_sug, desc_sug, clave = buscar_clasificacion_previa(user_id, item["concepto"])
     item["cat_sug"] = cat_sug
     item["desc_sug"] = desc_sug
@@ -2702,7 +2849,7 @@ async def presentar_siguiente_movimiento(update: Update, user_id: int):
         f"• Fecha: {item['fecha']}\n"
         f"• Tipo: {em}\n"
         f"• Monto: ${item['monto']:,.2f} ARS\n"
-        f"• Concepto del banco: {item['concepto']}\n\n"
+        f"• Concepto: {item['concepto']}\n\n"
         f"{opciones_txt}"
     )
     await update.message.reply_text(msg)
@@ -2718,7 +2865,28 @@ async def procesar_respuesta_importacion(update: Update, user_id: int, user_text
         await update.message.reply_text("🛑 Importación cancelada.")
         return True
 
-    # 1. Si estábamos esperando que el usuario elija si recordar o no el patrón
+    idx = sesion["idx"]
+    item = sesion["items"][idx]
+
+    # 1. Si estábamos resolviendo si reemplazar un movimiento viejo duplicado
+    if sesion.get("esperando_reemplazo"):
+        coin = sesion["coincidencia_previa"]
+        sesion["esperando_reemplazo"] = False
+        sesion["coincidencia_previa"] = None
+
+        if tlow in ("si", "sí", "s", "yes", "dale", "ok", "reemplazar"):
+            borrar_movimiento_por_id_db(user_id, coin["id"])
+            sesion["reemplazados"] += 1
+            await update.message.reply_text(f"🗑️ Se eliminó el gasto genérico previo de ${coin['monto']:,.2f} (ID {coin['id']}). Procedemos a guardar el detallado.")
+        elif tlow in ("omitir", "saltear", "descartar"):
+            sesion["omitidos"] += 1
+            sesion["idx"] += 1
+            await presentar_siguiente_movimiento(update, user_id)
+            return True
+        else:
+            await update.message.reply_text("👌 Se mantiene el registro previo. Procedemos a registrar este como adicional.")
+
+    # 2. Si estábamos esperando confirmación de recordar el comercio en memoria
     if sesion.get("esperando_recordar"):
         clave = sesion["patron_pendiente"]
         cat = sesion["cat_pendiente"]
@@ -2738,10 +2906,7 @@ async def procesar_respuesta_importacion(update: Update, user_id: int, user_text
         await presentar_siguiente_movimiento(update, user_id)
         return True
 
-    # 2. Flujo normal de cada movimiento
-    idx = sesion["idx"]
-    item = sesion["items"][idx]
-
+    # 3. Flujo normal de confirmación o descarte del movimiento
     if tlow in ("no", "paso", "omitir", "saltear", "descartar", "nop"):
         sesion["omitidos"] += 1
         sesion["idx"] += 1
@@ -2752,7 +2917,7 @@ async def procesar_respuesta_importacion(update: Update, user_id: int, user_text
     desc_sug = item.get("desc_sug")
     clave = item.get("clave_patron")
 
-    # Si el usuario confirma la sugerencia aprendida
+    # Confirmó sugerencia aprendida previa (0 tokens)
     if cat_sug and tlow in ("si", "sí", "ok", "dale", "guardalo", "s", "yes", "confirmo"):
         cat_final = cat_sug
         desc_final = desc_sug
@@ -2763,7 +2928,7 @@ async def procesar_respuesta_importacion(update: Update, user_id: int, user_text
         await presentar_siguiente_movimiento(update, user_id)
         return True
 
-    # Si es una categoría nueva o sobreescrita por el usuario
+    # Normalización con Gemini
     prompt = f"""El usuario recibió este movimiento bancario:
 Tipo: {item['tipo']}
 Monto: {item['monto']} ARS
@@ -2777,7 +2942,7 @@ Responde ÚNICAMENTE en este formato:
 CATEGORIA|DESCRIPCION
 
 Ejemplo:
-Nafta|Estación de servicio YPF
+Comida|Café Villa Luro
 """
     try:
         res = llamar_gemini(prompt, "Eres un clasificador contable profesional. Devuelve solo CATEGORIA|DESCRIPCION.")
@@ -2788,11 +2953,10 @@ Nafta|Estación de servicio YPF
         cat_final = "Varios"
         desc_final = user_text.strip()
 
-    # Guardamos el movimiento en la base de datos
     guardar_movimiento(user_id, item["tipo"], item["monto"], cat_final, desc_final, item["fecha"])
     sesion["guardados"] += 1
 
-    # Preguntamos si desea recordar el patrón para el futuro
+    # Preguntar si recordar el patrón
     if clave and len(clave) >= 3 and clave != cat_sug:
         sesion["esperando_recordar"] = True
         sesion["patron_pendiente"] = clave
@@ -2830,7 +2994,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /mes        →  Presupuestos y control del mes\n"
         "• /objetivos  →  Progreso de metas financieras\n"
         "• /excel      →  Exportar planilla completa\n"
-        "• Envía un archivo Excel (.xlsx) con tu extracto bancario para clasificar gastos uno a uno.\n\n"
+        "• Envía un archivo Excel (.xlsx) de tu banco o un PDF de Mercado Pago para procesar y conciliar gastos uno por uno.\n\n"
         "También podés hablarme en lenguaje natural."
     )
 
@@ -3115,19 +3279,16 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_msg = update.message.text
 
-    # 1. Si hay una sesión activa de importación de extracto, responderle a esa sesión
     if user_id in importaciones_activas:
         if await procesar_respuesta_importacion(update, user_id, user_msg):
             return
 
-    # 2. Filtro local ultra rápido (0 tokens)
     try:
         if await intentar_comando_local(update, user_id, user_msg):
             return
     except Exception as e:
         logger.error(f"Error comando local: {e}", exc_info=True)
 
-    # 3. Copiloto Cognitivo + Router
     try:
         contexto = resumen_compacto_para_ia(user_id)
         prompt = f"""CONTEXTO DEL USUARIO:
@@ -3286,9 +3447,9 @@ async def main():
     app.add_handler(CommandHandler("excel", cmd_excel_alias))
     app.add_handler(CommandHandler("analisis", cmd_analisis_alias))
     
-    # Handler para recibir archivos Excel del banco
-    app.add_handler(MessageHandler(filters.Document.ALL, manejar_documento_excel))
-    # Handler de texto y mensajes
+    # Manejador de documentos: acepta tanto Excel (.xlsx/.xls) como PDF de Mercado Pago
+    app.add_handler(MessageHandler(filters.Document.ALL, manejar_documento_extracto))
+    # Manejador de mensajes de texto
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, responder))
     
     await app.initialize()
