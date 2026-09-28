@@ -156,6 +156,7 @@ def init_db():
                 """)
 
                 cursor.execute("ALTER TABLE mapeo_conceptos ADD COLUMN IF NOT EXISTS usos_exitosos INTEGER DEFAULT 1;")
+                cursor.execute("ALTER TABLE mapeo_conceptos ADD COLUMN IF NOT EXISTS usos_rechazados INTEGER DEFAULT 0;")
                 cursor.execute("ALTER TABLE movimientos ADD COLUMN IF NOT EXISTS user_id BIGINT;")
                 cursor.execute("ALTER TABLE portafolio_inversiones ADD COLUMN IF NOT EXISTS user_id BIGINT;")
                 cursor.execute("ALTER TABLE portafolio_inversiones ADD COLUMN IF NOT EXISTS tipo_posicion VARCHAR(10) DEFAULT 'SPOT';")
@@ -229,75 +230,290 @@ PALABRAS_PROHIBIDAS_PATRON = {
     "INTERES", "CAPITALIZADO", "PROMOCION", "REINTEGRO", "REINTEGROS"
 }
 
+def _es_hash_debin(token: str) -> bool:
+    t = str(token).upper()
+    if len(t) < 8:
+        return False
+    if re.fullmatch(r"[A-Z0-9]{10,}", t) and any(c.isdigit() for c in t) and any(c.isalpha() for c in t):
+        return True
+    return False
+
 def extraer_clave_comercio(concepto_crudo: str) -> str:
-    texto = str(concepto_crudo).upper()
+    raw = str(concepto_crudo)
+    texto = raw.upper()
     texto = re.sub(r"\d{4}X+\d{2,4}", " ", texto)
     texto = re.sub(r"\b\d{6,}\b", " ", texto)
-    texto = re.sub(r"[^A-Z0-9\s]", " ", texto)
+    texto = re.sub(r"[^A-Z0-9\s\*]", " ", texto)
 
     tokens = texto.split()
-    tokens_utiles = [t for t in tokens if t not in PALABRAS_PROHIBIDAS_PATRON and len(t) >= 3 and not t.isdigit()]
+    tokens_utiles = [
+        t for t in tokens
+        if t not in PALABRAS_PROHIBIDAS_PATRON
+        and len(t) >= 3
+        and not t.isdigit()
+        and not _es_hash_debin(t)
+        and t not in {"A001", "A171", "A368", "A371", "A429", "A603", "A736", "A738", "A760", "A762", "A894", "A068"}
+    ]
+
+    if re.search(r"PEDIDOSYA\s*\*?\s*MARKET|PEDIDOS YA\s*\*?\s*MARKET", texto):
+        return "PEDIDOSYA MARKET"
+    if "PEDIDOSYA" in tokens or "PEDIDOSYA" in texto.replace(" ", ""):
+        local = ""
+        m_loc = re.search(r"PEDIDOSYA\s*\*?\s*([A-Z][A-Z0-9 ]{2,40})", texto)
+        if m_loc:
+            local = m_loc.group(1).strip()
+            local = re.sub(r"\bA\d{3}\b", " ", local)
+            local = re.sub(r"\b\d{3,}\b", " ", local)
+            local = re.sub(r"\b(DE|DEL|LA|EL|LOS|LAS)\b", " ", local)
+            local = " ".join(local.split()[:3]).strip()
+        if local and "MARKET" not in local and "EXTRA" not in local:
+            return f"PEDIDOSYA {local}"
+        if "EXTRA" in texto:
+            return "PEDIDOSYA EXTRA"
+        return "PEDIDOSYA DELIVERY"
+
+    if "UBER" in tokens or "UBER" in texto:
+        if "SHOPPER" in texto:
+            return "UBER SHOPPER"
+        return "UBER"
+    if "SUBE" in tokens or "TRANSPORTE" in texto and "SUBE" in texto:
+        return "SUBE"
+    if "FARMACITY" in texto:
+        return "FARMACITY"
+    if "CINEMARK" in tokens:
+        return "CINEMARK"
+    if "METROGAS" in tokens:
+        return "METROGAS"
+    if "EDESUR" in tokens:
+        return "EDESUR"
+    if "HAVAS" in tokens:
+        return "HAVAS MEDIA"
+    if "FORNODELPAESE" in texto or "FORNO DEL PAESE" in texto:
+        return "FORNODELPAESE"
+    if "PETTISH" in tokens:
+        return "PETTISH"
+    if "RAPPI" in tokens:
+        return "RAPPI PRO" if "PRO" in tokens else "RAPPI"
+    if "FIMA" in tokens:
+        return "FIMA PREMIUM"
+    if "DOLAR" in texto or "DOLARES" in texto:
+        return "COMPRA DOLARES"
+    if "DELFINA" in tokens and "SILVA" in tokens:
+        return "DELFINA SILVA"
+    if "UGARRIZA" in tokens and not any(x in texto for x in ["TOFALO", "LUCIANO", "20454793820"]):
+        return "MARINA LUZ (MAMA)"
+    if "MASTER" in tokens and "TARJETA" in texto:
+        return "PAGO TARJETA MASTER"
 
     if not tokens_utiles:
         return ""
-
-    if "UBER" in tokens_utiles:
-        return "UBER"
-    if "SUBE" in tokens_utiles:
-        return "SUBE"
-    if "FARMACITY" in tokens_utiles:
-        return "FARMACITY"
-    if "PEDIDOSYA" in tokens_utiles:
-        return "PEDIDOSYA"
-    if "CINEMARK" in tokens_utiles:
-        return "CINEMARK"
-    if "METROGAS" in tokens_utiles:
-        return "METROGAS"
-    if "EDESUR" in tokens_utiles:
-        return "EDESUR"
-    if "HAVAS" in tokens_utiles:
-        return "HAVAS MEDIA"
-    if "FORNODELPAESE" in tokens_utiles:
-        return "FORNODELPAESE"
-    if "PETTISH" in tokens_utiles:
-        return "PETTISH"
-    if "DELFINA" in tokens_utiles and "SILVA" in tokens_utiles:
-        return "DELFINA SILVA"
-    if "UGARRIZA" in tokens_utiles:
-        return "MARINA LUZ (MAMA)"
-
     return " ".join(tokens_utiles[:2])
 
-def buscar_clasificacion_previa(user_id: int, concepto: str):
+def sugerir_clasificacion_por_concepto(concepto: str):
     clave = extraer_clave_comercio(concepto)
+    texto = str(concepto).upper()
+    if clave == "PEDIDOSYA MARKET":
+        return "Supermercado", "PedidosYa Market", clave
+    if clave == "PEDIDOSYA EXTRA":
+        return "Delivery", "PedidosYa Extra", clave
+    if clave.startswith("PEDIDOSYA"):
+        desc = clave.replace("PEDIDOSYA", "PedidosYa").strip()
+        return "Delivery", desc or "PedidosYa Delivery", clave
+    if clave == "HAVAS MEDIA":
+        return "Sueldo", "Havas Media Argentina S.A.", clave
+    if clave == "FIMA PREMIUM":
+        if "RESCATE" in texto:
+            return "Inversiones", "Rescate FIMA Premium", clave
+        return "Inversiones", "Suscripción FIMA Premium", clave
+    if clave == "COMPRA DOLARES":
+        return "Inversiones", "Compra de dólares", clave
+    if clave == "SUBE":
+        if "ANULACION" in texto:
+            return "Transporte", "Devolución SUBE", clave
+        return "Transporte", "Tarjeta SUBE", clave
+    if clave == "UBER":
+        if "REINTEGRO" in texto:
+            return "Transporte", "Reintegro Uber", clave
+        return "Transporte", "Uber", clave
+    if clave == "FARMACITY":
+        if "REINTEGRO" in texto:
+            return "Farmacia", "Reintegro Farmacity", clave
+        return "Farmacia", "Farmacity", clave
+    if clave == "FORNODELPAESE":
+        return "Comida", "Forno del Paese", clave
+    if clave == "CINEMARK":
+        return "Entretenimiento", "Cinemark", clave
+    if clave == "METROGAS":
+        return "Servicios", "Metrogas", clave
+    if clave == "EDESUR":
+        return "Servicios", "Edesur", clave
+    if clave == "PETTISH":
+        return "Hogar", "Pettish Bazar", clave
+    if clave == "MARINA LUZ (MAMA)":
+        return "Transferencias", "Transferencia de mamá", clave
+    if clave == "DELFINA SILVA":
+        return "Transferencias", "Transferencia de Delfina Silva", clave
+    if clave == "PAGO TARJETA MASTER":
+        return "Tarjeta de crédito", "Pago Tarjeta Mastercard", clave
+    return None, None, clave
+
+def clasificacion_es_auto_aprobable(usos: int, rechazos: int) -> bool:
+    return usos >= UMBRAL_AUTO_APROBAR and int(rechazos or 0) == 0
+
+def buscar_clasificacion_previa(user_id: int, concepto: str):
+    cat_reglas, desc_reglas, clave = sugerir_clasificacion_por_concepto(concepto)
     if not clave:
-        return None, None, "", 0
+        return None, None, "", 0, 0, False
+    cat_db, desc_db, usos, rechazos = None, None, 0, 0
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """SELECT categoria, descripcion_limpia,
+                              COALESCE(usos_exitosos, 1), COALESCE(usos_rechazados, 0)
+                       FROM mapeo_conceptos WHERE user_id = %s AND patron_clave = %s;""",
+                    (user_id, clave)
+                )
+                res = cursor.fetchone()
+                if res:
+                    cat_db, desc_db, usos, rechazos = res[0], res[1], int(res[2]), int(res[3])
+    except Exception as e:
+        logger.warning(f"buscar_clasificacion_previa sin DB: {e}")
+
+    if cat_db:
+        auto_ok = clasificacion_es_auto_aprobable(usos, rechazos)
+        return cat_db, desc_db, clave, usos, rechazos, auto_ok
+    if cat_reglas:
+        return cat_reglas, desc_reglas, clave, 0, 0, False
+    return None, None, clave, 0, 0, False
+
+def guardar_aprendizaje_concepto(user_id: int, clave: str, categoria: str, descripcion: str):
+    if not clave or len(clave) < 3 or clave in PALABRAS_PROHIBIDAS_PATRON or _es_hash_debin(clave.replace(" ", "")):
+        return
+    categoria = normalizar_categoria(categoria)
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
-                "SELECT categoria, descripcion_limpia, COALESCE(usos_exitosos, 1) FROM mapeo_conceptos WHERE user_id = %s AND patron_clave = %s;",
+                "SELECT categoria, COALESCE(usos_exitosos,1), COALESCE(usos_rechazados,0) FROM mapeo_conceptos WHERE user_id = %s AND patron_clave = %s;",
                 (user_id, clave)
             )
-            res = cursor.fetchone()
-            if res:
-                return res[0], res[1], clave, int(res[2])
-    return None, None, clave, 0
+            prev = cursor.fetchone()
+            if prev:
+                cat_prev = normalizar_categoria(str(prev[0]))
+                usos = int(prev[1])
+                rechazos = int(prev[2])
+                if cat_prev != categoria:
+                    cursor.execute(
+                        """UPDATE mapeo_conceptos
+                           SET categoria = %s, descripcion_limpia = %s,
+                               usos_exitosos = 1, usos_rechazados = usos_rechazados + 1
+                           WHERE user_id = %s AND patron_clave = %s;""",
+                        (categoria, descripcion, user_id, clave)
+                    )
+                else:
+                    cursor.execute(
+                        """UPDATE mapeo_conceptos
+                           SET descripcion_limpia = %s, usos_exitosos = usos_exitosos + 1
+                           WHERE user_id = %s AND patron_clave = %s;""",
+                        (descripcion, user_id, clave)
+                    )
+            else:
+                cursor.execute("""
+                    INSERT INTO mapeo_conceptos (user_id, patron_clave, categoria, descripcion_limpia, usos_exitosos, usos_rechazados)
+                    VALUES (%s, %s, %s, %s, 1, 0)
+                    ON CONFLICT (user_id, patron_clave)
+                    DO UPDATE SET
+                        categoria = EXCLUDED.categoria,
+                        descripcion_limpia = EXCLUDED.descripcion_limpia,
+                        usos_exitosos = mapeo_conceptos.usos_exitosos + 1;
+                """, (user_id, clave, categoria, descripcion))
+            conn.commit()
 
-def guardar_aprendizaje_concepto(user_id: int, clave: str, categoria: str, descripcion: str):
-    if not clave or len(clave) < 3 or clave in PALABRAS_PROHIBIDAS_PATRON:
+def registrar_rechazo_concepto(user_id: int, clave: str):
+    if not clave or len(clave) < 3:
         return
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
-            cursor.execute("""
-                INSERT INTO mapeo_conceptos (user_id, patron_clave, categoria, descripcion_limpia, usos_exitosos)
-                VALUES (%s, %s, %s, %s, 1)
-                ON CONFLICT (user_id, patron_clave)
-                DO UPDATE SET 
-                    categoria = EXCLUDED.categoria, 
-                    descripcion_limpia = EXCLUDED.descripcion_limpia,
-                    usos_exitosos = mapeo_conceptos.usos_exitosos + 1;
-            """, (user_id, clave, categoria, descripcion))
+            cursor.execute(
+                """UPDATE mapeo_conceptos
+                   SET usos_rechazados = COALESCE(usos_rechazados, 0) + 1
+                   WHERE user_id = %s AND patron_clave = %s;""",
+                (user_id, clave)
+            )
             conn.commit()
+
+def es_sueldo_haberes(categoria: str = "", descripcion: str = "") -> bool:
+    txt = f"{categoria} {descripcion}".lower()
+    return any(k in txt for k in ["sueldo", "haberes", "havas", "acreditamiento de haberes"])
+
+def obtener_fechas_sueldo(user_id: int):
+    with get_db_connection() as conn:
+        df = pd.read_sql(
+            """SELECT fecha, categoria, descripcion FROM movimientos
+               WHERE user_id = %s AND tipo = 'INGRESO' ORDER BY fecha ASC;""",
+            conn, params=(user_id,)
+        )
+    if df.empty:
+        return []
+    fechas = []
+    for _, row in df.iterrows():
+        if es_sueldo_haberes(str(row.get("categoria") or ""), str(row.get("descripcion") or "")):
+            f = pd.to_datetime(row["fecha"]).tz_localize(None).normalize()
+            fechas.append(f)
+    fechas = sorted(set(fechas))
+    return fechas
+
+def resolver_ciclo_havas(user_id: int, fecha_ref=None):
+    fecha_ref = pd.to_datetime(fecha_ref or ahora_argentina()).tz_localize(None).normalize() if not isinstance(fecha_ref, pd.Timestamp) else fecha_ref.normalize()
+    sueldos = obtener_fechas_sueldo(user_id)
+    if not sueldos:
+        inicio = pd.Timestamp(datetime(fecha_ref.year, fecha_ref.month, 1))
+        return inicio, fecha_ref + pd.Timedelta(days=1), "calendario (sin sueldo Havas cargado)"
+    inicio = sueldos[0]
+    fin = fecha_ref + pd.Timedelta(days=1)
+    for i, f in enumerate(sueldos):
+        nxt = sueldos[i + 1] if i + 1 < len(sueldos) else None
+        if f <= fecha_ref and (nxt is None or fecha_ref < nxt):
+            inicio = f
+            fin = nxt if nxt is not None else (fecha_ref + pd.Timedelta(days=1))
+            break
+    if fecha_ref < sueldos[0]:
+        inicio = fecha_ref - pd.Timedelta(days=30)
+        fin = sueldos[0]
+    etiqueta = f"ciclo Havas {inicio.strftime('%d/%m')} → {(fin - pd.Timedelta(days=1)).strftime('%d/%m/%Y')}"
+    return inicio, fin, etiqueta
+
+def asignar_ciclo_havas(df, sueldos):
+    if df.empty:
+        df = df.copy()
+        df["ciclo_id"] = []
+        df["ciclo_inicio"] = []
+        return df
+    df = df.copy()
+    df["fecha"] = pd.to_datetime(df["fecha"]).dt.tz_localize(None)
+    if not sueldos:
+        df["ciclo_id"] = df["fecha"].dt.to_period("M").astype(str)
+        df["ciclo_inicio"] = df["fecha"].dt.to_period("M").dt.start_time
+        return df
+    sueldos = sorted(sueldos)
+    def _cid(f):
+        inicio = sueldos[0]
+        for i, s in enumerate(sueldos):
+            nxt = sueldos[i + 1] if i + 1 < len(sueldos) else None
+            if s <= f and (nxt is None or f < nxt):
+                inicio = s
+                break
+        if f < sueldos[0]:
+            inicio = sueldos[0] - pd.Timedelta(days=30)
+        return inicio.strftime("%Y-%m-%d")
+    df["ciclo_inicio"] = df["fecha"].apply(lambda x: pd.Timestamp(_cid(x)))
+    df["ciclo_id"] = df["ciclo_inicio"].dt.strftime("%Y-%m-%d")
+    return df
+
+TAGS_AHORRO = {
+    "inversion", "inversión", "inversiones", "ahorro", "usdt", "crypto", "cripto",
+    "broker", "dolares", "dólares", "dolar", "dólar", "usd", "fima"
+}
 
 # ==================== CONCILIACIÓN ENTRE BANCO Y MERCADO PAGO ====================
 def buscar_coincidencia_previa_db(user_id: int, monto: float, fecha_str: str, origen_nuevo: str = "EXCEL"):
@@ -655,18 +871,35 @@ def calcular_metricas_finanzas_completas(user_id: int, meses_lookback: int = 6):
     if df_mov.empty:
         return "No tenés movimientos registrados en los últimos meses para analizar."
 
-    df_mov['fecha'] = pd.to_datetime(df_mov['fecha'])
-    df_mov['mes_periodo'] = df_mov['fecha'].dt.to_period('M')
+    df_mov['fecha'] = pd.to_datetime(df_mov['fecha']).dt.tz_localize(None)
     df_mov['categoria'] = df_mov['categoria'].apply(normalizar_categoria)
-
-    tags_inversion = {'inversion', 'inversión', 'ahorro', 'usdt', 'crypto', 'cripto', 'broker', 'dolares', 'dólares'}
+    sueldos = obtener_fechas_sueldo(user_id)
+    df_mov = asignar_ciclo_havas(df_mov, sueldos)
+    df_mov['mes_periodo'] = df_mov['ciclo_id']
 
     def es_registro_ahorro(row):
         cat = str(row['categoria']).lower().strip()
         desc = str(row['descripcion']).lower().strip()
-        return cat in tags_inversion or any(t in desc for t in tags_inversion)
+        blob = f"{cat} {desc}"
+        if any(t in blob for t in TAGS_AHORRO):
+            return True
+        if "fima" in blob or "compra de dólar" in blob or "compra de dolar" in blob:
+            return True
+        return False
+
+    def es_capital_tercero(row):
+        cat = str(row['categoria']).lower()
+        desc = str(row['descripcion']).lower()
+        if row['tipo'] != 'INGRESO':
+            return False
+        if es_sueldo_haberes(cat, desc):
+            return False
+        if any(t in f"{cat} {desc}" for t in TAGS_AHORRO):
+            return True
+        return False
 
     df_mov['es_ahorro'] = df_mov.apply(es_registro_ahorro, axis=1)
+    df_mov['es_capital'] = df_mov.apply(es_capital_tercero, axis=1)
 
     df_gastos_totales = df_mov[df_mov['tipo'] == 'GASTO'].copy()
     df_ingresos_totales = df_mov[df_mov['tipo'] == 'INGRESO'].copy()
@@ -674,10 +907,10 @@ def calcular_metricas_finanzas_completas(user_id: int, meses_lookback: int = 6):
     df_consumo = df_gastos_totales[~df_gastos_totales['es_ahorro']].copy()
     df_salidas_ahorro = df_gastos_totales[df_gastos_totales['es_ahorro']].copy()
 
-    df_ingresos_reales = df_ingresos_totales[~df_ingresos_totales['es_ahorro']].copy()
-    df_entradas_ahorro = df_ingresos_totales[df_ingresos_totales['es_ahorro']].copy()
+    df_ingresos_reales = df_ingresos_totales[~df_ingresos_totales['es_ahorro'] & ~df_ingresos_totales['es_capital']].copy()
+    df_entradas_ahorro = df_ingresos_totales[df_ingresos_totales['es_ahorro'] | df_ingresos_totales['es_capital']].copy()
 
-    cant_meses_reales = max(1, df_mov['mes_periodo'].nunique())
+    cant_meses_reales = max(1, df_mov['ciclo_id'].nunique())
 
     tot_ingresos = float(df_ingresos_reales['monto'].sum()) if not df_ingresos_reales.empty else 0.0
     tot_consumo = float(df_consumo['monto'].sum()) if not df_consumo.empty else 0.0
@@ -698,11 +931,13 @@ def calcular_metricas_finanzas_completas(user_id: int, meses_lookback: int = 6):
 
     cat_totales = df_consumo.groupby('categoria')['monto'].sum().sort_values(ascending=False) if not df_consumo.empty else pd.Series()
     
-    periodo_actual = pd.Period(ahora_argentina(), freq='M')
-    df_mes_actual = df_consumo[df_consumo['mes_periodo'] == periodo_actual] if not df_consumo.empty else pd.DataFrame()
+    inicio_ciclo, fin_ciclo, etq_ciclo = resolver_ciclo_havas(user_id)
+    mask_ciclo = (df_consumo['fecha'] >= inicio_ciclo) & (df_consumo['fecha'] < fin_ciclo)
+    df_mes_actual = df_consumo[mask_ciclo] if not df_consumo.empty else pd.DataFrame()
     consumo_mes_actual = float(df_mes_actual['monto'].sum()) if not df_mes_actual.empty else 0.0
-    dia_del_mes = ahora_argentina().day
-    dias_en_mes = 30
+    dias_ciclo = max(1, (min(pd.Timestamp(ahora_argentina()), fin_ciclo - pd.Timedelta(days=1)) - inicio_ciclo).days + 1)
+    dia_del_mes = dias_ciclo
+    dias_en_mes = max(28, (fin_ciclo - inicio_ciclo).days)
     proyeccion_mes_actual = (consumo_mes_actual / dia_del_mes * dias_en_mes) if dia_del_mes > 0 else consumo_mes_actual
     desvio_pct_vs_prom = ((proyeccion_mes_actual - prom_consumo_mensual) / prom_consumo_mensual * 100.0) if prom_consumo_mensual > 0 else 0.0
 
@@ -712,7 +947,8 @@ def calcular_metricas_finanzas_completas(user_id: int, meses_lookback: int = 6):
     runway_meses = (patrimonio_ars_aprox / prom_consumo_mensual) if prom_consumo_mensual > 0 else 0.0
 
     lineas = [
-        f"📊 RADIOGRAFÍA FINANCIERA (Últimos {cant_meses_reales} meses)",
+        f"📊 RADIOGRAFÍA FINANCIERA ({cant_meses_reales} ciclos Havas→Havas)",
+        f"• Ciclo actual: {etq_ciclo}",
         "",
         "💵 Flujo de Caja y Ahorro",
         f"• Ingresos habituales:     ${prom_ingreso_mensual:,.0f} ARS/mes",
@@ -751,7 +987,7 @@ def calcular_metricas_finanzas_completas(user_id: int, meses_lookback: int = 6):
     lineas.append("⏱️ Control del Mes en Curso y Runway")
     signo_d = "+" if desvio_pct_vs_prom >= 0 else ""
     em_d = "🔴" if desvio_pct_vs_prom > 15 else ("🟢" if desvio_pct_vs_prom < -5 else "🟡")
-    lineas.append(f"• Consumido este mes:   ${consumo_mes_actual:,.0f} ARS (Día {dia_del_mes})")
+    lineas.append(f"• Consumido este ciclo: ${consumo_mes_actual:,.0f} ARS (día {dia_del_mes}/{dias_en_mes})")
     lineas.append(f"• Ritmo proyectado:     {em_d} {signo_d}{desvio_pct_vs_prom:.1f}% vs promedio histórico")
     if runway_meses > 0:
         lineas.append(f"• Runway de respaldo:   {runway_meses:.1f} meses de costo de vida cubiertos con tu cartera")
@@ -2862,10 +3098,10 @@ async def presentar_siguiente_movimiento(update: Update, user_id: int):
     # Procesar de forma automática movimientos con alta recurrencia histórica
     while sesion["idx"] < len(items):
         item = items[sesion["idx"]]
-        cat_sug, desc_sug, clave, usos = buscar_clasificacion_previa(user_id, item["concepto"])
+        cat_sug, desc_sug, clave, usos, rechazos, auto_ok = buscar_clasificacion_previa(user_id, item["concepto"])
 
-        # Si el concepto se repitió varias veces en meses anteriores, se auto-aprueba
-        if cat_sug and usos >= UMBRAL_AUTO_APROBAR:
+        # Auto-aprobar solo con historial 100% consistente (cero rechazos / cambios de rubro)
+        if cat_sug and auto_ok:
             guardar_movimiento(user_id, item["tipo"], item["monto"], cat_sug, desc_sug, item["fecha"])
             guardar_aprendizaje_concepto(user_id, clave, cat_sug, desc_sug)
             sesion["guardados"] += 1
@@ -2915,14 +3151,17 @@ async def presentar_siguiente_movimiento(update: Update, user_id: int):
         await update.message.reply_text(msg)
         return
 
-    cat_sug, desc_sug, clave, usos = buscar_clasificacion_previa(user_id, item["concepto"])
+    cat_sug, desc_sug, clave, usos, rechazos, auto_ok = buscar_clasificacion_previa(user_id, item["concepto"])
     item["cat_sug"] = cat_sug
     item["desc_sug"] = desc_sug
     item["clave_patron"] = clave
+    item["usos_sug"] = usos
+    item["rechazos_sug"] = rechazos
 
     if cat_sug:
+        extra_no = f" | {rechazos} rechazo(s)" if rechazos else ""
         opciones_txt = (
-            f"🏷️ Clasificación sugerida ({usos}/{UMBRAL_AUTO_APROBAR} confirmaciones previas): {cat_sug} ({desc_sug})\n\n"
+            f"🏷️ Clasificación sugerida ({usos}/{UMBRAL_AUTO_APROBAR} OK{extra_no}): {cat_sug} ({desc_sug})\n\n"
             f"¿Querés registrarlo con esta categoría?\n"
             f"• Respondé 'Si' u 'Ok' para guardarlo directo.\n"
             f"• O escribí otra categoría si preferís cambiarla.\n"
@@ -3001,6 +3240,9 @@ async def procesar_respuesta_importacion(update: Update, user_id: int, user_text
 
     # 3. Descarte del movimiento
     if tlow in ("no", "paso", "omitir", "saltear", "descartar", "nop"):
+        clave_omit = item.get("clave_patron")
+        if item.get("cat_sug") and clave_omit:
+            registrar_rechazo_concepto(user_id, clave_omit)
         sesion["omitidos"] += 1
         sesion["idx"] += 1
         await presentar_siguiente_movimiento(update, user_id)
@@ -3339,21 +3581,21 @@ async def cmd_riesgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_mes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    inicio, fin, etq = resolver_ciclo_havas(user_id)
     texto, err = obtener_progreso_presupuestos(user_id)
     if err:
-        ahora = ahora_argentina()
         with get_db_connection() as conn:
             df = pd.read_sql(
                 """SELECT categoria, SUM(monto) as total FROM movimientos 
                    WHERE user_id = %s AND tipo = 'GASTO' 
-                   AND EXTRACT(MONTH FROM fecha) = %s AND EXTRACT(YEAR FROM fecha) = %s
+                   AND fecha >= %s AND fecha < %s
                    GROUP BY categoria ORDER BY total DESC;""",
-                conn, params=(user_id, ahora.month, ahora.year)
+                conn, params=(user_id, inicio.to_pydatetime(), fin.to_pydatetime())
             )
         if df.empty:
-            await update.message.reply_text("No hay gastos registrados este mes ni presupuestos cargados.")
+            await update.message.reply_text(f"No hay gastos registrados en el {etq} ni presupuestos cargados.")
         else:
-            lineas = [f"📅 GASTOS DEL MES {ahora.month:02d}/{ahora.year}", ""]
+            lineas = [f"📅 GASTOS {etq}", ""]
             total = 0.0
             for _, r in df.iterrows():
                 cat_clean = normalizar_categoria(r['categoria'])
@@ -3363,7 +3605,7 @@ async def cmd_mes(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lineas.append("\n💡 Tip: definí presupuestos diciendo 'Presupuesto Comida 180000'")
             await update.message.reply_text("\n".join(lineas))
     else:
-        await update.message.reply_text(texto)
+        await update.message.reply_text(f"{etq}\n\n{texto}")
 
 async def cmd_objetivos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
