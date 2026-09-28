@@ -3770,6 +3770,21 @@ async def intentar_comando_local(update: Update, user_id: int, user_msg: str) ->
     if cmd in ("delivery", "pedidosya", "pedidos") or re.search(r"\b(como va(n)? delivery|gastos? de delivery)\b", low):
         await update.message.reply_text(texto_alerta_delivery(user_id))
         return True
+    m_pres = re.search(
+        r"presupuesto\s+([a-záéíóúüñ ]+?)\s+\$?\s*(\d[\d\.]*)\s*(k|mil)?",
+        low,
+    )
+    if m_pres:
+        cat_p = normalizar_categoria(m_pres.group(1).strip())
+        bruto = m_pres.group(2).replace(".", "").replace(",", "")
+        mon_p = float(bruto)
+        suf = (m_pres.group(3) or "").strip()
+        if suf in ("k", "mil") or low.rstrip().endswith("k"):
+            if mon_p < 10000:
+                mon_p *= 1000
+        set_presupuesto(user_id, cat_p, mon_p)
+        await update.message.reply_text(f"✅ Presupuesto {cat_p}: ${mon_p:,.0f} ARS este ciclo.")
+        return True
     if cmd in ("mes", "presupuesto", "presupuestos"):
         await cmd_mes(update, None)
         return True
@@ -3778,15 +3793,6 @@ async def intentar_comando_local(update: Update, user_id: int, user_msg: str) ->
         return True
     if cmd in ("riesgo", "risk"):
         await cmd_riesgo(update, None)
-        return True
-    m_pres = re.search(r"presupuesto\s+([a-záéíóúñ ]+?)\s+(\d[\d\.]*)", low)
-    if m_pres:
-        cat_p = normalizar_categoria(m_pres.group(1).strip())
-        mon_p = float(m_pres.group(2).replace(".", "").replace(",", ".")) if "," in m_pres.group(2) else float(m_pres.group(2).replace(".", ""))
-        if mon_p < 1000:
-            mon_p = float(m_pres.group(2).replace(".", ""))
-        set_presupuesto(user_id, cat_p, mon_p)
-        await update.message.reply_text(f"✅ Presupuesto {cat_p}: ${mon_p:,.0f} ARS este ciclo.")
         return True
     if cmd in ("resumen", "cartera", "balance"):
         await cmd_resumen(update, None)
