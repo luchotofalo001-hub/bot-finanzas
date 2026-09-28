@@ -1,6 +1,7 @@
 import os
 import io
 import re
+import time
 import asyncio
 import logging
 import threading
@@ -11,6 +12,7 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 from google import genai
 import psycopg2
+from psycopg2.pool import SimpleConnectionPool
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -26,6 +28,10 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+plt.ioff()
 
 # ==================== SERVIDOR WEB PARA RENDER ====================
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -64,8 +70,60 @@ ai_client = genai.Client(api_key=GEMINI_API_KEY)
 # Estado en memoria para importaciones interactivas
 importaciones_activas = {}
 
+_DB_POOL = None
+_YF_CACHE = {}
+_YF_TTL_SEG = 180
+_YF_CACHE_MAX = 80
+
+def _db_pool():
+    global _DB_POOL
+    if _DB_POOL is None:
+        _DB_POOL = SimpleConnectionPool(1, 6, dsn=DATABASE_URL, connect_timeout=8)
+    return _DB_POOL
+
+class _PooledConn:
+    def __init__(self):
+        self.conn = _db_pool().getconn()
+    def __enter__(self):
+        return self.conn
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if self.conn and not self.conn.closed:
+                if exc_type:
+                    self.conn.rollback()
+        except Exception:
+            pass
+        try:
+            _db_pool().putconn(self.conn)
+        except Exception:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+        return False
+
 def get_db_connection():
-    return psycopg2.connect(DATABASE_URL)
+    return _PooledConn()
+
+def yf_history(symbol: str, start=None, period=None, auto_adjust=True, interval=None):
+    key = (str(symbol), str(start), str(period), bool(auto_adjust), str(interval))
+    now = time.time()
+    hit = _YF_CACHE.get(key)
+    if hit and now - hit[0] < _YF_TTL_SEG:
+        return hit[1].copy()
+    t = yf.Ticker(symbol)
+    kwargs = {"auto_adjust": auto_adjust}
+    if interval:
+        kwargs["interval"] = interval
+    if period:
+        h = t.history(period=period, **kwargs)
+    else:
+        h = t.history(start=start, **kwargs)
+    _YF_CACHE[key] = (now, h)
+    if len(_YF_CACHE) > _YF_CACHE_MAX:
+        viejo = min(_YF_CACHE.items(), key=lambda kv: kv[1][0])[0]
+        _YF_CACHE.pop(viejo, None)
+    return h
 
 def init_db():
     try:
@@ -168,6 +226,11 @@ def init_db():
                 cursor.execute("UPDATE movimientos SET user_id = %s WHERE user_id IS NULL;", (LUCHO_TELEGRAM_ID,))
                 cursor.execute("UPDATE portafolio_inversiones SET user_id = %s WHERE user_id IS NULL;", (LUCHO_TELEGRAM_ID,))
                 cursor.execute("UPDATE trades_cerrados SET user_id = %s WHERE user_id IS NULL;", (LUCHO_TELEGRAM_ID,))
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_mov_user_fecha ON movimientos (user_id, fecha);")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_mov_user_tipo ON movimientos (user_id, tipo);")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_mapeo_user_clave ON mapeo_conceptos (user_id, patron_clave);")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_inv_user ON portafolio_inversiones (user_id);")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_tc_user_fecha ON trades_cerrados (user_id, fecha);")
                 conn.commit()
         logger.info("Base de datos inicializada correctamente.")
     except Exception as e:
@@ -1073,7 +1136,7 @@ def consultar_datos_mercado(ticker: str):
     for sym in simbolos_a_probar:
         try:
             t = yf.Ticker(sym)
-            df_hist = t.history(period="5d")
+            df_hist = yf_history(sym, period="5d")
             if df_hist is not None and not df_hist.empty:
                 df_hist = df_hist.dropna(subset=['Close'])
                 if not df_hist.empty:
@@ -1384,7 +1447,7 @@ def calcular_rendimiento_por_meses(user_id: int, anio: int = None):
     fecha_min = df_tc['fecha'].min().strftime('%Y-%m-%d')
     spy_hist = None
     try:
-        hspy = yf.Ticker("SPY").history(start=fecha_min, auto_adjust=True)
+        hspy = yf_history("SPY", start=fecha_min, auto_adjust=True)
         if hspy is not None and not hspy.empty:
             spy_hist = hspy['Close'].dropna()
             spy_hist.index = pd.to_datetime(spy_hist.index).tz_localize(None)
@@ -1488,7 +1551,7 @@ def generar_grafico_evolucion_cartera_consolidada(user_id: int, periodo_solicita
                 continue
             sym = normalizar_ticker_yf(tk)
             try:
-                h = yf.Ticker(sym).history(start=fecha_start)
+                h = yf_history(sym, start=fecha_start)
                 if not h.empty:
                     s = h['Close'].ffill().bfill()
                     s.index = pd.to_datetime(s.index).tz_localize(None)
@@ -1572,7 +1635,7 @@ def generar_grafico_evolucion_cartera_consolidada(user_id: int, periodo_solicita
 
         sspy = None
         try:
-            hspy = yf.Ticker("SPY").history(start=fecha_start, auto_adjust=True)
+            hspy = yf_history("SPY", start=fecha_start, auto_adjust=True)
             if hspy is not None and not hspy.empty:
                 sspy = hspy["Close"].replace([np.inf, -np.inf], np.nan)
                 sspy.index = pd.to_datetime(sspy.index).tz_localize(None)
@@ -1670,7 +1733,7 @@ def generar_grafico_evolucion_por_activos(user_id: int, periodo_solicitado: str 
 
             sym = normalizar_ticker_yf(tk)
             try:
-                h = yf.Ticker(sym).history(start=fecha_start)
+                h = yf_history(sym, start=fecha_start)
                 if not h.empty:
                     s = h['Close'].ffill().bfill()
                     s.index = pd.to_datetime(s.index).tz_localize(None)
@@ -1750,12 +1813,10 @@ def generar_grafico_evolucion_activo(user_id: int, ticker: str, periodo_solicita
     fecha_start, desc_periodo = resolver_fecha_inicio(periodo_solicitado, fecha_compra_db)
 
     try:
-        t = yf.Ticker(simbolo)
-        df_hist = t.history(start=fecha_start)
+        df_hist = yf_history(simbolo, start=fecha_start)
         if df_hist.empty and not simbolo.endswith("-USD"):
             simbolo = f"{simbolo}-USD"
-            t = yf.Ticker(simbolo)
-            df_hist = t.history(start=fecha_start)
+            df_hist = yf_history(simbolo, start=fecha_start)
 
         if df_hist.empty:
             return None
@@ -2167,12 +2228,10 @@ def generar_grafico_analisis_tecnico(ticker: str, timeframe: str = "diario", con
         tf_label = "Diario"
 
     try:
-        t = yf.Ticker(simbolo)
-        df = t.history(period=periodo, interval=intervalo)
+        df = yf_history(simbolo, period=periodo, interval=intervalo)
         if df.empty and not simbolo.endswith("-USD"):
             simbolo = f"{simbolo}-USD"
-            t = yf.Ticker(simbolo)
-            df = t.history(period=periodo, interval=intervalo)
+            df = yf_history(simbolo, period=periodo, interval=intervalo)
             
         if df.empty:
             return None, f"No se encontraron datos para {ticker} en {tf_label}"
@@ -2869,7 +2928,7 @@ def calcular_metricas_riesgo_completas(user_id: int):
 def _serie_spy_ret(fecha_start: str):
     for sym in ("SPY", "SPY.US", "^GSPC"):
         try:
-            h = yf.Ticker(sym).history(start=fecha_start, auto_adjust=True)
+            h = yf_history(sym, start=fecha_start, auto_adjust=True)
             if h is None or h.empty or "Close" not in h.columns:
                 continue
             s = h["Close"].replace([np.inf, -np.inf], np.nan).dropna()
@@ -4132,7 +4191,7 @@ async def cmd_delivery(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(texto_alerta_delivery(update.effective_user.id))
 
 async def main():
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).concurrent_updates(True).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", cmd_borrar_todo))
     app.add_handler(CommandHandler("resumen", cmd_resumen))
