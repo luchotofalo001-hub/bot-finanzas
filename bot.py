@@ -241,9 +241,10 @@ def _es_hash_debin(token: str) -> bool:
 def extraer_clave_comercio(concepto_crudo: str) -> str:
     raw = str(concepto_crudo)
     texto = raw.upper()
+    texto = texto.replace("*", " ")
     texto = re.sub(r"\d{4}X+\d{2,4}", " ", texto)
     texto = re.sub(r"\b\d{6,}\b", " ", texto)
-    texto = re.sub(r"[^A-Z0-9\s\*]", " ", texto)
+    texto = re.sub(r"[^A-Z0-9\s]", " ", texto)
 
     tokens = texto.split()
     tokens_utiles = [
@@ -276,11 +277,13 @@ def extraer_clave_comercio(concepto_crudo: str) -> str:
         if "SHOPPER" in texto:
             return "UBER SHOPPER"
         return "UBER"
-    if "SUBE" in tokens or "TRANSPORTE" in texto and "SUBE" in texto:
+    if "SUBE" in tokens or ("TRANSPORTE" in texto and "SUBE" in texto):
         return "SUBE"
     if "FARMACITY" in texto:
+        if "REINTEGRO" in texto:
+            return "FARMACITY REINTEGRO"
         return "FARMACITY"
-    if "CINEMARK" in tokens:
+    if "CINEMARK" in tokens or "CINEMARK" in texto:
         return "CINEMARK"
     if "METROGAS" in tokens:
         return "METROGAS"
@@ -307,7 +310,14 @@ def extraer_clave_comercio(concepto_crudo: str) -> str:
 
     if not tokens_utiles:
         return ""
-    return " ".join(tokens_utiles[:2])
+    clave_fallback = " ".join(tokens_utiles[:2])
+    genericas = {
+        "TRANSPORTE", "SEPTIEMBRE", "OCTUBRE", "NOVIEMBRE", "DICIEMBRE", "ENERO", "FEBRERO",
+        "MARZO", "ABRIL", "MAYO", "JUNIO", "JULIO", "AGOSTO", "VARIOS", "PERSONAL", "PAY"
+    }
+    if clave_fallback in genericas or all(p in genericas for p in clave_fallback.split()):
+        return ""
+    return clave_fallback
 
 def sugerir_clasificacion_por_concepto(concepto: str):
     clave = extraer_clave_comercio(concepto)
@@ -335,9 +345,9 @@ def sugerir_clasificacion_por_concepto(concepto: str):
         if "REINTEGRO" in texto:
             return "Transporte", "Reintegro Uber", clave
         return "Transporte", "Uber", clave
+    if clave == "FARMACITY REINTEGRO":
+        return "Farmacia", "Reintegro Farmacity", clave
     if clave == "FARMACITY":
-        if "REINTEGRO" in texto:
-            return "Farmacia", "Reintegro Farmacity", clave
         return "Farmacia", "Farmacity", clave
     if clave == "FORNODELPAESE":
         return "Comida", "Forno del Paese", clave
@@ -357,8 +367,20 @@ def sugerir_clasificacion_por_concepto(concepto: str):
         return "Tarjeta de crédito", "Pago Tarjeta Mastercard", clave
     return None, None, clave
 
-def clasificacion_es_auto_aprobable(usos: int, rechazos: int) -> bool:
-    return usos >= UMBRAL_AUTO_APROBAR and int(rechazos or 0) == 0
+CLAVES_COMERCIO_CONOCIDO = {
+    "PEDIDOSYA MARKET", "PEDIDOSYA EXTRA", "SUBE", "UBER", "UBER SHOPPER",
+    "FARMACITY", "FARMACITY REINTEGRO", "CINEMARK", "METROGAS", "EDESUR",
+    "HAVAS MEDIA", "FORNODELPAESE", "PETTISH", "FIMA PREMIUM", "COMPRA DOLARES",
+    "MARINA LUZ (MAMA)", "PAGO TARJETA MASTER", "RAPPI PRO", "RAPPI",
+}
+
+def clasificacion_es_auto_aprobable(usos: int, rechazos: int, clave: str = "") -> bool:
+    if int(rechazos or 0) > 0:
+        return False
+    if not clave:
+        return False
+    umbral = 1 if (clave in CLAVES_COMERCIO_CONOCIDO or str(clave).startswith("PEDIDOSYA")) else UMBRAL_AUTO_APROBAR
+    return usos >= umbral
 
 def buscar_clasificacion_previa(user_id: int, concepto: str):
     cat_reglas, desc_reglas, clave = sugerir_clasificacion_por_concepto(concepto)
@@ -381,7 +403,7 @@ def buscar_clasificacion_previa(user_id: int, concepto: str):
         logger.warning(f"buscar_clasificacion_previa sin DB: {e}")
 
     if cat_db:
-        auto_ok = clasificacion_es_auto_aprobable(usos, rechazos)
+        auto_ok = clasificacion_es_auto_aprobable(usos, rechazos, clave)
         return cat_db, desc_db, clave, usos, rechazos, auto_ok
     if cat_reglas:
         return cat_reglas, desc_reglas, clave, 0, 0, False
@@ -894,7 +916,11 @@ def calcular_metricas_finanzas_completas(user_id: int, meses_lookback: int = 6):
             return False
         if es_sueldo_haberes(cat, desc):
             return False
-        if any(t in f"{cat} {desc}" for t in TAGS_AHORRO):
+        blob = f"{cat} {desc}"
+        if any(t in blob for t in TAGS_AHORRO):
+            return True
+        monto = float(row.get("monto") or 0)
+        if "delfina" in blob and monto >= 100000:
             return True
         return False
 
@@ -915,6 +941,7 @@ def calcular_metricas_finanzas_completas(user_id: int, meses_lookback: int = 6):
     tot_ingresos = float(df_ingresos_reales['monto'].sum()) if not df_ingresos_reales.empty else 0.0
     tot_consumo = float(df_consumo['monto'].sum()) if not df_consumo.empty else 0.0
     tot_ahorro_derivado = float(df_salidas_ahorro['monto'].sum()) if not df_salidas_ahorro.empty else 0.0
+    tot_capital = float(df_entradas_ahorro['monto'].sum()) if not df_entradas_ahorro.empty else 0.0
 
     prom_ingreso_mensual = tot_ingresos / cant_meses_reales
     prom_consumo_mensual = tot_consumo / cant_meses_reales
@@ -954,6 +981,7 @@ def calcular_metricas_finanzas_completas(user_id: int, meses_lookback: int = 6):
         f"• Ingresos habituales:     ${prom_ingreso_mensual:,.0f} ARS/mes",
         f"• Costo de vida (consumo): ${prom_consumo_mensual:,.0f} ARS/mes",
         f"• Derivado a Ahorro/USDT:  ${prom_ahorro_derivado:,.0f} ARS/mes",
+        f"• Capital recibido (no sueldo): ${tot_capital / cant_meses_reales:,.0f} ARS/mes",
         f"• Capacidad neta de ahorro: ${superavit_mensual_prom:+,.0f} ARS/mes",
         f"• Tasa de ahorro real:     {tasa_ahorro_pct:.1f}% del ingreso"
     ]
@@ -3596,12 +3624,33 @@ async def cmd_mes(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"No hay gastos registrados en el {etq} ni presupuestos cargados.")
         else:
             lineas = [f"📅 GASTOS {etq}", ""]
-            total = 0.0
+            total_vida = 0.0
+            total_ahorro = 0.0
+            lineas.append("🛒 Costo de vida")
             for _, r in df.iterrows():
                 cat_clean = normalizar_categoria(r['categoria'])
+                blob = cat_clean.lower()
+                es_ah = any(t in blob for t in TAGS_AHORRO)
+                if es_ah:
+                    continue
                 lineas.append(f"• {cat_clean}: ${float(r['total']):,.0f}")
-                total += float(r['total'])
-            lineas.append(f"\nTotal: ${total:,.0f} ARS")
+                total_vida += float(r['total'])
+            lineas.append(f"Subtotal vida: ${total_vida:,.0f} ARS")
+            lineas.append("")
+            lineas.append("💼 Ahorro / inversión")
+            hay_ah = False
+            for _, r in df.iterrows():
+                cat_clean = normalizar_categoria(r['categoria'])
+                blob = cat_clean.lower()
+                if not any(t in blob for t in TAGS_AHORRO):
+                    continue
+                hay_ah = True
+                lineas.append(f"• {cat_clean}: ${float(r['total']):,.0f}")
+                total_ahorro += float(r['total'])
+            if not hay_ah:
+                lineas.append("• (sin movimientos de ahorro en el ciclo)")
+            lineas.append(f"Subtotal ahorro: ${total_ahorro:,.0f} ARS")
+            lineas.append(f"\nTotal salidas: ${total_vida + total_ahorro:,.0f} ARS")
             lineas.append("\n💡 Tip: definí presupuestos diciendo 'Presupuesto Comida 180000'")
             await update.message.reply_text("\n".join(lineas))
     else:
@@ -3798,3 +3847,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
