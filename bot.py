@@ -202,18 +202,141 @@ MAPA_CANONICO_CATEGORIAS = {
     "tarjetas de crédito": "Tarjeta de crédito",
     "tarjeta de credito": "Tarjeta de crédito",
     "tarjeta de crédito": "Tarjeta de crédito",
+    "pago de tarjeta de credito": "Tarjeta de crédito",
+    "pago de tarjeta": "Tarjeta de crédito",
+    "pago tarjetas": "Tarjeta de crédito",
+    "pago tarjeta": "Tarjeta de crédito",
     "tarjetas": "Tarjeta de crédito",
     "supermercados": "Supermercado",
+    "supermercado": "Supermercado",
     "servicios basicos": "Servicios",
     "servicios básicos": "Servicios",
+    "servicio": "Servicios",
+    "servicios": "Servicios",
     "transferencia familiar": "Transferencias",
     "ingresos familiares": "Transferencias",
+    "transferencias": "Transferencias",
+    "transferencia": "Transferencias",
     "devolucion": "Devoluciones",
     "devolución": "Devoluciones",
     "panaderia": "Comida",
     "panadería": "Comida",
+    "verduleria": "Comida",
+    "verdulería": "Comida",
+    "fiambreria": "Comida",
+    "fiambrería": "Comida",
+    "comida": "Comida",
+    "cafe": "Comida",
+    "café": "Comida",
+    "delivery": "Delivery",
     "bazar": "Hogar",
+    "hogar": "Hogar",
+    "regalos": "Regalos",
+    "regalo": "Regalos",
+    "flores": "Regalos",
+    "farmacia": "Farmacia",
+    "transporte": "Transporte",
+    "uber": "Transporte",
+    "sube": "Transporte",
+    "entretenimiento": "Entretenimiento",
+    "cine": "Entretenimiento",
+    "suscripciones": "Suscripciones",
+    "suscripcion": "Suscripciones",
+    "suscripción": "Suscripciones",
+    "impuestos": "Impuestos",
+    "impuesto": "Impuestos",
+    "inversiones": "Inversiones",
+    "inversion": "Inversiones",
+    "inversión": "Inversiones",
+    "sueldo": "Sueldo",
+    "mascotas": "Mascotas",
+    "mascota": "Mascotas",
+    "arena": "Mascotas",
+    "deportes": "Deportes",
+    "futbol": "Deportes",
+    "fútbol": "Deportes",
+    "cuidado personal": "Cuidado personal",
+    "barberia": "Cuidado personal",
+    "barbería": "Cuidado personal",
+    "compras": "Compras",
+    "compra": "Compras",
 }
+
+def _emprolijar_texto(txt: str) -> str:
+    t = " ".join(str(txt or "").split()).strip()
+    if not t:
+        return t
+    minus = {"de", "del", "la", "el", "los", "las", "y", "a", "en", "para", "por"}
+    parts = t.split(" ")
+    out = []
+    for i, w in enumerate(parts):
+        wl = w.lower()
+        if i > 0 and wl in minus:
+            out.append(wl)
+        else:
+            out.append(wl[:1].upper() + wl[1:] if wl else w)
+    return " ".join(out)
+
+CATEGORIAS_VALIDAS = {
+    "Tarjeta de crédito", "Supermercado", "Servicios", "Transferencias", "Devoluciones",
+    "Comida", "Delivery", "Hogar", "Regalos", "Farmacia", "Transporte", "Entretenimiento",
+    "Suscripciones", "Impuestos", "Inversiones", "Sueldo", "Mascotas", "Deportes",
+    "Cuidado personal", "Compras", "Ingresos", "Ingresos financieros", "Varios",
+}
+
+def categoria_reconocida_por_python(texto: str) -> bool:
+    tlow = " ".join(str(texto or "").split()).strip().lower()
+    if not tlow:
+        return False
+    if "|" in tlow or "," in tlow:
+        izq = tlow.split("|", 1)[0].split(",", 1)[0].strip()
+        tlow = izq
+    if tlow in MAPA_CANONICO_CATEGORIAS:
+        return True
+    for alias in sorted(MAPA_CANONICO_CATEGORIAS, key=len, reverse=True):
+        if tlow == alias or tlow.startswith(alias + " "):
+            return True
+    return False
+
+def emprolijar_categoria_con_gemini(user_text: str):
+    prompt = (
+        "El usuario escribió esto para clasificar un gasto o ingreso. "
+        "Devolvé SOLO: CATEGORIA|DESCRIPCION\n"
+        f"Texto: {user_text}"
+    )
+    res = llamar_gemini(prompt, "Clasificador breve. Responde solo CATEGORIA|DESCRIPCION.")
+    partes = [p.strip() for p in (res or "").split("|")]
+    cat = normalizar_categoria(partes[0]) if partes and partes[0] else "Varios"
+    desc = _emprolijar_texto(partes[1]) if len(partes) > 1 and partes[1] else _emprolijar_texto(user_text)
+    return cat, desc
+
+def parsear_categoria_descripcion_usuario(texto: str):
+    raw = " ".join(str(texto or "").split()).strip()
+    if not raw:
+        return "Varios", "Sin descripción"
+    if "|" in raw:
+        izq, der = raw.split("|", 1)
+        cat = normalizar_categoria(izq)
+        desc = _emprolijar_texto(der) or cat
+        return cat, desc
+    if "," in raw:
+        izq, der = raw.split(",", 1)
+        if len(izq.split()) <= 4:
+            cat = normalizar_categoria(izq)
+            desc = _emprolijar_texto(der) or cat
+            return cat, desc
+    tlow = raw.lower()
+    alias_ord = sorted(MAPA_CANONICO_CATEGORIAS.items(), key=lambda x: len(x[0]), reverse=True)
+    for alias, canon in alias_ord:
+        if tlow == alias:
+            return canon, canon
+        if tlow.startswith(alias + " "):
+            resto = raw[len(alias):].strip(" ,:-")
+            return canon, _emprolijar_texto(resto) or canon
+    partes = raw.split(None, 1)
+    cat = normalizar_categoria(partes[0])
+    desc = _emprolijar_texto(partes[1]) if len(partes) > 1 else cat
+    return cat, desc or cat
 
 def normalizar_categoria(cat: str) -> str:
     c_low = cat.strip().lower()
@@ -536,6 +659,199 @@ TAGS_AHORRO = {
     "inversion", "inversión", "inversiones", "ahorro", "usdt", "crypto", "cripto",
     "broker", "dolares", "dólares", "dolar", "dólar", "usd", "fima"
 }
+
+CATS_NETEAR_DEVOL = {
+    "comida", "delivery", "supermercado", "farmacia", "transporte",
+    "entretenimiento", "hogar", "regalos", "mascotas", "compras",
+}
+TAGS_DEVOL = ("reintegro", "devol", "anulacion", "anulación", "dev.compra", "devo")
+TAGS_FIJO = (
+    "metrogas", "edesur", "aysa", "telecentro", "personal", "internet",
+    "luz", "gas", "abl", "expensas", "alquiler", "rappi pro", "suscrip",
+    "netflix", "spotify", "youtube", "icloud", "openai",
+)
+
+def _es_devolucion_row(row) -> bool:
+    if str(row.get("tipo", "")).upper() != "INGRESO":
+        return False
+    blob = f"{row.get('categoria', '')} {row.get('descripcion', '')}".lower()
+    cat = str(row.get("categoria", "")).lower()
+    if any(t in blob for t in TAGS_DEVOL):
+        return True
+    return cat in CATS_NETEAR_DEVOL
+
+def netear_devoluciones_en_consumo(df_consumo, df_ingresos):
+    if df_consumo is None or df_consumo.empty:
+        return df_consumo
+    if df_ingresos is None or df_ingresos.empty:
+        return df_consumo
+    reint = df_ingresos[df_ingresos.apply(_es_devolucion_row, axis=1)].copy()
+    if reint.empty:
+        return df_consumo
+    por_cat = reint.groupby(reint["categoria"].apply(lambda c: normalizar_categoria(c)))["monto"].sum()
+    out = df_consumo.copy()
+    out["categoria"] = out["categoria"].apply(normalizar_categoria)
+    descuentos = []
+    for cat, monto_dev in por_cat.items():
+        mask = out["categoria"] == cat
+        if not mask.any():
+            continue
+        resto = float(monto_dev)
+        idxs = list(out.loc[mask].sort_values("monto", ascending=False).index)
+        for i in idxs:
+            if resto <= 0:
+                break
+            actual = float(out.at[i, "monto"])
+            baja = min(actual, resto)
+            out.at[i, "monto"] = actual - baja
+            resto -= baja
+            descuentos.append((cat, baja))
+    out = out[out["monto"] > 0.5]
+    return out
+
+def _cargar_movimientos_ciclo(user_id: int):
+    with get_db_connection() as conn:
+        df = pd.read_sql(
+            "SELECT fecha, tipo, monto, categoria, descripcion FROM movimientos WHERE user_id = %s;",
+            conn, params=(user_id,),
+        )
+    if df.empty:
+        return df
+    df["fecha"] = pd.to_datetime(df["fecha"])
+    df["categoria"] = df["categoria"].apply(normalizar_categoria)
+    sueldos = obtener_fechas_sueldo(user_id)
+    return asignar_ciclo_havas(df, sueldos)
+
+def texto_comparar_ciclos(user_id: int) -> str:
+    df = _cargar_movimientos_ciclo(user_id)
+    if df.empty:
+        return "No hay movimientos para comparar ciclos."
+    inicio, fin, etq = resolver_ciclo_havas(user_id)
+    ciclos = sorted(df["ciclo_id"].dropna().unique())
+    if not ciclos:
+        return "Todavía no hay ciclos Havas para comparar."
+    actual_id = inicio.strftime("%Y-%m-%d")
+    if actual_id not in ciclos:
+        actual_id = ciclos[-1]
+    prevs = [c for c in ciclos if c < actual_id]
+    prev_id = prevs[-1] if prevs else None
+
+    g = df[(df["tipo"] == "GASTO")].copy()
+    blob = (g["categoria"].astype(str) + " " + g["descripcion"].astype(str)).str.lower()
+    g = g[~blob.apply(lambda x: any(t in x for t in TAGS_AHORRO))]
+    g_act = g[g["ciclo_id"] == actual_id]
+    tot_act = float(g_act["monto"].sum()) if not g_act.empty else 0.0
+    por_act = g_act.groupby("categoria")["monto"].sum() if not g_act.empty else pd.Series(dtype=float)
+
+    lineas = [f"📊 ESTE CICLO VS ANTERIOR", f"• Actual: {etq}", ""]
+    if prev_id is None:
+        lineas.append("Todavía no hay un ciclo anterior completo para comparar.")
+        lineas.append(f"Consumo de este ciclo: ${tot_act:,.0f} ARS")
+        return "\n".join(lineas)
+
+    g_prev = g[g["ciclo_id"] == prev_id]
+    tot_prev = float(g_prev["monto"].sum()) if not g_prev.empty else 0.0
+    por_prev = g_prev.groupby("categoria")["monto"].sum() if not g_prev.empty else pd.Series(dtype=float)
+    delta = tot_act - tot_prev
+    pct = (delta / tot_prev * 100.0) if tot_prev else 0.0
+    em = "🔴" if delta > 0 else ("🟢" if delta < 0 else "🟡")
+    lineas.append(f"• Ciclo anterior: {prev_id}")
+    lineas.append(f"• Consumo actual:    ${tot_act:,.0f}")
+    lineas.append(f"• Consumo anterior:  ${tot_prev:,.0f}")
+    lineas.append(f"• {em} Variación:     ${delta:+,.0f} ({pct:+.1f}%)")
+    lineas.append("")
+    cats = sorted(set(por_act.index) | set(por_prev.index), key=lambda c: -float(por_act.get(c, 0)))
+    lineas.append("Por rubro:")
+    for cat in cats[:12]:
+        a = float(por_act.get(cat, 0))
+        p = float(por_prev.get(cat, 0))
+        if a == 0 and p == 0:
+            continue
+        d = a - p
+        pc = (d / p * 100.0) if p else 100.0
+        mark = "▲" if d > 0 else ("▼" if d < 0 else "=")
+        lineas.append(f"• {cat}: ${a:,.0f} vs ${p:,.0f}  {mark}{abs(pc):.0f}%")
+    # Delivery highlight
+    d_act = float(por_act.get("Delivery", 0))
+    d_prev = float(por_prev.get("Delivery", 0))
+    lineas.append("")
+    if d_prev > 0 or d_act > 0:
+        dd = d_act - d_prev
+        lineas.append(f"🛵 Delivery: ${d_act:,.0f} vs ${d_prev:,.0f} ({dd:+,.0f})")
+        if d_prev and d_act > d_prev * 1.2:
+            lineas.append("⚠️ Delivery +20% vs el ciclo anterior.")
+    return "\n".join(lineas)
+
+def texto_gastos_fijos(user_id: int) -> str:
+    df = _cargar_movimientos_ciclo(user_id)
+    if df.empty:
+        return "No hay movimientos para detectar fijos."
+    g = df[df["tipo"] == "GASTO"].copy()
+    if g.empty:
+        return "No hay gastos cargados."
+    g["blob"] = (g["categoria"].astype(str) + " " + g["descripcion"].astype(str)).str.lower()
+    g["es_fijo_tag"] = g["blob"].apply(lambda x: any(t in x for t in TAGS_FIJO) or any(
+        k in x for k in ("servicio", "suscrip")
+    ))
+    por_cat_ciclo = g.groupby(["categoria", "ciclo_id"])["monto"].sum().reset_index()
+    n_ciclos_cat = por_cat_ciclo.groupby("categoria")["ciclo_id"].nunique()
+    cats_repetidas = set(n_ciclos_cat[n_ciclos_cat >= 2].index)
+    # también comercios que se repiten aunque el monto cambie
+    g["clave"] = g["descripcion"].fillna("").str.upper().str.slice(0, 40)
+    n_ciclos_desc = g.groupby("clave")["ciclo_id"].nunique()
+    claves_rep = set(n_ciclos_desc[n_ciclos_desc >= 2].index)
+
+    cand = g[g["es_fijo_tag"] | g["categoria"].isin(cats_repetidas) | g["clave"].isin(claves_rep)].copy()
+    # descartar hormiga one-off comida
+    skip = {"comida", "delivery", "regalos", "entretenimiento", "hogar"}
+    cand = cand[~cand["categoria"].str.lower().isin(skip) | cand["es_fijo_tag"]]
+    if cand.empty:
+        return "No detecté gastos fijos todavía (hace falta verlos en más de un ciclo, o que sean servicios/suscripciones)."
+
+    lineas = ["📌 GASTOS FIJOS (monto puede variar)", ""]
+    grp = cand.groupby("categoria")
+    inicio, fin, etq = resolver_ciclo_havas(user_id)
+    actual_id = inicio.strftime("%Y-%m-%d")
+    for cat, sub in sorted(grp, key=lambda kv: -kv[1]["monto"].sum()):
+        ciclos_n = sub["ciclo_id"].nunique()
+        prom = float(sub.groupby("ciclo_id")["monto"].sum().mean())
+        ult = float(sub[sub["ciclo_id"] == actual_id]["monto"].sum()) if actual_id in set(sub["ciclo_id"]) else float(sub.groupby("ciclo_id")["monto"].sum().iloc[-1])
+        mn = float(sub.groupby("ciclo_id")["monto"].sum().min())
+        mx = float(sub.groupby("ciclo_id")["monto"].sum().max())
+        lineas.append(f"• {cat}")
+        lineas.append(f"  {ciclos_n} ciclo(s) · promedio ${prom:,.0f} · último ${ult:,.0f} · rango ${mn:,.0f}–${mx:,.0f}")
+    lineas.append("")
+    lineas.append("Se marcan fijos si aparecen en 2+ ciclos o si son servicio/suscripción/luz/gas, aunque el importe cambie.")
+    return "\n".join(lineas)
+
+def texto_alerta_delivery(user_id: int) -> str:
+    df = _cargar_movimientos_ciclo(user_id)
+    if df.empty:
+        return "No hay datos de Delivery."
+    inicio, fin, etq = resolver_ciclo_havas(user_id)
+    g = df[(df["tipo"] == "GASTO") & (df["categoria"] == "Delivery")].copy()
+    ing = df[(df["tipo"] == "INGRESO") & (df["categoria"] == "Delivery")]
+    gast_act = float(g[g["ciclo_id"] == inicio.strftime("%Y-%m-%d")]["monto"].sum()) if not g.empty else 0.0
+    dev_act = float(ing[ing["ciclo_id"] == inicio.strftime("%Y-%m-%d")]["monto"].sum()) if not ing.empty else 0.0
+    neto = max(0.0, gast_act - dev_act)
+    lineas = [f"🛵 DELIVERY — {etq}", f"• Gastado: ${gast_act:,.0f}", f"• Devoluciones: ${dev_act:,.0f}", f"• Neto: ${neto:,.0f}"]
+    # presupuesto si existe
+    ahora = ahora_argentina()
+    with get_db_connection() as conn:
+        dfp = pd.read_sql(
+            "SELECT monto_limite FROM presupuestos WHERE user_id = %s AND LOWER(categoria) LIKE %s ORDER BY id DESC LIMIT 1;",
+            conn, params=(user_id, "%delivery%"),
+        )
+    if not dfp.empty:
+        lim = float(dfp.iloc[0]["monto_limite"])
+        pct = neto / lim * 100 if lim else 0
+        em = "🟢" if pct < 70 else ("🟡" if pct < 95 else "🔴")
+        lineas.append(f"• Tope: ${lim:,.0f}  {em} {pct:.0f}%")
+        if pct >= 80:
+            lineas.append("⚠️ Ya usaste el 80%+ del presupuesto de Delivery.")
+    else:
+        lineas.append("Tip: 'Presupuesto Delivery 80000' para avisarte al 80%.")
+    return "\n".join(lineas)
 
 # ==================== CONCILIACIÓN ENTRE BANCO Y MERCADO PAGO ====================
 def buscar_coincidencia_previa_db(user_id: int, monto: float, fecha_str: str, origen_nuevo: str = "EXCEL"):
@@ -932,6 +1248,7 @@ def calcular_metricas_finanzas_completas(user_id: int, meses_lookback: int = 6):
 
     df_consumo = df_gastos_totales[~df_gastos_totales['es_ahorro']].copy()
     df_salidas_ahorro = df_gastos_totales[df_gastos_totales['es_ahorro']].copy()
+    df_consumo = netear_devoluciones_en_consumo(df_consumo, df_ingresos_totales)
 
     df_ingresos_reales = df_ingresos_totales[~df_ingresos_totales['es_ahorro'] & ~df_ingresos_totales['es_capital']].copy()
     df_entradas_ahorro = df_ingresos_totales[df_ingresos_totales['es_ahorro'] | df_ingresos_totales['es_capital']].copy()
@@ -1019,6 +1336,14 @@ def calcular_metricas_finanzas_completas(user_id: int, meses_lookback: int = 6):
     lineas.append(f"• Ritmo proyectado:     {em_d} {signo_d}{desvio_pct_vs_prom:.1f}% vs promedio histórico")
     if runway_meses > 0:
         lineas.append(f"• Runway de respaldo:   {runway_meses:.1f} meses de costo de vida cubiertos con tu cartera")
+
+    try:
+        deliv = texto_alerta_delivery(user_id)
+        if deliv:
+            lineas.append("")
+            lineas.append(deliv)
+    except Exception:
+        pass
 
     return "\n".join(lineas)
 
@@ -2684,8 +3009,12 @@ def resumen_compacto_para_ia(user_id: int) -> str:
 def llamar_gemini(prompt: str, system_instruction: str) -> str:
     response = ai_client.models.generate_content(
         model=GEMINI_MODEL,
-        contents=prompt,
-        config={"system_instruction": system_instruction},
+        contents=prompt[:800],
+        config={
+            "system_instruction": system_instruction,
+            "max_output_tokens": 120,
+            "temperature": 0,
+        },
     )
     return response.text or ""
 
@@ -2710,6 +3039,7 @@ def obtener_progreso_presupuestos(user_id: int, mes: int = None, anio: int = Non
     ahora = ahora_argentina()
     mes = mes or ahora.month
     anio = anio or ahora.year
+    inicio, fin, etq = resolver_ciclo_havas(user_id)
 
     with get_db_connection() as conn:
         df_pres = pd.read_sql(
@@ -2720,9 +3050,9 @@ def obtener_progreso_presupuestos(user_id: int, mes: int = None, anio: int = Non
             """SELECT categoria, SUM(monto) as gastado 
                FROM movimientos 
                WHERE user_id = %s AND tipo = 'GASTO' 
-               AND EXTRACT(MONTH FROM fecha) = %s AND EXTRACT(YEAR FROM fecha) = %s
+               AND fecha >= %s AND fecha < %s
                GROUP BY categoria;""",
-            conn, params=(user_id, mes, anio)
+            conn, params=(user_id, inicio.to_pydatetime(), fin.to_pydatetime())
         )
 
     if df_pres.empty:
@@ -2735,7 +3065,7 @@ def obtener_progreso_presupuestos(user_id: int, mes: int = None, anio: int = Non
     else:
         gastos_dict = {}
 
-    lineas = [f"📅 PRESUPUESTOS — {mes:02d}/{anio}", ""]
+    lineas = [f"📅 PRESUPUESTOS — {etq}", ""]
     total_limite = 0.0
     total_gastado = 0.0
 
@@ -3039,39 +3369,13 @@ async def tarea_alertas_periodicas(app):
         await asyncio.sleep(ALERTA_INTERVALO_HORAS * 3600)
 
 # ==================== SYSTEM INSTRUCTION PARA IA ====================
-SYSTEM_INSTRUCTION = """
-Eres el copiloto y asesor financiero institucional del usuario.
-Tienes acceso al CONTEXTO COMPACTO de sus finanzas (posiciones abiertas, trades cerrados, gastos e ingresos en ARS).
-
-REGLAS DE ACTUACIÓN:
-1. SI EL USUARIO PIDE UN GRÁFICO, RENDIMIENTO O MÉTRICA COMPLEJA:
-   No calcules números pesados ni inventes cifras. Derívalo directamente al script de Python emitiendo en una línea:
-   COMANDO: [comando_correspondiente]
-   
-   Comandos del sistema:
-   - COMANDO: /mensual (cuando el usuario pida rendimientos mes a mes, tasa de ganancias mensual o desglose en %)
-   - COMANDO: /gastos (radiografía completa de finanzas, promedios mensuales, ahorro real y gastos hormiga)
-   - COMANDO: /spy [periodo] (comparativa con S&P 500: ytd, todo, 3m, 6m, 1y)
-   - COMANDO: /grafico [periodo] (curva USD)
-   - COMANDO: /activos [tickers] [periodo] (comparativa base 100)
-   - COMANDO: /analisis [TICKER] [timeframe] (análisis técnico algorítmico)
-   - COMANDO: /resumen (balance de posiciones abiertas y PnL)
-   - COMANDO: /riesgo (métricas institucionales de trading y riesgo)
-   - COMANDO: /mes (presupuestos del mes)
-   - COMANDO: /objetivos (metas de ahorro/capital)
-   - COMANDO: /precio [TICKER] (cotización en vivo)
-   - COMANDO: /excel (descargar planilla)
-
-2. SI EL USUARIO REGISTRA O MODIFICA:
-   - Registro Gasto/Ingreso ARS: REGISTRO_ARS: [TIPO]|[MONTO]|[CATEGORIA]|[DESCRIPCION]|[FECHA]
-   - Registro Inversión abierta: REGISTRO_INV: [TICKER]|[MARGEN]|[PPC]|[CANTIDAD]|[FECHA]|[TIPO_POS]|[LEV]|[LIQ]
-   - Registro Trade cerrado: REGISTRO_TRADE_CERRADO: [TICKER]|[PNL]|[TIPO_POS]|[ROI]|[MONTO]|[DESC]|[FECHA]
-   - Cerrar posición abierta: ACCION: CERRAR_POSICION|[ID]|[PNL_MANUAL]|[PRECIO_SALIDA]
-   - Agregar margen: ACCION: AGREGAR_MARGEN|[ID]|[MONTO_EXTRA]
-   - Borrados: ACCION: BORRAR_INVERSION_ID|[ID] / ACCION: BORRAR_MOVIMIENTO_ID|[ID] / ACCION: BORRAR_ULTIMO
-
-3. SI EL USUARIO PREGUNTA COSAS ESPECÍFICAS DE SU CARTERA O HISTORIAL:
-   Respóndele con precisión y de forma concisa usando los datos del CONTEXTO DEL USUARIO.
+SYSTEM_INSTRUCTION = """Router corto. NO calcules, NO inventes números, NO describas gráficos.
+Si pide un reporte o gráfico respondé UNA sola línea:
+COMANDO: /gastos
+Comandos: /gastos /vs /fijos /delivery /mes /resumen /riesgo /objetivos /mensual /spy /grafico /activos /analisis /precio /excel
+Si registra un movimiento: REGISTRO_ARS: TIPO|MONTO|CATEGORIA|DESCRIPCION|FECHA
+Si registra inversión: REGISTRO_INV: TICKER|MARGEN|PPC|CANTIDAD|FECHA|TIPO_POS|LEV|LIQ
+Si no entendés: pedí /help. Máximo 2 oraciones.
 """
 
 # ==================== FLUJO INTERACTIVO DE IMPORTACIÓN Y CONCILIACIÓN ====================
@@ -3292,30 +3596,15 @@ async def procesar_respuesta_importacion(update: Update, user_id: int, user_text
         await presentar_siguiente_movimiento(update, user_id)
         return True
 
-    # Normalización con Gemini
-    prompt = f"""El usuario recibió este movimiento bancario:
-Tipo: {item['tipo']}
-Monto: {item['monto']} ARS
-Fecha: {item['fecha']}
-Concepto original: "{item['concepto']}"
-
-El usuario indicó: "{user_text}"
-
-Determina la categoría y descripción final de forma concisa.
-Responde ÚNICAMENTE en este formato:
-CATEGORIA|DESCRIPCION
-
-Ejemplo:
-Comida|Café Villa Luro
-"""
-    try:
-        res = llamar_gemini(prompt, "Eres un clasificador contable profesional. Devuelve solo CATEGORIA|DESCRIPCION.")
-        partes = [p.strip() for p in res.strip().split("|")]
-        cat_final = normalizar_categoria(partes[0]) if len(partes) > 0 and partes[0] else "Varios"
-        desc_final = partes[1] if len(partes) > 1 and partes[1] else user_text.strip()
-    except Exception:
-        cat_final = normalizar_categoria(user_text)
-        desc_final = user_text.strip()
+    # Python primero (0 tokens). Gemini solo si no reconoce la categoría,
+    # y únicamente con el texto que escribió el usuario.
+    if categoria_reconocida_por_python(user_text):
+        cat_final, desc_final = parsear_categoria_descripcion_usuario(user_text)
+    else:
+        try:
+            cat_final, desc_final = emprolijar_categoria_con_gemini(user_text)
+        except Exception:
+            cat_final, desc_final = parsear_categoria_descripcion_usuario(user_text)
 
     guardar_movimiento(user_id, item["tipo"], item["monto"], cat_final, desc_final, item["fecha"])
     sesion["guardados"] += 1
@@ -3355,6 +3644,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /resumen    →  Balance consolidado de cartera\n\n"
         "💵 Finanzas Personales (ARS)\n"
         "• /gastos     →  Costo de vida, Tasa de Ahorro y Gastos Hormiga\n"
+        "• /vs         →  Este ciclo Havas vs el anterior\n"
+        "• /fijos      →  Servicios y gastos que se repiten (aunque el monto cambie)\n"
+        "• /delivery   →  Delivery neto (gasto − devoluciones) y tope\n"
         "• /mes        →  Presupuestos y control del mes\n"
         "• /objetivos  →  Progreso de metas financieras\n"
         "• /excel      →  Exportar planilla completa\n"
@@ -3409,6 +3701,33 @@ async def intentar_comando_local(update: Update, user_id: int, user_msg: str) ->
 
     if cmd in ("help", "ayuda", "comandos"):
         await start(update, None)
+        return True
+    if (cmd == "vs" and "spy" not in low) or re.search(r"\b(ciclo anterior|contra el ciclo|vs el mes|compar(a|ame|ar) ciclos?)\b", low):
+        await update.message.reply_text(texto_comparar_ciclos(user_id))
+        return True
+    if cmd in ("fijos", "fijo", "recurrentes") or re.search(r"\b(gastos? fijos?|servicios recurrentes)\b", low):
+        await update.message.reply_text(texto_gastos_fijos(user_id))
+        return True
+    if cmd in ("delivery", "pedidosya", "pedidos") or re.search(r"\b(como va(n)? delivery|gastos? de delivery)\b", low):
+        await update.message.reply_text(texto_alerta_delivery(user_id))
+        return True
+    if cmd in ("mes", "presupuesto", "presupuestos"):
+        await cmd_mes(update, None)
+        return True
+    if cmd in ("objetivos", "metas"):
+        await cmd_objetivos(update, None)
+        return True
+    if cmd in ("riesgo", "risk"):
+        await cmd_riesgo(update, None)
+        return True
+    m_pres = re.search(r"presupuesto\s+([a-záéíóúñ ]+?)\s+(\d[\d\.]*)", low)
+    if m_pres:
+        cat_p = normalizar_categoria(m_pres.group(1).strip())
+        mon_p = float(m_pres.group(2).replace(".", "").replace(",", ".")) if "," in m_pres.group(2) else float(m_pres.group(2).replace(".", ""))
+        if mon_p < 1000:
+            mon_p = float(m_pres.group(2).replace(".", ""))
+        set_presupuesto(user_id, cat_p, mon_p)
+        await update.message.reply_text(f"✅ Presupuesto {cat_p}: ${mon_p:,.0f} ARS este ciclo.")
         return True
     if cmd in ("resumen", "cartera", "balance"):
         await cmd_resumen(update, None)
@@ -3676,13 +3995,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Error comando local: {e}", exc_info=True)
 
     try:
-        contexto = resumen_compacto_para_ia(user_id)
-        prompt = f"""CONTEXTO DEL USUARIO:
-{contexto}
-
-MENSAJE DEL USUARIO:
-"{user_msg}"
-"""
+        prompt = f'Texto del usuario:\n"{user_msg[:240]}"'
         reply = llamar_gemini(prompt, SYSTEM_INSTRUCTION)
         
         m_cmd = re.search(r"COMANDO:\s*(\S+)(?:[^\S\r\n]+([^\r\n]+))?", reply)
@@ -3809,6 +4122,15 @@ async def cmd_analisis_alias(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def cmd_gastos_alias(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await intentar_comando_local(update, update.effective_user.id, "/gastos")
 
+async def cmd_vs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(texto_comparar_ciclos(update.effective_user.id))
+
+async def cmd_fijos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(texto_gastos_fijos(update.effective_user.id))
+
+async def cmd_delivery(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(texto_alerta_delivery(update.effective_user.id))
+
 async def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
@@ -3821,6 +4143,9 @@ async def main():
     app.add_handler(CommandHandler("gastos", cmd_gastos_alias))
     app.add_handler(CommandHandler("finanzas", cmd_gastos_alias))
     app.add_handler(CommandHandler("hormiga", cmd_gastos_alias))
+    app.add_handler(CommandHandler("vs", cmd_vs))
+    app.add_handler(CommandHandler("fijos", cmd_fijos))
+    app.add_handler(CommandHandler("delivery", cmd_delivery))
     app.add_handler(CommandHandler("help", start))
     app.add_handler(CommandHandler("ayuda", start))
     app.add_handler(CommandHandler("cartera", cmd_resumen))
@@ -3847,4 +4172,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
