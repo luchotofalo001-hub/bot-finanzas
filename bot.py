@@ -244,6 +244,14 @@ def init_db():
                     );
                 """)
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_frases_user ON mapeo_frases (user_id, frase);")
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS preferencias_usuario (
+                        user_id BIGINT,
+                        clave VARCHAR(40),
+                        valor VARCHAR(40),
+                        PRIMARY KEY (user_id, clave)
+                    );
+                """)
                 conn.commit()
         logger.info("Base de datos inicializada correctamente.")
     except Exception as e:
@@ -258,6 +266,37 @@ def ahora_argentina():
 def en_horario_alertas():
     h = ahora_argentina().hour
     return ALERTA_HORA_INICIO <= h < ALERTA_HORA_FIN
+
+def es_dia_habil_arg() -> bool:
+    return ahora_argentina().weekday() < 5
+
+def get_pref(user_id: int, clave: str, default: str = "") -> str:
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT valor FROM preferencias_usuario WHERE user_id = %s AND clave = %s;",
+                    (user_id, clave),
+                )
+                row = cursor.fetchone()
+                return str(row[0]) if row and row[0] is not None else default
+    except Exception as e:
+        logger.warning(f"get_pref: {e}")
+        return default
+
+def set_pref(user_id: int, clave: str, valor: str):
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """INSERT INTO preferencias_usuario (user_id, clave, valor)
+                   VALUES (%s, %s, %s)
+                   ON CONFLICT (user_id, clave) DO UPDATE SET valor = EXCLUDED.valor;""",
+                (user_id, clave, valor),
+            )
+            conn.commit()
+
+def alertas_activas(user_id: int) -> bool:
+    return get_pref(user_id, "alertas", "on") != "off"
 
 # ==================== FORMATEO LIMPIO TELEGRAM ====================
 def limpiar_estilo_telegram(texto: str) -> str:
@@ -717,6 +756,8 @@ REGLAS_INTENTO = [
     (r"\bpresupuestos?\b|\bdel mes\b|^mes$", "mes"),
     (r"\bobjetivos?\b|\bmetas?\b", "objetivos"),
     (r"\briesgo\b|\brisk\b|drawdown", "riesgo"),
+    (r"desactivar\s+alertas|apagar\s+alertas|alertas\s+off", "silencio"),
+    (r"activar\s+alertas|prender\s+alertas|alertas\s+on", "activar alertas"),
     (r"\bbriefing\b|\bresumen de mercado\b|\bpremarket\b", "briefing"),
     (r"\bresumen\b|\bcartera\b|\bbalance\b|como esta mi cartera", "resumen"),
     (r"\bexcel\b|exportar planilla", "excel"),
@@ -3806,12 +3847,14 @@ async def tarea_alertas_periodicas(app):
             dia_par = (ahora.toordinal() % 2 == 0)
 
             for uid in usuarios:
+                if not alertas_activas(uid):
+                    continue
                 if en_horario_alertas():
                     bruscas = await asyncio.to_thread(generar_alertas_movimiento_brusco, uid)
                     if bruscas:
                         await _enviar_bloque_alertas(app, uid, "⚡ ALERTA DE MOVIMIENTO (fuera de señales técnicas)", bruscas)
 
-                if en_ventana_brief and dia_par:
+                if en_ventana_brief and dia_par and es_dia_habil_arg():
                     h = _hash_alerta("briefing", ahora.strftime("%Y%m%d"), "")
                     ya = await asyncio.to_thread(alerta_ya_enviada, uid, h, 36)
                     if not ya:
@@ -3824,6 +3867,8 @@ async def tarea_alertas_periodicas(app):
 
             if en_horario_alertas() and (time.time() - ultimo_tech) >= ALERTA_INTERVALO_HORAS * 3600:
                 for uid in usuarios:
+                    if not alertas_activas(uid):
+                        continue
                     alertas = await asyncio.to_thread(generar_alertas_para_usuario, uid)
                     tech = [a for a in alertas if a.get("tipo") != "brusco"]
                     if tech:
@@ -4401,7 +4446,18 @@ async def intentar_comando_local(update: Update, user_id: int, user_msg: str) ->
         await update.message.reply_text(texto_alerta_delivery(user_id))
         return True
     if cmd in ("briefing", "premarket"):
+        if not es_dia_habil_arg():
+            await update.message.reply_text("El briefing automático es solo días hábiles. El lunes a las 08:30 ART.")
+            return True
         await update.message.reply_text(texto_briefing_mananero(user_id))
+        return True
+    if re.search(r"desactivar\s+alertas|apagar\s+alertas|alertas\s+off", low) or cmd in ("silencio",):
+        set_pref(user_id, "alertas", "off")
+        await update.message.reply_text("🔕 Alertas desactivadas (bruscas, técnicas, briefing). Decí 'activar alertas' para prenderlas.")
+        return True
+    if re.search(r"activar\s+alertas|prender\s+alertas|alertas\s+on", low):
+        set_pref(user_id, "alertas", "on")
+        await update.message.reply_text("🔔 Alertas activadas. Briefing días hábiles 08:30 ART (día por medio).")
         return True
     m_pres = re.search(
         r"presupuesto\s+([a-záéíóúüñ ]+?)\s+\$?\s*(\d[\d\.]*)\s*(k|mil)?",
@@ -4845,6 +4901,9 @@ async def cmd_delivery(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(texto_alerta_delivery(update.effective_user.id))
 
 async def cmd_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not es_dia_habil_arg():
+        await update.message.reply_text("El briefing automático es solo días hábiles.")
+        return
     await update.message.reply_text(texto_briefing_mananero(update.effective_user.id))
 
 async def cmd_torta(update: Update, context: ContextTypes.DEFAULT_TYPE):
