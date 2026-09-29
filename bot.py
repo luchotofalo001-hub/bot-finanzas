@@ -717,6 +717,7 @@ REGLAS_INTENTO = [
     (r"\bpresupuestos?\b|\bdel mes\b|^mes$", "mes"),
     (r"\bobjetivos?\b|\bmetas?\b", "objetivos"),
     (r"\briesgo\b|\brisk\b|drawdown", "riesgo"),
+    (r"\bbriefing\b|\bresumen de mercado\b|\bpremarket\b", "briefing"),
     (r"\bresumen\b|\bcartera\b|\bbalance\b|como esta mi cartera", "resumen"),
     (r"\bexcel\b|exportar planilla", "excel"),
     (r"\ban[aá]lisis\b|\bt[eé]cnico\b", "analisis"),
@@ -3603,45 +3604,166 @@ def generar_alertas_movimiento_brusco(user_id: int) -> list:
             logger.warning(f"brusco {tk}: {e}")
     return alertas
 
+_KW_VOL = (
+    "fed", "fomc", "powell", "rate cut", "rate hike", "interest rate", "cpi", "nfp",
+    "inflation", "sec ", "etf", "ban", "regul", "crypto", "bitcoin", "ethereum",
+    "war", "tariff", "treasury", "payroll", "jobs", "yield",
+)
+
+def _pct(a, b):
+    try:
+        if a is None or b is None or float(b) == 0:
+            return None
+        return (float(a) - float(b)) / float(b) * 100.0
+    except Exception:
+        return None
+
+def snapshot_briefing_ticker(ticker: str) -> dict:
+    sym = normalizar_ticker_yf(ticker)
+    out = {"ticker": ticker.upper(), "sym": sym, "precio": None, "var_hoy": None, "var_ayer": None, "var_pre": None}
+    try:
+        h = yf_history(sym, period="10d")
+        if h is not None and not h.empty and "Close" in h.columns:
+            c = h["Close"].dropna()
+            if len(c) >= 1:
+                out["precio"] = float(c.iloc[-1])
+            if len(c) >= 2:
+                out["var_hoy"] = _pct(c.iloc[-1], c.iloc[-2])
+            if len(c) >= 3:
+                out["var_ayer"] = _pct(c.iloc[-2], c.iloc[-3])
+    except Exception as e:
+        logger.warning(f"brief hist {sym}: {e}")
+    try:
+        t = yf.Ticker(sym)
+        info = {}
+        try:
+            info = t.fast_info if hasattr(t, "fast_info") else {}
+        except Exception:
+            info = {}
+        pre = None
+        prev = None
+        last = None
+        def _g(obj, *keys):
+            for k in keys:
+                try:
+                    if hasattr(obj, k):
+                        v = getattr(obj, k)
+                        if v is not None:
+                            return float(v)
+                    if isinstance(obj, dict) and obj.get(k) is not None:
+                        return float(obj.get(k))
+                except Exception:
+                    continue
+            return None
+        pre = _g(info, "pre_market_price", "preMarketPrice")
+        prev = _g(info, "previous_close", "previousClose", "regularMarketPreviousClose")
+        last = _g(info, "last_price", "lastPrice", "regularMarketPrice")
+        if last and out["precio"] is None:
+            out["precio"] = last
+        if pre and prev:
+            out["var_pre"] = _pct(pre, prev)
+            out["pre_px"] = pre
+        elif "-USD" in sym or ticker.upper() in CRIPTOS_COMUNES:
+            # cripto: variación últimas ~8h vs precio de hace 8h
+            try:
+                hin = yf.Ticker(sym).history(period="1d", interval="1h")
+                if hin is not None and not hin.empty:
+                    ser = hin["Close"].dropna()
+                    if len(ser) >= 4:
+                        out["var_pre"] = _pct(ser.iloc[-1], ser.iloc[0])
+            except Exception:
+                pass
+    except Exception as e:
+        logger.warning(f"brief pre {sym}: {e}")
+    return out
+
+def titulares_volatilidad() -> list:
+    titulos = []
+    vistos = set()
+    for tk in ("SPY", "QQQ", "BTC-USD", "^VIX"):
+        try:
+            items = getattr(yf.Ticker(tk), "news", None) or []
+        except Exception:
+            items = []
+        for it in items[:8]:
+            title = ""
+            if isinstance(it, dict):
+                title = it.get("title") or it.get("headline") or ""
+                content = it.get("content") if isinstance(it.get("content"), dict) else {}
+                if not title and content:
+                    title = content.get("title") or ""
+            title = str(title).strip()
+            if not title:
+                continue
+            key = title.lower()[:80]
+            if key in vistos:
+                continue
+            vistos.add(key)
+            blob = title.lower()
+            if any(k in blob for k in _KW_VOL) or tk in ("SPY", "BTC-USD"):
+                titulos.append(title[:140])
+            if len(titulos) >= 5:
+                return titulos
+    return titulos[:5]
+
+def _fmt_var(v):
+    if v is None:
+        return "n/d"
+    em = "🟢" if v >= 0 else "🔴"
+    return f"{em} {v:+.2f}%"
+
 def texto_briefing_mananero(user_id: int) -> str:
     es_finde = ahora_argentina().weekday() >= 5
     lineas = [f"☀️ BRIEFING {ahora_argentina().strftime('%d/%m %H:%M')} ART", ""]
-    lineas.append("Mercado general")
+    lineas.append("Mercado general  (hoy / ayer / pre o 8h crypto)")
     universales = ["BTC-USD", "ETH-USD"] if es_finde else list(TICKERS_MERCADO_GRAL)
-    movs = []
+    snaps = []
     for tk in universales:
-        try:
-            d = consultar_datos_mercado(tk)
-            if not d:
-                continue
-            em = "🟢" if d["var_pct"] >= 0 else "🔴"
-            lineas.append(f"• {em} {d['ticker']}: ${d['precio']:,.2f}  {d['var_pct']:+.2f}%")
-            movs.append(d)
-        except Exception:
+        s = snapshot_briefing_ticker(tk)
+        if s.get("precio") is None:
             continue
-    if not movs:
+        snaps.append(s)
+        pre_lbl = "pre" if "USD" not in str(s.get("sym", "")) and tk not in ("BTC-USD", "ETH-USD") else "8h"
+        lineas.append(
+            f"• {s['ticker']} ${s['precio']:,.2f}"
+            f"  hoy {_fmt_var(s.get('var_hoy'))}"
+            f"  ayer {_fmt_var(s.get('var_ayer'))}"
+            f"  {pre_lbl} {_fmt_var(s.get('var_pre'))}"
+        )
+    if not snaps:
         lineas.append("• Sin datos de mercado (Yahoo).")
     propios = []
     tickers = _tickers_cartera_usuario(user_id)
     if es_finde:
         tickers = [t for t in tickers if t in CRIPTOS_COMUNES or str(t).endswith("-USD") or t in ("BTC", "ETH", "SOL")]
     for tk in tickers[:20]:
-        try:
-            d = consultar_datos_mercado(tk)
-            if d:
-                propios.append(d)
-        except Exception:
-            continue
+        s = snapshot_briefing_ticker(tk)
+        if s.get("precio") is not None:
+            propios.append(s)
     lineas.append("")
-    lineas.append("Tus activos con más movimiento")
+    lineas.append("Tus activos (hoy / ayer / pre|8h)")
     if not propios:
-        lineas.append("• No hay posiciones volátiles para listar.")
+        lineas.append("• No hay posiciones para listar.")
     else:
-        propios.sort(key=lambda x: abs(x.get("var_pct") or 0), reverse=True)
-        for d in propios[:8]:
-            em = "🟢" if d["var_pct"] >= 0 else "🔴"
-            mark = " ⚡" if abs(d["var_pct"]) >= UMBRAL_MOVIMIENTO_BRUSCO_PCT else ""
-            lineas.append(f"• {em} {d['ticker']}: {d['var_pct']:+.2f}%  ${d['precio']:,.2f}{mark}")
+        propios.sort(key=lambda x: abs(x.get("var_hoy") or x.get("var_ayer") or 0), reverse=True)
+        for s in propios[:8]:
+            vref = s.get("var_hoy") if s.get("var_hoy") is not None else s.get("var_ayer")
+            mark = " ⚡" if vref is not None and abs(vref) >= UMBRAL_MOVIMIENTO_BRUSCO_PCT else ""
+            pre_lbl = "8h" if str(s.get("sym", "")).endswith("-USD") or s["ticker"] in CRIPTOS_COMUNES else "pre"
+            lineas.append(
+                f"• {s['ticker']} ${s['precio']:,.2f}{mark}"
+                f"  hoy {_fmt_var(s.get('var_hoy'))}"
+                f"  ayer {_fmt_var(s.get('var_ayer'))}"
+                f"  {pre_lbl} {_fmt_var(s.get('var_pre'))}"
+            )
+    lineas.append("")
+    lineas.append("Qué puede mover el día")
+    news = titulares_volatilidad()
+    if news:
+        for t in news[:4]:
+            lineas.append(f"• {t}")
+    else:
+        lineas.append("• No llegaron titulares (Fed/regulación/macro) en Yahoo.")
     lineas.append("")
     lineas.append("Próximo briefing: pasado mañana 08:30 ART.")
     return "\n".join(lineas)
@@ -4278,6 +4400,9 @@ async def intentar_comando_local(update: Update, user_id: int, user_msg: str) ->
     if cmd in ("delivery", "pedidosya", "pedidos") or re.search(r"\b(como va(n)? delivery|gastos? de delivery)\b", low):
         await update.message.reply_text(texto_alerta_delivery(user_id))
         return True
+    if cmd in ("briefing", "premarket"):
+        await update.message.reply_text(texto_briefing_mananero(user_id))
+        return True
     m_pres = re.search(
         r"presupuesto\s+([a-záéíóúüñ ]+?)\s+\$?\s*(\d[\d\.]*)\s*(k|mil)?",
         low,
@@ -4719,6 +4844,9 @@ async def cmd_fijos(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_delivery(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(texto_alerta_delivery(update.effective_user.id))
 
+async def cmd_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(texto_briefing_mananero(update.effective_user.id))
+
 async def cmd_torta(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await intentar_comando_local(update, update.effective_user.id, update.message.text or "/torta")
 
@@ -4737,6 +4865,7 @@ async def main():
     app.add_handler(CommandHandler("vs", cmd_vs))
     app.add_handler(CommandHandler("fijos", cmd_fijos))
     app.add_handler(CommandHandler("delivery", cmd_delivery))
+    app.add_handler(CommandHandler("briefing", cmd_briefing))
     app.add_handler(CommandHandler("torta", cmd_torta))
     app.add_handler(CommandHandler("pie", cmd_torta))
     app.add_handler(CommandHandler("help", start))
