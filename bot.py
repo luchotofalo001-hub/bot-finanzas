@@ -1420,7 +1420,7 @@ def calcular_metricas_finanzas_completas(user_id: int, meses_lookback: int = 6):
     df_gastos_totales = df_mov[df_mov['tipo'] == 'GASTO'].copy()
     df_ingresos_totales = df_mov[df_mov['tipo'] == 'INGRESO'].copy()
 
-    df_consumo = df_gastos_totales[~df_gastos_totales['es_ahorro'] & ~df_gastos_totales['es_deuda']].copy()
+    df_consumo = df_gastos_totales[~df_gastos_totales['es_ahorro']].copy()
     df_salidas_ahorro = df_gastos_totales[df_gastos_totales['es_ahorro']].copy()
     df_pagos_deuda = df_gastos_totales[df_gastos_totales['es_deuda'] & ~df_gastos_totales['es_ahorro']].copy()
     df_consumo = netear_devoluciones_en_consumo(df_consumo, df_ingresos_totales)
@@ -1473,7 +1473,6 @@ def calcular_metricas_finanzas_completas(user_id: int, meses_lookback: int = 6):
         "💵 Flujo de Caja y Ahorro",
         f"• Ingresos habituales:     ${prom_ingreso_mensual:,.0f} ARS/mes",
         f"• Costo de vida (consumo): ${prom_consumo_mensual:,.0f} ARS/mes",
-        f"• Pagos tarjeta/deuda:     ${tot_deuda / cant_meses_reales:,.0f} ARS/mes",
         f"• Derivado a Ahorro/USDT:  ${prom_ahorro_derivado:,.0f} ARS/mes",
         f"• Capital recibido (no sueldo): ${tot_capital / cant_meses_reales:,.0f} ARS/mes",
         f"• Capacidad neta de ahorro: ${superavit_mensual_prom:+,.0f} ARS/mes",
