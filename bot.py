@@ -64,6 +64,8 @@ UMBRAL_LIQUIDACION_PCT = 15.0
 UMBRAL_GASTO_INUSUAL = 2.2
 UMBRAL_GASTO_HORMIGA_ARS = 15000.0
 UMBRAL_AUTO_APROBAR = 3  # Si se confirmó 3 o más veces, se registra directo sin preguntar
+UMBRAL_MOVIMIENTO_BRUSCO_PCT = 5.0
+TICKERS_MERCADO_GRAL = ["SPY", "QQQ", "DIA", "BTC-USD", "ETH-USD"]
 
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
@@ -231,6 +233,17 @@ def init_db():
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_mapeo_user_clave ON mapeo_conceptos (user_id, patron_clave);")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_inv_user ON portafolio_inversiones (user_id);")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_tc_user_fecha ON trades_cerrados (user_id, fecha);")
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS mapeo_frases (
+                        id SERIAL PRIMARY KEY,
+                        user_id BIGINT,
+                        frase VARCHAR(180),
+                        comando VARCHAR(80),
+                        usos INTEGER DEFAULT 1,
+                        UNIQUE(user_id, frase)
+                    );
+                """)
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_frases_user ON mapeo_frases (user_id, frase);")
                 conn.commit()
         logger.info("Base de datos inicializada correctamente.")
     except Exception as e:
@@ -637,6 +650,90 @@ def guardar_aprendizaje_concepto(user_id: int, clave: str, categoria: str, descr
                 """, (user_id, clave, categoria, descripcion))
             conn.commit()
 
+def normalizar_frase(texto: str) -> str:
+    t = (texto or "").lower().strip()
+    if t.startswith("/"):
+        t = t[1:]
+    t = re.sub(r"[¿?¡!.,;:\"']+", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t[:180]
+
+def buscar_comando_por_frase(user_id: int, texto: str) -> str:
+    frase = normalizar_frase(texto)
+    if not frase:
+        return ""
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT comando FROM mapeo_frases WHERE user_id = %s AND frase = %s;",
+                    (user_id, frase),
+                )
+                row = cursor.fetchone()
+                if row and row[0]:
+                    cursor.execute(
+                        "UPDATE mapeo_frases SET usos = COALESCE(usos,1)+1 WHERE user_id = %s AND frase = %s;",
+                        (user_id, frase),
+                    )
+                    conn.commit()
+                    return str(row[0]).strip()
+    except Exception as e:
+        logger.warning(f"buscar_comando_por_frase: {e}")
+    return ""
+
+def guardar_frase_comando(user_id: int, texto: str, comando: str):
+    frase = normalizar_frase(texto)
+    cmd = (comando or "").strip().lstrip("/")
+    if not frase or not cmd or frase == cmd or len(frase) < 3:
+        return
+    if frase.split()[0] == cmd.split()[0] and len(frase.split()) == 1:
+        return
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """INSERT INTO mapeo_frases (user_id, frase, comando, usos)
+                       VALUES (%s, %s, %s, 1)
+                       ON CONFLICT (user_id, frase)
+                       DO UPDATE SET comando = EXCLUDED.comando, usos = mapeo_frases.usos + 1;""",
+                    (user_id, frase, cmd),
+                )
+                conn.commit()
+    except Exception as e:
+        logger.warning(f"guardar_frase_comando: {e}")
+
+# Frases fijas (0 tokens). Las más específicas van primero.
+REGLAS_INTENTO = [
+    (r"\bspy\b|\bbenchmark\b|contra el\s*s&?p|vs\s*spy", "spy"),
+    (r"torta\s*(de\s*)?(la\s*)?(cartera|invers|usd|activos)|pie\s*cartera", "torta cartera"),
+    (r"\btorta\b|\bpie\b|grafico de torta|gráfico de torta", "torta"),
+    (r"ciclo anterior|contra el ciclo|vs el (ciclo|mes)|compar(a|ame|ar)\s+(los\s+)?ciclos?", "vs"),
+    (r"^vs$", "vs"),
+    (r"gastos?\s+fijos?|servicios recurrentes|\bfijos\b|\brecurrentes\b", "fijos"),
+    (r"\bdelivery\b|pedidos\s*ya(?!\s*market)|gasto(s)? de delivery", "delivery"),
+    (r"rendimiento mensual|mes a mes|como me fue cada mes|tasa mensual|\bmensual\b", "mensual"),
+    (r"radiograf[ií]a|gastos hormiga|como vengo de gastos|resumen de gastos|\bgastos\b|\bfinanzas\b", "gastos"),
+    (r"presupuesto\s+\S+", None),  # lo maneja el regex de set
+    (r"\bpresupuestos?\b|\bdel mes\b|^mes$", "mes"),
+    (r"\bobjetivos?\b|\bmetas?\b", "objetivos"),
+    (r"\briesgo\b|\brisk\b|drawdown", "riesgo"),
+    (r"\bresumen\b|\bcartera\b|\bbalance\b|como esta mi cartera", "resumen"),
+    (r"\bexcel\b|exportar planilla", "excel"),
+    (r"\ban[aá]lisis\b|\bt[eé]cnico\b", "analisis"),
+    (r"\bgrafico\b|\bgráfico\b|\bcurva\b", "grafico"),
+]
+
+def resolver_intencion(texto: str) -> str:
+    low = normalizar_frase(texto)
+    if not low:
+        return ""
+    for pat, cmd in REGLAS_INTENTO:
+        if cmd is None:
+            continue
+        if re.search(pat, low):
+            return cmd
+    return ""
+
 def registrar_rechazo_concepto(user_id: int, clave: str):
     if not clave or len(clave) < 3:
         return
@@ -721,6 +818,10 @@ def asignar_ciclo_havas(df, sueldos):
 TAGS_AHORRO = {
     "inversion", "inversión", "inversiones", "ahorro", "usdt", "crypto", "cripto",
     "broker", "dolares", "dólares", "dolar", "dólar", "usd", "fima"
+}
+TAGS_DEUDA = {
+    "tarjeta de crédito", "tarjeta de credito", "pago de tarjeta", "pago tarjeta",
+    "pago tarjetas",
 }
 
 CATS_NETEAR_DEVOL = {
@@ -1288,6 +1389,15 @@ def calcular_metricas_finanzas_completas(user_id: int, meses_lookback: int = 6):
             return True
         return False
 
+    def es_pago_deuda(row):
+        cat = normalizar_categoria(str(row.get("categoria", "")))
+        if cat == "Tarjeta de crédito":
+            return True
+        blob = f"{row.get('categoria','')} {row.get('descripcion','')}".lower()
+        if any(t in blob for t in TAGS_DEUDA):
+            return True
+        return False
+
     def es_capital_tercero(row):
         cat = str(row['categoria']).lower()
         desc = str(row['descripcion']).lower()
@@ -1305,12 +1415,14 @@ def calcular_metricas_finanzas_completas(user_id: int, meses_lookback: int = 6):
 
     df_mov['es_ahorro'] = df_mov.apply(es_registro_ahorro, axis=1)
     df_mov['es_capital'] = df_mov.apply(es_capital_tercero, axis=1)
+    df_mov['es_deuda'] = df_mov.apply(es_pago_deuda, axis=1)
 
     df_gastos_totales = df_mov[df_mov['tipo'] == 'GASTO'].copy()
     df_ingresos_totales = df_mov[df_mov['tipo'] == 'INGRESO'].copy()
 
-    df_consumo = df_gastos_totales[~df_gastos_totales['es_ahorro']].copy()
+    df_consumo = df_gastos_totales[~df_gastos_totales['es_ahorro'] & ~df_gastos_totales['es_deuda']].copy()
     df_salidas_ahorro = df_gastos_totales[df_gastos_totales['es_ahorro']].copy()
+    df_pagos_deuda = df_gastos_totales[df_gastos_totales['es_deuda'] & ~df_gastos_totales['es_ahorro']].copy()
     df_consumo = netear_devoluciones_en_consumo(df_consumo, df_ingresos_totales)
 
     df_ingresos_reales = df_ingresos_totales[~df_ingresos_totales['es_ahorro'] & ~df_ingresos_totales['es_capital']].copy()
@@ -1322,6 +1434,7 @@ def calcular_metricas_finanzas_completas(user_id: int, meses_lookback: int = 6):
     tot_consumo = float(df_consumo['monto'].sum()) if not df_consumo.empty else 0.0
     tot_ahorro_derivado = float(df_salidas_ahorro['monto'].sum()) if not df_salidas_ahorro.empty else 0.0
     tot_capital = float(df_entradas_ahorro['monto'].sum()) if not df_entradas_ahorro.empty else 0.0
+    tot_deuda = float(df_pagos_deuda['monto'].sum()) if not df_pagos_deuda.empty else 0.0
 
     prom_ingreso_mensual = tot_ingresos / cant_meses_reales
     prom_consumo_mensual = tot_consumo / cant_meses_reales
@@ -1360,6 +1473,7 @@ def calcular_metricas_finanzas_completas(user_id: int, meses_lookback: int = 6):
         "💵 Flujo de Caja y Ahorro",
         f"• Ingresos habituales:     ${prom_ingreso_mensual:,.0f} ARS/mes",
         f"• Costo de vida (consumo): ${prom_consumo_mensual:,.0f} ARS/mes",
+        f"• Pagos tarjeta/deuda:     ${tot_deuda / cant_meses_reales:,.0f} ARS/mes",
         f"• Derivado a Ahorro/USDT:  ${prom_ahorro_derivado:,.0f} ARS/mes",
         f"• Capital recibido (no sueldo): ${tot_capital / cant_meses_reales:,.0f} ARS/mes",
         f"• Capacidad neta de ahorro: ${superavit_mensual_prom:+,.0f} ARS/mes",
@@ -2794,6 +2908,62 @@ def obtener_resumen_portafolio(user_id: int):
         "pnl_total_pct": pnl_total_pct
     }
 
+def generar_grafico_torta_gastos(user_id: int):
+    inicio, fin, etq = resolver_ciclo_havas(user_id)
+    with get_db_connection() as conn:
+        df = pd.read_sql(
+            """SELECT categoria, tipo, monto, descripcion FROM movimientos
+               WHERE user_id = %s AND fecha >= %s AND fecha < %s;""",
+            conn, params=(user_id, inicio.to_pydatetime(), fin.to_pydatetime()),
+        )
+    if df.empty:
+        return None, etq
+    df["categoria"] = df["categoria"].apply(normalizar_categoria)
+    gastos = df[df["tipo"] == "GASTO"].copy()
+    if gastos.empty:
+        return None, etq
+    blob = (gastos["categoria"].astype(str) + " " + gastos["descripcion"].astype(str)).str.lower()
+    gastos = gastos[~blob.apply(lambda x: any(t in x for t in TAGS_AHORRO))]
+    if gastos.empty:
+        return None, etq
+    # netear devoluciones de las mismas categorías
+    ings = df[df["tipo"] == "INGRESO"].copy()
+    if not ings.empty:
+        ings["categoria"] = ings["categoria"].apply(normalizar_categoria)
+        for cat, mdev in ings.groupby("categoria")["monto"].sum().items():
+            if str(cat).lower() not in CATS_NETEAR_DEVOL and not any(t in str(cat).lower() for t in TAGS_DEVOL):
+                continue
+            mask = gastos["categoria"] == cat
+            resto = float(mdev)
+            for i in list(gastos.loc[mask].index):
+                if resto <= 0:
+                    break
+                actual = float(gastos.at[i, "monto"])
+                baja = min(actual, resto)
+                gastos.at[i, "monto"] = actual - baja
+                resto -= baja
+        gastos = gastos[gastos["monto"] > 0.5]
+    por = gastos.groupby("categoria")["monto"].sum().sort_values(ascending=False)
+    if por.empty:
+        return None, etq
+    if len(por) > 8:
+        top = por.head(7)
+        otros = float(por.iloc[7:].sum())
+        por = pd.concat([top, pd.Series({"Otros": otros})])
+    plt.figure(figsize=(8, 6.2))
+    colores = ["#4C78A8", "#F58518", "#54A24B", "#E45756", "#72B7B2", "#EECA3B", "#B279A2", "#FF9DA6"]
+    labels = [f"{c}\n${v:,.0f}" for c, v in por.items()]
+    plt.pie(por.values, labels=labels, autopct="%1.0f%%", startangle=120,
+            colors=colores[:len(por)], wedgeprops=dict(width=0.55, edgecolor="w"),
+            textprops={"fontsize": 8})
+    plt.title(f"Gastos de vida — {etq}", fontsize=13, pad=16)
+    plt.tight_layout()
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=160)
+    buf.seek(0)
+    plt.close()
+    return buf, etq
+
 def generar_grafico_distribucion_inversiones(user_id: int):
     resumen = obtener_resumen_portafolio(user_id)
     if not resumen or not resumen["posiciones"]:
@@ -3385,47 +3555,163 @@ def generar_alertas_para_usuario(user_id: int) -> list:
 
     return alertas
 
+def _tickers_cartera_usuario(user_id: int):
+    resumen = obtener_resumen_portafolio(user_id)
+    if not resumen:
+        return []
+    out = []
+    for p in resumen["posiciones"]:
+        tk = str(p.get("ticker") or "").upper()
+        if tk in ("USDT", "USDC", "DAI", "USD"):
+            continue
+        out.append(tk)
+    return list(dict.fromkeys(out))
+
+def generar_alertas_movimiento_brusco(user_id: int) -> list:
+    alertas = []
+    tickers = _tickers_cartera_usuario(user_id)
+    if not tickers:
+        return alertas
+    es_finde = ahora_argentina().weekday() >= 5
+    if es_finde:
+        tickers = [t for t in tickers if t in CRIPTOS_COMUNES or str(t).endswith("-USD") or t in ("BTC", "ETH", "SOL")]
+    dia = ahora_argentina().strftime("%Y%m%d")
+    for tk in tickers[:15]:
+        try:
+            datos = consultar_datos_mercado(tk)
+            if not datos:
+                continue
+            var = float(datos.get("var_pct") or 0)
+            if abs(var) < UMBRAL_MOVIMIENTO_BRUSCO_PCT:
+                continue
+            lado = "ALZA" if var > 0 else "BAJA"
+            clave = f"{tk}_{dia}_{lado}"
+            h = _hash_alerta("brusco", clave, "")
+            if alerta_ya_enviada(user_id, h, horas_ventana=20):
+                continue
+            em = "🟢" if var > 0 else "🔴"
+            alertas.append({
+                "texto": (
+                    f"{em} MOVIMIENTO BRUSCO {lado} {abs(var):.1f}%\n"
+                    f"{datos['ticker']}  ${datos['precio']:,.2f}\n"
+                    f"Var día: {var:+.2f}%  (umbral {UMBRAL_MOVIMIENTO_BRUSCO_PCT:.0f}%)"
+                ),
+                "tipo": "brusco",
+                "clave": clave,
+                "hash": h,
+            })
+        except Exception as e:
+            logger.warning(f"brusco {tk}: {e}")
+    return alertas
+
+def texto_briefing_mananero(user_id: int) -> str:
+    es_finde = ahora_argentina().weekday() >= 5
+    lineas = [f"☀️ BRIEFING {ahora_argentina().strftime('%d/%m %H:%M')} ART", ""]
+    lineas.append("Mercado general")
+    universales = ["BTC-USD", "ETH-USD"] if es_finde else list(TICKERS_MERCADO_GRAL)
+    movs = []
+    for tk in universales:
+        try:
+            d = consultar_datos_mercado(tk)
+            if not d:
+                continue
+            em = "🟢" if d["var_pct"] >= 0 else "🔴"
+            lineas.append(f"• {em} {d['ticker']}: ${d['precio']:,.2f}  {d['var_pct']:+.2f}%")
+            movs.append(d)
+        except Exception:
+            continue
+    if not movs:
+        lineas.append("• Sin datos de mercado (Yahoo).")
+    propios = []
+    tickers = _tickers_cartera_usuario(user_id)
+    if es_finde:
+        tickers = [t for t in tickers if t in CRIPTOS_COMUNES or str(t).endswith("-USD") or t in ("BTC", "ETH", "SOL")]
+    for tk in tickers[:20]:
+        try:
+            d = consultar_datos_mercado(tk)
+            if d:
+                propios.append(d)
+        except Exception:
+            continue
+    lineas.append("")
+    lineas.append("Tus activos con más movimiento")
+    if not propios:
+        lineas.append("• No hay posiciones volátiles para listar.")
+    else:
+        propios.sort(key=lambda x: abs(x.get("var_pct") or 0), reverse=True)
+        for d in propios[:8]:
+            em = "🟢" if d["var_pct"] >= 0 else "🔴"
+            mark = " ⚡" if abs(d["var_pct"]) >= UMBRAL_MOVIMIENTO_BRUSCO_PCT else ""
+            lineas.append(f"• {em} {d['ticker']}: {d['var_pct']:+.2f}%  ${d['precio']:,.2f}{mark}")
+    lineas.append("")
+    lineas.append("Próximo briefing: pasado mañana 08:30 ART.")
+    return "\n".join(lineas)
+
+async def _enviar_bloque_alertas(app, uid, titulo, alertas):
+    if not alertas:
+        return
+    mensajes = [titulo, ""]
+    for a in alertas:
+        mensajes.append(a["texto"])
+        mensajes.append("")
+        await asyncio.to_thread(registrar_alerta_enviada, uid, a["tipo"], a["clave"], a["hash"])
+    try:
+        await app.bot.send_message(chat_id=uid, text="\n".join(mensajes).strip())
+    except Exception as e:
+        logger.error(f"No se pudo enviar alerta a {uid}: {e}")
+
+def _obtener_usuarios_alerta():
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT DISTINCT user_id FROM (
+                    SELECT user_id FROM portafolio_inversiones
+                    UNION
+                    SELECT user_id FROM movimientos
+                    UNION
+                    SELECT user_id FROM trades_cerrados
+                ) u WHERE user_id IS NOT NULL;
+            """)
+            return [r[0] for r in cursor.fetchall()]
+
 async def tarea_alertas_periodicas(app):
-    await asyncio.sleep(60)
+    await asyncio.sleep(45)
+    ultimo_tech = 0.0
     while True:
         try:
-            if en_horario_alertas():
-                def _obtener_usuarios():
-                    with get_db_connection() as conn:
-                        with conn.cursor() as cursor:
-                            cursor.execute("""
-                                SELECT DISTINCT user_id FROM (
-                                    SELECT user_id FROM portafolio_inversiones
-                                    UNION
-                                    SELECT user_id FROM movimientos
-                                    UNION
-                                    SELECT user_id FROM trades_cerrados
-                                ) u WHERE user_id IS NOT NULL;
-                            """)
-                            return [r[0] for r in cursor.fetchall()]
+            ahora = ahora_argentina()
+            usuarios = await asyncio.to_thread(_obtener_usuarios_alerta)
+            en_ventana_brief = ahora.hour == 8 and 25 <= ahora.minute <= 50
+            dia_par = (ahora.toordinal() % 2 == 0)
 
-                usuarios = await asyncio.to_thread(_obtener_usuarios)
+            for uid in usuarios:
+                if en_horario_alertas():
+                    bruscas = await asyncio.to_thread(generar_alertas_movimiento_brusco, uid)
+                    if bruscas:
+                        await _enviar_bloque_alertas(app, uid, "⚡ ALERTA DE MOVIMIENTO (fuera de señales técnicas)", bruscas)
 
+                if en_ventana_brief and dia_par:
+                    h = _hash_alerta("briefing", ahora.strftime("%Y%m%d"), "")
+                    ya = await asyncio.to_thread(alerta_ya_enviada, uid, h, 36)
+                    if not ya:
+                        texto = await asyncio.to_thread(texto_briefing_mananero, uid)
+                        try:
+                            await app.bot.send_message(chat_id=uid, text=texto)
+                            await asyncio.to_thread(registrar_alerta_enviada, uid, "briefing", ahora.strftime("%Y%m%d"), h)
+                        except Exception as e:
+                            logger.error(f"Briefing {uid}: {e}")
+
+            if en_horario_alertas() and (time.time() - ultimo_tech) >= ALERTA_INTERVALO_HORAS * 3600:
                 for uid in usuarios:
                     alertas = await asyncio.to_thread(generar_alertas_para_usuario, uid)
-                    if alertas:
-                        mensajes = ["🔔 ALERTAS DE TU CARTERA\n"]
-                        for a in alertas:
-                            mensajes.append(a["texto"])
-                            mensajes.append("")
-                            await asyncio.to_thread(registrar_alerta_enviada, uid, a["tipo"], a["clave"], a["hash"])
-                        texto_final = "\n".join(mensajes).strip()
-                        try:
-                            await app.bot.send_message(chat_id=uid, text=texto_final)
-                            logger.info(f"Alertas enviadas a user {uid}: {len(alertas)}")
-                        except Exception as e:
-                            logger.error(f"No se pudo enviar alerta a {uid}: {e}")
-            else:
-                logger.info("Fuera de horario de alertas, se omite ciclo.")
+                    tech = [a for a in alertas if a.get("tipo") != "brusco"]
+                    if tech:
+                        await _enviar_bloque_alertas(app, uid, "🔔 ALERTAS DE TU CARTERA", tech)
+                ultimo_tech = time.time()
         except Exception as e:
             logger.error(f"Error en tarea de alertas: {e}", exc_info=True)
 
-        await asyncio.sleep(ALERTA_INTERVALO_HORAS * 3600)
+        await asyncio.sleep(15 * 60)
 
 # ==================== SYSTEM INSTRUCTION PARA IA ====================
 SYSTEM_INSTRUCTION = """Router corto. NO calcules, NO inventes números, NO describas gráficos.
@@ -3706,6 +3992,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /vs         →  Este ciclo Havas vs el anterior\n"
         "• /fijos      →  Servicios y gastos que se repiten (aunque el monto cambie)\n"
         "• /delivery   →  Delivery neto (gasto − devoluciones) y tope\n"
+        "• /torta      →  Torta de gastos del ciclo (o /torta cartera)\n"
         "• /mes        →  Presupuestos y control del mes\n"
         "• /objetivos  →  Progreso de metas financieras\n"
         "• /excel      →  Exportar planilla completa\n"
@@ -3746,6 +4033,210 @@ async def enviar_grafico_activos(update: Update, user_id: int, periodo: str = ""
     else:
         await update.message.reply_text("No hay suficientes activos que coincidan.")
 
+MESES_ES = {
+    "enero": 1, "febrero": 2, "marzo": 3, "abril": 4, "mayo": 5, "junio": 6,
+    "julio": 7, "agosto": 8, "septiembre": 9, "setiembre": 9, "octubre": 10,
+    "noviembre": 11, "diciembre": 12,
+}
+
+def cotizacion_usd_ars() -> float:
+    for sym in ("USDARS=X", "ARS=X"):
+        try:
+            h = yf_history(sym, period="5d")
+            if h is not None and not h.empty:
+                px = float(h["Close"].dropna().iloc[-1])
+                if 100 < px < 20000:
+                    return px
+                if 0 < px < 1:
+                    return 1.0 / px
+        except Exception:
+            continue
+    return 1400.0
+
+def snapshot_capacidad(user_id: int) -> dict:
+    with get_db_connection() as conn:
+        df = pd.read_sql(
+            "SELECT fecha, tipo, monto, categoria, descripcion FROM movimientos WHERE user_id = %s;",
+            conn, params=(user_id,),
+        )
+    ingreso = consumo = ahorro = deuda = 0.0
+    ciclos = 1
+    if not df.empty:
+        df["fecha"] = pd.to_datetime(df["fecha"])
+        df["categoria"] = df["categoria"].apply(normalizar_categoria)
+        sueldos = obtener_fechas_sueldo(user_id)
+        df = asignar_ciclo_havas(df, sueldos)
+        ciclos = max(1, df["ciclo_id"].nunique())
+        for _, r in df.iterrows():
+            blob = f"{r['categoria']} {r['descripcion']}".lower()
+            mon = float(r["monto"] or 0)
+            if r["tipo"] == "INGRESO":
+                if "delfina" in blob and mon >= 100000:
+                    continue
+                if any(t in blob for t in TAGS_AHORRO):
+                    continue
+                ingreso += mon
+            else:
+                if any(t in blob for t in TAGS_AHORRO) or "fima" in blob:
+                    ahorro += mon
+                elif normalizar_categoria(str(r["categoria"])) == "Tarjeta de crédito" or any(t in blob for t in TAGS_DEUDA):
+                    deuda += mon
+                else:
+                    consumo += mon
+    # ingresos counted all non-capital; subtract was messy with "or True"
+    superavit = (ingreso - consumo) / ciclos
+    cartera = 0.0
+    try:
+        res = obtener_resumen_portafolio(user_id)
+        if res:
+            cartera = float(res.get("total_actual") or 0)
+    except Exception:
+        pass
+    fx = cotizacion_usd_ars()
+    return {
+        "ingreso_mes": ingreso / ciclos,
+        "consumo_mes": consumo / ciclos,
+        "ahorro_mes": ahorro / ciclos,
+        "deuda_mes": deuda / ciclos,
+        "superavit_mes": superavit,
+        "cartera_usd": cartera,
+        "fx": fx,
+        "ciclos": ciclos,
+    }
+
+def parsear_pedido_proyeccion(texto: str):
+    low = (texto or "").lower()
+    if not re.search(r"\b(vacaciones|viaje|viajar|puedo|podr[eé]|alcanza|me da|meta|quiero hacer|me voy)\b", low):
+        return None
+    if not re.search(r"\b(vacaciones|viaje|viajar|usd|d[oó]lar|plata|plata|presupuesto de viaje)\b", low) and not re.search(r"\d", low):
+        return None
+    # monto
+    monto_usd = None
+    monto_ars = None
+    m = re.search(r"(\d[\d\.]*)\s*(k|mil)?\s*(usd|u\$d|u\$s|d[oó]lares?)", low)
+    if m:
+        n = float(m.group(1).replace(".", "").replace(",", ".")) if "," in m.group(1) else float(m.group(1).replace(".", "") if m.group(1).count(".")>1 else m.group(1).replace(",", ""))
+        try:
+            n = float(re.sub(r"[^\d.]", "", m.group(1).replace(",", ".")))
+        except Exception:
+            n = None
+        if n is not None:
+            if (m.group(2) or "") in ("k", "mil") and n < 10000:
+                n *= 1000
+            monto_usd = n
+    if monto_usd is None:
+        m2 = re.search(r"(usd|u\$d|u\$s|d[oó]lares?)\s*(\d[\d\.]*)\s*(k|mil)?", low)
+        if m2:
+            try:
+                n = float(m2.group(2).replace(",", "."))
+                if (m2.group(3) or "") in ("k", "mil") and n < 10000:
+                    n *= 1000
+                monto_usd = n
+            except Exception:
+                pass
+    if monto_usd is None:
+        m3 = re.search(r"(\d[\d\.]*)\s*(k|mil)?\s*(ars|pesos)?", low)
+        # only if explicitly pesos or large number without usd already
+        if "usd" not in low and "dólar" not in low and "dolar" not in low and m3:
+            try:
+                n = float(m3.group(1).replace(".", "").replace(",", "")) if m3.group(1).count(".") >= 1 and "usd" not in low else float(m3.group(1).replace(",", "."))
+            except Exception:
+                n = None
+            if n and n >= 100000:
+                monto_ars = n
+    mes_n = None
+    anio_n = None
+    for nom, num in MESES_ES.items():
+        if re.search(rf"\b{nom}\b", low):
+            mes_n = num
+            break
+    m_an = re.search(r"\b(202[6-9]|203[0-9])\b", low)
+    if m_an:
+        anio_n = int(m_an.group(1))
+    m_en = re.search(r"en\s+(\d+)\s+mes", low)
+    meses_plazo = int(m_en.group(1)) if m_en else None
+    if monto_usd is None and monto_ars is None and mes_n is None and meses_plazo is None:
+        if re.search(r"\bvacaciones\b|\bviaje\b", low):
+            return {"tipo": "vacaciones", "monto_usd": None, "monto_ars": None, "mes": None, "anio": None, "meses_plazo": None, "incompleto": True}
+        return None
+    return {
+        "tipo": "vacaciones" if re.search(r"vacaciones|viaje", low) else "meta",
+        "monto_usd": monto_usd,
+        "monto_ars": monto_ars,
+        "mes": mes_n,
+        "anio": anio_n,
+        "meses_plazo": meses_plazo,
+        "incompleto": False,
+    }
+
+def texto_analisis_proyeccion(user_id: int, texto_orig: str) -> str:
+    pedido = parsear_pedido_proyeccion(texto_orig)
+    if not pedido:
+        return ""
+    if pedido.get("incompleto") or (not pedido.get("monto_usd") and not pedido.get("monto_ars")):
+        return (
+            "Para proyectar necesito el monto. Ejemplo:\n"
+            "• 'Vacaciones en marzo de 3000 USD, ¿puedo?'\n"
+            "• 'Viaje en 5 meses de 2k usd'"
+        )
+    snap = snapshot_capacidad(user_id)
+    fx = snap["fx"]
+    if pedido["monto_usd"]:
+        need_usd = float(pedido["monto_usd"])
+        need_ars = need_usd * fx
+    else:
+        need_ars = float(pedido["monto_ars"])
+        need_usd = need_ars / fx if fx else 0
+    ahora = ahora_argentina()
+    if pedido.get("meses_plazo"):
+        meses = max(1, int(pedido["meses_plazo"]))
+        fecha_obj = ahora + timedelta(days=30 * meses)
+    elif pedido.get("mes"):
+        anio = pedido.get("anio") or ahora.year
+        if pedido["mes"] < ahora.month or (pedido["mes"] == ahora.month and ahora.day > 15):
+            if not pedido.get("anio"):
+                anio = ahora.year + 1
+        fecha_obj = datetime(anio, pedido["mes"], 1)
+        meses = max(1, int(round((fecha_obj - ahora).days / 30.0)))
+    else:
+        meses = 6
+        fecha_obj = ahora + timedelta(days=180)
+    ahorro_acum_ars = snap["superavit_mes"] * meses
+    ahorro_acum_usd = ahorro_acum_ars / fx if fx else 0
+    cartera = snap["cartera_usd"]
+    disponible_usd = cartera + max(0.0, ahorro_acum_usd)
+    cubre_flujo = ahorro_acum_usd >= need_usd
+    cubre_cartera = cartera >= need_usd
+    cubre_mixto = disponible_usd >= need_usd
+    if cubre_flujo:
+        veredicto = "🟢 Sí, con el ritmo actual de ahorro (sin tocar la cartera)."
+    elif cubre_mixto:
+        veredicto = "🟡 Sí, si usás parte de la cartera + lo que ahorres hasta esa fecha."
+    elif cubre_cartera:
+        veredicto = "🟡 La cartera cubre el viaje, pero no lo financiás solo con el excedente mensual."
+    else:
+        falta = need_usd - disponible_usd
+        veredicto = f"🔴 Justo no cierra. Te faltarían ~${falta:,.0f} USD a este ritmo."
+    mes_txt = fecha_obj.strftime("%m/%Y")
+    lineas = [
+        f"🧳 Proyección · {pedido['tipo']} {mes_txt}",
+        f"• Objetivo: ${need_usd:,.0f} USD  (~${need_ars:,.0f} ARS @ {fx:,.0f})",
+        f"• Plazo: {meses} mes(es)",
+        "",
+        "Tu capacidad (Python, ciclo Havas):",
+        f"• Ingresos habit. ${snap['ingreso_mes']:,.0f} ARS/mes",
+        f"• Consumo vida    ${snap['consumo_mes']:,.0f} ARS/mes",
+        f"• Excedente       ${snap['superavit_mes']:+,.0f} ARS/mes ({snap['superavit_mes']/fx:+,.0f} USD/mes)",
+        f"• Cartera USD     ${cartera:,.0f}",
+        "",
+        f"• Ahorro estimado al plazo: ${ahorro_acum_usd:,.0f} USD",
+        f"• Cartera + ahorro:         ${disponible_usd:,.0f} USD",
+        "",
+        veredicto,
+        "No toca FIMA como si fuera plata líquida del viaje; si querés usarla, decilo.",
+    ]
+    return "\n".join(lineas)
+
 async def intentar_comando_local(update: Update, user_id: int, user_msg: str) -> bool:
     raw = (user_msg or "").strip()
     low = raw.lower().strip()
@@ -3753,10 +4244,28 @@ async def intentar_comando_local(update: Update, user_id: int, user_msg: str) ->
         low = low[1:]
         raw = raw[1:] if raw.startswith("/") else raw
 
+    if parsear_pedido_proyeccion(raw):
+        await update.message.reply_text(texto_analisis_proyeccion(user_id, raw))
+        return True
+
+    aprendido = buscar_comando_por_frase(user_id, raw)
+    if aprendido:
+        raw = aprendido
+        low = aprendido.lower()
+
     partes = raw.split()
     cmd = partes[0].lower() if partes else ""
     args = " ".join(partes[1:]) if len(partes) > 1 else ""
     periodo = extraer_periodo(raw)
+
+    if not re.match(r"presupuesto\s+\S+.+\d", low):
+        intent = resolver_intencion(low)
+        if intent:
+            partes_i = intent.split()
+            cmd = partes_i[0]
+            if len(partes_i) > 1 and not args:
+                args = " ".join(partes_i[1:])
+            low = (intent + (" " + args if args else "")).strip()
 
     if cmd in ("help", "ayuda", "comandos"):
         await start(update, None)
@@ -3785,6 +4294,16 @@ async def intentar_comando_local(update: Update, user_id: int, user_msg: str) ->
         set_presupuesto(user_id, cat_p, mon_p)
         await update.message.reply_text(f"✅ Presupuesto {cat_p}: ${mon_p:,.0f} ARS este ciclo.")
         return True
+    if cmd in ("mensual", "meses", "mesames") or re.search(r"\b(rendimiento mensual|como me fue cada mes|mes a mes|tasa mensual)\b", low):
+        anio_filtro = None
+        m_anio = re.search(r"\b(202\d)\b", low)
+        if m_anio:
+            anio_filtro = int(m_anio.group(1))
+        elif re.search(r"\b(este a[ñn]o|ytd|actual)\b", low):
+            anio_filtro = datetime.now().year
+            
+        await update.message.reply_text(calcular_rendimiento_por_meses(user_id, anio_filtro))
+        return True
     if cmd in ("mes", "presupuesto", "presupuestos"):
         await cmd_mes(update, None)
         return True
@@ -3796,16 +4315,6 @@ async def intentar_comando_local(update: Update, user_id: int, user_msg: str) ->
         return True
     if cmd in ("resumen", "cartera", "balance"):
         await cmd_resumen(update, None)
-        return True
-    if cmd in ("mensual", "meses", "mesames") or re.search(r"\b(rendimiento mensual|como me fue cada mes|mes a mes|tasa mensual)\b", low):
-        anio_filtro = None
-        m_anio = re.search(r"\b(202\d)\b", low)
-        if m_anio:
-            anio_filtro = int(m_anio.group(1))
-        elif re.search(r"\b(este a[ñn]o|ytd|actual)\b", low):
-            anio_filtro = datetime.now().year
-            
-        await update.message.reply_text(calcular_rendimiento_por_meses(user_id, anio_filtro))
         return True
     if cmd in ("gastos", "finanzas", "hormiga", "promedios") or re.search(r"\b(gasto(s)? hormiga|promedio(s)? de gasto(s)?|radiograf[ií]a)\b", low):
         await update.message.reply_text(calcular_metricas_finanzas_completas(user_id))
@@ -3858,10 +4367,19 @@ async def intentar_comando_local(update: Update, user_id: int, user_msg: str) ->
         else:
             await update.message.reply_text("No hay datos para exportar.")
         return True
-    if cmd == "torta":
-        buf = generar_grafico_distribucion_inversiones(user_id)
-        if buf:
-            await update.message.reply_photo(photo=buf, caption="Distribución abierta")
+    if cmd in ("torta", "pie"):
+        if re.search(r"cartera|invers|usd|activos", low):
+            buf = generar_grafico_distribucion_inversiones(user_id)
+            if buf:
+                await update.message.reply_photo(photo=buf, caption="Distribución de la cartera (USD)")
+            else:
+                await update.message.reply_text("No hay posiciones abiertas para armar la torta.")
+        else:
+            buf, etq = generar_grafico_torta_gastos(user_id)
+            if buf:
+                await update.message.reply_photo(photo=buf, caption=f"Torta de gastos de vida — {etq}")
+            else:
+                await update.message.reply_text("No hay gastos de vida en este ciclo para armar la torta.")
         return True
     if cmd in ("analisis", "análisis", "at", "tecnico", "técnico"):
         tk = ""
@@ -4059,6 +4577,11 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Error comando local: {e}", exc_info=True)
 
+    tlow = (user_msg or "").strip().lower()
+    if tlow in ("hola", "buenas", "ok", "oka", "gracias", "thx", "dale", "si", "sí"):
+        await update.message.reply_text("Decime /gastos, /mes, /torta, /vs o /help.")
+        return
+
     try:
         prompt = f'Texto del usuario:\n"{user_msg[:240]}"'
         reply = llamar_gemini(prompt, SYSTEM_INSTRUCTION)
@@ -4147,6 +4670,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(texto_limpio)
 
         if cmd_para_ejecutar:
+            guardar_frase_comando(user_id, user_msg, cmd_para_ejecutar)
             await intentar_comando_local(update, user_id, cmd_para_ejecutar)
 
     except Exception as e:
@@ -4196,6 +4720,9 @@ async def cmd_fijos(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_delivery(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(texto_alerta_delivery(update.effective_user.id))
 
+async def cmd_torta(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await intentar_comando_local(update, update.effective_user.id, update.message.text or "/torta")
+
 async def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).concurrent_updates(True).build()
     app.add_handler(CommandHandler("start", start))
@@ -4211,6 +4738,8 @@ async def main():
     app.add_handler(CommandHandler("vs", cmd_vs))
     app.add_handler(CommandHandler("fijos", cmd_fijos))
     app.add_handler(CommandHandler("delivery", cmd_delivery))
+    app.add_handler(CommandHandler("torta", cmd_torta))
+    app.add_handler(CommandHandler("pie", cmd_torta))
     app.add_handler(CommandHandler("help", start))
     app.add_handler(CommandHandler("ayuda", start))
     app.add_handler(CommandHandler("cartera", cmd_resumen))
