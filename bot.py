@@ -457,6 +457,395 @@ def normalizar_categoria(cat: str) -> str:
     c_low = cat.strip().lower()
     return MAPA_CANONICO_CATEGORIAS.get(c_low, cat.strip().capitalize())
 
+# ==================== REGLAS FIJAS PYTHON (0 tokens) ====================
+# Alias de comercio / concepto → (categoria, descripcion). Orden: el match más largo gana.
+REGLAS_COMERCIO_NL = [
+    (("pedidosya market", "pedidos ya market", "pya market"), "Supermercado", "PedidosYa Market"),
+    (("pedidosya extra", "pedidos ya extra"), "Delivery", "PedidosYa Extra"),
+    (("pedidosya", "pedidos ya", "peya", "pedidosya delivery"), "Delivery", "PedidosYa Delivery"),
+    (("rappi pro",), "Suscripciones", "Rappi Pro"),
+    (("rappi",), "Delivery", "Rappi"),
+    (("uber eats",), "Delivery", "Uber Eats"),
+    (("uber shopper",), "Supermercado", "Uber Shopper"),
+    (("uber",), "Transporte", "Uber"),
+    (("cabify", "didi"), "Transporte", "Viaje app"),
+    (("sube",), "Transporte", "Tarjeta SUBE"),
+    (("farmacity", "farmacity reintegro"), "Farmacia", "Farmacity"),
+    (("cinemark", "hoyts", "cinema"), "Entretenimiento", "Cine"),
+    (("metrogas",), "Servicios", "Metrogas"),
+    (("edesur",), "Servicios", "Edesur"),
+    (("aysa",), "Servicios", "AySA"),
+    (("telecentro", "fibertel", "personal flow", "flow"), "Servicios", "Internet"),
+    (("netflix", "spotify", "youtube premium", "icloud", "openai", "chatgpt plus"), "Suscripciones", "Suscripción"),
+    (("havas", "havas media"), "Sueldo", "Havas Media Argentina S.A."),
+    (("fornodelpaese", "forno del paese"), "Comida", "Forno del Paese"),
+    (("pettish",), "Hogar", "Pettish Bazar"),
+    (("fima premium", "fima"), "Inversiones", "FIMA Premium"),
+    (("compra dolares", "compra de dolares", "compra de dólares", "compra dólares"), "Inversiones", "Compra de dólares"),
+    (("delfina silva", "delfina"), "Transferencias", "Transferencia de Delfina Silva"),
+    (("marina luz", "ugariza", "mama", "mamá"), "Transferencias", "Transferencia familiar"),
+    (("pago tarjeta master", "pago mastercard", "pago visa", "pago de tarjeta"), "Tarjeta de crédito", "Pago tarjeta"),
+    (("panaderia", "panadería", "pan"), "Comida", "Panadería"),
+    (("verduleria", "verdulería", "verdura"), "Comida", "Verdulería"),
+    (("fiambreria", "fiambrería"), "Comida", "Fiambrería"),
+    (("cafe", "café", "cafeteria", "cafetería"), "Comida", "Café"),
+    (("super", "chino", "dia ", "carrefour", "coto", "jumbo", "vea", "disco"), "Supermercado", "Supermercado"),
+    (("barberia", "barbería", "pelo", "corte de pelo"), "Cuidado personal", "Barbería"),
+    (("arena", "piedras gato", "veterinaria"), "Mascotas", "Mascotas"),
+    (("nafta", "ypf", "shell", "axion", "estacion de servicio"), "Transporte", "Combustible"),
+]
+
+VERBO_GASTO = (
+    r"registr(a|á|ar|ame)|anot(a|á|ar|ame)|carg(a|á|ar|ame)|"
+    r"gast(e|é|o|ar|aste)|pagu(e|é)|pag(o|ué|ue)|un pago|"
+    r"compr(e|é|o|ar)|saqu(e|é)|transfer(i|í)|debito|débito|"
+    r"me cobraron|me descontaron|salida"
+)
+VERBO_INGRESO = (
+    r"ingreso|cobr(e|é|o)|me depositaron|me transfirieron|"
+    r"sueldo|haberes|salario|n[oó]mina|acreditaron|"
+    r"me devolvieron|reintegro|devoluci[oó]n"
+)
+VERBO_MOVIMIENTO = VERBO_GASTO + r"|" + VERBO_INGRESO
+
+STOP_CLAVE_NL = {
+    "REGISTRA", "REGISTRAR", "REGISTRAME", "ANOTA", "ANOTAR", "ANOTAME", "CARGA", "CARGAR",
+    "GASTE", "GASTE", "GASTO", "PAGUE", "PAGO", "COMPRE", "COMPRA", "SAQUE",
+    "INGRESO", "COBRE", "SUELDO", "UN", "UNA", "EL", "LA", "LOS", "LAS", "DE", "DEL",
+    "EN", "POR", "CON", "PARA", "HOY", "AYER", "ARS", "PESOS", "PESO", "PLATA",
+    "QUE", "ME", "MI", "LO", "LE", "SE", "AL", "THE", "AND",
+}
+
+
+def _parsear_numero_ars(bruto: str, sufijo: str = ""):
+    s = (bruto or "").strip().replace("$", "").replace(" ", "")
+    if not s:
+        return None
+    try:
+        if "," in s and "." in s:
+            if s.rfind(",") > s.rfind("."):
+                s = s.replace(".", "").replace(",", ".")
+            else:
+                s = s.replace(",", "")
+        elif "," in s:
+            izq, der = s.split(",", 1)
+            if len(der) <= 2:
+                s = izq.replace(".", "") + "." + der
+            else:
+                s = s.replace(",", "")
+        elif s.count(".") == 1:
+            izq, der = s.split(".")
+            if len(der) == 3 and len(izq) <= 3:
+                s = izq + der
+        else:
+            s = s.replace(".", "")
+        val = float(s)
+    except Exception:
+        return None
+    suf = (sufijo or "").lower().strip()
+    if suf in ("k", "mil") and val < 100000:
+        val *= 1000
+    return val if val > 0 else None
+
+
+def extraer_monto_ars(texto: str):
+    low = (texto or "").lower()
+    low = re.sub(r"\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b", " ", low)
+    low = re.sub(r"\b(20[2-3]\d)\b", " ", low)
+    patrones = [
+        r"\$\s*(\d[\d\.]*)([,]\d{1,2})?\s*(k|mil)?",
+        r"(?:de|por)\s+(\d[\d\.]*)([,]\d{1,2})?\s*(k|mil)?",
+        r"\b(\d[\d\.]*)([,]\d{1,2})?\s*(k|mil)?\s*(?:ars|pesos)?\b",
+    ]
+    mejor = None
+    for pat in patrones:
+        for m in re.finditer(pat, low):
+            entero = m.group(1) or "0"
+            dec = m.group(2) or ""
+            suf = m.group(3) if m.lastindex and m.lastindex >= 3 else ""
+            val = _parsear_numero_ars(entero + dec, suf)
+            if val is None:
+                continue
+            if 1900 <= val <= 2100 and not suf:
+                continue
+            if mejor is None or val > mejor:
+                mejor = val
+    return mejor
+
+
+def extraer_fecha_movimiento(texto: str):
+    low = (texto or "").lower()
+    if re.search(r"\bayer\b", low):
+        return (ahora_argentina() - timedelta(days=1)).strftime("%Y-%m-%d")
+    if re.search(r"\bhoy\b", low):
+        return ahora_argentina().strftime("%Y-%m-%d")
+    m_f = re.search(r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b", low)
+    if not m_f:
+        return None
+    d, mo = int(m_f.group(1)), int(m_f.group(2))
+    an = m_f.group(3)
+    if an:
+        an = int(an)
+        if an < 100:
+            an += 2000
+    else:
+        an = ahora_argentina().year
+    try:
+        return datetime(an, mo, d).strftime("%Y-%m-%d")
+    except Exception:
+        return None
+
+
+def detectar_tipo_movimiento(texto: str) -> str:
+    low = (texto or "").lower()
+    if re.search(r"\b(" + VERBO_INGRESO + r")\b", low):
+        return "INGRESO"
+    if re.search(r"\b(reintegro|devoluci[oó]n|me devolvieron|anulaci[oó]n)\b", low):
+        return "INGRESO"
+    return "GASTO"
+
+
+def extraer_clave_nl(texto: str) -> str:
+    clave_bank = extraer_clave_comercio(texto)
+    if clave_bank:
+        return clave_bank
+    t = re.sub(r"\$?\d[\d\.,]*", " ", (texto or "").upper())
+    t = re.sub(r"\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b", " ", t)
+    t = re.sub(r"[^A-ZÁÉÍÓÚÜÑ0-9\s]", " ", t)
+    tokens = [
+        tok for tok in t.split()
+        if tok not in STOP_CLAVE_NL
+        and tok not in PALABRAS_PROHIBIDAS_PATRON
+        and len(tok) >= 3
+        and not tok.isdigit()
+    ]
+    return " ".join(tokens[:3]).strip()
+
+
+def match_regla_comercio(texto: str):
+    low = " " + re.sub(r"\s+", " ", (texto or "").lower()) + " "
+    mejor = None
+    mejor_len = 0
+    for aliases, cat, desc in REGLAS_COMERCIO_NL:
+        for alias in aliases:
+            if f" {alias} " in low or low.strip() == alias:
+                if len(alias) > mejor_len:
+                    mejor = (cat, desc, alias.upper())
+                    mejor_len = len(alias)
+    return mejor
+
+
+def descripcion_limpia_desde_texto(texto: str, fallback: str = "") -> str:
+    t = (texto or "").lower()
+    t = re.sub(r"\b(" + VERBO_MOVIMIENTO + r")\b", " ", t)
+    t = re.sub(r"\$?\d[\d\.,]*", " ", t)
+    t = re.sub(r"\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b", " ", t)
+    t = re.sub(r"\b(hoy|ayer|ars|pesos|un|una|el|la|los|las|de|del|en|por|con|para)\b", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return _emprolijar_texto(t)[:80] or fallback
+
+
+def parece_consulta_no_registro(texto: str) -> bool:
+    low = (texto or "").lower().strip()
+    if re.search(r"\b(vacaciones|viaje|viajar|presupuesto|activar|desactivar|alertas)\b", low):
+        return True
+    if re.search(r"\b(cu[aá]nto|c[oó]mo vengo|radiograf|resumen|gr[aá]fico|an[aá]lisis|torta|benchmark)\b", low):
+        return True
+    if re.search(r"\b(btc|eth|spy|nvda|meli|cartera|long|short|apalanc)\b", low) and re.search(r"\b(usd|u\$d|d[oó]lar)\b", low):
+        return True
+    return False
+
+
+def parece_intento_registro(texto: str, tiene_regla: bool, tiene_cat: bool, tiene_mapeo: bool) -> bool:
+    low = (texto or "").lower()
+    if parece_consulta_no_registro(texto):
+        return False
+    if re.search(r"\b(" + VERBO_MOVIMIENTO + r")\b", low):
+        return True
+    if extraer_monto_ars(texto) and (tiene_regla or tiene_cat or tiene_mapeo or "$" in (texto or "")):
+        return True
+    return False
+
+
+def buscar_mapeo_por_texto(user_id: int, texto: str):
+    if not user_id:
+        return None, None, ""
+    claves = []
+    k1 = extraer_clave_comercio(texto)
+    k2 = extraer_clave_nl(texto)
+    if k1:
+        claves.append(k1)
+    if k2 and k2 not in claves:
+        claves.append(k2)
+    hit = match_regla_comercio(texto)
+    if hit and hit[2] not in claves:
+        claves.append(hit[2])
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                for clave in claves:
+                    if not clave:
+                        continue
+                    cursor.execute(
+                        """SELECT categoria, descripcion_limpia, patron_clave,
+                                  COALESCE(usos_exitosos,1), COALESCE(usos_rechazados,0)
+                           FROM mapeo_conceptos
+                           WHERE user_id = %s AND patron_clave = %s;""",
+                        (user_id, clave),
+                    )
+                    row = cursor.fetchone()
+                    if row and int(row[4] or 0) == 0:
+                        return row[0], row[1], row[2]
+                blob = " " + re.sub(r"\s+", " ", (texto or "").upper()) + " "
+                cursor.execute(
+                    """SELECT categoria, descripcion_limpia, patron_clave,
+                              COALESCE(usos_rechazados,0)
+                       FROM mapeo_conceptos WHERE user_id = %s;""",
+                    (user_id,),
+                )
+                candidatos = []
+                for cat, desc, patron, rech in cursor.fetchall():
+                    if int(rech or 0) > 0 or not patron or len(str(patron)) < 3:
+                        continue
+                    p = f" {str(patron).upper()} "
+                    if p in blob:
+                        candidatos.append((len(str(patron)), cat, desc, patron))
+                if candidatos:
+                    candidatos.sort(reverse=True)
+                    _, cat, desc, patron = candidatos[0]
+                    return cat, desc, patron
+    except Exception as e:
+        logger.warning(f"buscar_mapeo_por_texto: {e}")
+    return None, None, (claves[0] if claves else "")
+
+
+def aprender_patron_clasificacion(user_id: int, texto: str, categoria: str, descripcion: str, clave_extra: str = ""):
+    if not user_id:
+        return
+    vistas = []
+    for cand in (clave_extra, extraer_clave_comercio(texto), extraer_clave_nl(texto)):
+        c = (cand or "").strip().upper()
+        if c and c not in vistas:
+            vistas.append(c)
+    for clave in vistas:
+        guardar_aprendizaje_concepto(user_id, clave, categoria, descripcion)
+
+
+def clasificar_categoria_python(texto: str):
+    hit = match_regla_comercio(texto)
+    if hit:
+        return hit[0], hit[1], hit[2], True
+    low = (texto or "").lower()
+    if re.search(r"\b(sueldo|haberes|salario|n[oó]mina|liquidaci[oó]n)\b", low) or "havas" in low:
+        return "Sueldo", "Sueldo", "SUELDO", True
+    if categoria_reconocida_por_python(texto):
+        cat, desc = parsear_categoria_descripcion_usuario(texto)
+        return cat, desc, extraer_clave_nl(texto), True
+    for canon in sorted(CATEGORIAS_VALIDAS, key=len, reverse=True):
+        if str(canon).lower() in low:
+            desc = descripcion_limpia_desde_texto(texto, canon)
+            return canon, desc, extraer_clave_nl(texto), True
+    return None, None, extraer_clave_nl(texto), False
+
+
+def clasificar_con_gemini_movimiento(texto: str):
+    cats = ", ".join(sorted(CATEGORIAS_VALIDAS))
+    prompt = (
+        "Clasificá este gasto o ingreso personal de Argentina. "
+        "Devolvé EXACTAMENTE una línea: TIPO|CATEGORIA|DESCRIPCION\n"
+        "TIPO es GASTO o INGRESO. CATEGORIA una de: "
+        f"{cats}. DESCRIPCION corta y prolija, sin monto.\n"
+        f"Texto: {texto}"
+    )
+    res = llamar_gemini(
+        prompt,
+        "Clasificador de movimientos. Solo TIPO|CATEGORIA|DESCRIPCION. No inventes montos.",
+    )
+    partes = [p.strip() for p in (res or "").replace("\n", " ").split("|")]
+    tipo = "GASTO"
+    cat = "Varios"
+    desc = descripcion_limpia_desde_texto(texto, "Movimiento")
+    if partes and partes[0].upper() in ("GASTO", "INGRESO"):
+        tipo = partes[0].upper()
+        if len(partes) > 1 and partes[1]:
+            cat = normalizar_categoria(partes[1])
+        if len(partes) > 2 and partes[2]:
+            desc = _emprolijar_texto(re.sub(r"\$?\d[\d\.,]*", " ", partes[2]))[:80] or desc
+    elif partes:
+        cat = normalizar_categoria(partes[0])
+        if len(partes) > 1 and partes[1]:
+            desc = _emprolijar_texto(partes[1])[:80] or desc
+    if cat not in CATEGORIAS_VALIDAS:
+        cat = normalizar_categoria(cat)
+        if cat not in CATEGORIAS_VALIDAS:
+            cat = "Varios"
+    return tipo, cat, desc
+
+
+def parsear_registro_manual(texto: str, user_id: int = None, usar_gemini: bool = False):
+    raw = (texto or "").strip()
+    if not raw or raw.startswith("/"):
+        return None
+    if parece_consulta_no_registro(raw):
+        return None
+
+    monto = extraer_monto_ars(raw)
+    fecha = extraer_fecha_movimiento(raw)
+    tipo = detectar_tipo_movimiento(raw)
+
+    cat_db, desc_db, clave_db = buscar_mapeo_por_texto(user_id, raw) if user_id else (None, None, "")
+    cat_py, desc_py, clave_py, ok_py = clasificar_categoria_python(raw)
+    tiene_cat = bool(cat_db or ok_py)
+
+    if not parece_intento_registro(raw, bool(match_regla_comercio(raw)), tiene_cat, bool(cat_db)):
+        return None
+    if monto is None or monto <= 0:
+        return None
+
+    origen = "python"
+    if cat_db:
+        cat, desc, clave = normalizar_categoria(cat_db), (desc_db or cat_db), clave_db
+        origen = "memoria"
+    elif ok_py:
+        cat, desc, clave = cat_py, desc_py, clave_py
+        origen = "python"
+    elif usar_gemini:
+        try:
+            tipo_ia, cat, desc = clasificar_con_gemini_movimiento(raw)
+            if tipo == "GASTO" and tipo_ia == "INGRESO":
+                tipo = "INGRESO"
+            clave = extraer_clave_nl(raw) or extraer_clave_comercio(raw)
+            origen = "gemini"
+            aprender_patron_clasificacion(user_id, raw, cat, desc, clave)
+        except Exception as e:
+            logger.warning(f"Gemini clasificador movimiento: {e}")
+            cat, desc, clave = "Varios", descripcion_limpia_desde_texto(raw, "Movimiento"), extraer_clave_nl(raw)
+            origen = "fallback"
+    else:
+        return {
+            "tipo": tipo,
+            "monto": monto,
+            "categoria": "Varios",
+            "descripcion": descripcion_limpia_desde_texto(raw, "Movimiento"),
+            "fecha": fecha,
+            "clave": extraer_clave_nl(raw),
+            "origen": "incompleto",
+            "necesita_ia": True,
+        }
+
+    if not desc:
+        desc = descripcion_limpia_desde_texto(raw, cat)
+    return {
+        "tipo": tipo,
+        "monto": float(monto),
+        "categoria": str(cat)[:50],
+        "descripcion": str(desc)[:80],
+        "fecha": fecha,
+        "clave": clave or extraer_clave_nl(raw),
+        "origen": origen,
+        "necesita_ia": False,
+    }
+
 # ==================== APRENDIZAJE Y MAPEO DE CONCEPTOS BANCARIOS ====================
 PALABRAS_PROHIBIDAS_PATRON = {
     "COMPRA", "DEBITO", "CREDITO", "TARJ", "TARJETA", "SUC", "SUCURSAL", "PAGO", "PAGOS",
@@ -1399,80 +1788,6 @@ def guardar_movimiento(user_id: int, tipo: str, monto: float, categoria: str, de
                     (user_id, tipo, float(monto), categoria, descripcion)
                 )
             conn.commit()
-
-def parsear_registro_manual(texto: str):
-    low = (texto or "").lower().strip()
-    if not re.search(
-        r"\b(registr(a|á|ar|ame)|anot(a|á|ar|ame)|carg(a|á|ar)|gaste|gasté|pague|pagué|pago|un pago)\b",
-        low,
-    ):
-        return None
-    if re.search(r"\b(vacaciones|viaje|presupuesto|activar|desactivar)\b", low):
-        return None
-    tipo = "INGRESO" if re.search(r"\b(ingreso|cobre|cobré|me depositaron|sueldo|haberes|salario|n[oó]mina)\b", low) else "GASTO"
-    fecha = None
-    m_f = re.search(r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b", low)
-    if m_f:
-        d, mo = int(m_f.group(1)), int(m_f.group(2))
-        an = m_f.group(3)
-        if an:
-            an = int(an)
-            if an < 100:
-                an += 2000
-        else:
-            an = ahora_argentina().year
-        try:
-            fecha = datetime(an, mo, d).strftime("%Y-%m-%d")
-        except Exception:
-            fecha = None
-    monto = None
-    m_m = re.search(r"(?:de\s+|\$\s*)(\d[\d.]*)([,]\d+)?", low)
-    if not m_m:
-        m_m = re.search(r"\b(\d[\d.]*)([,]\d{1,2})\b", low)
-    if not m_m:
-        m_m = re.search(r"\b(\d{3,})(?:[,.](\d{1,2}))?\b", low)
-    if m_m:
-        entero = re.sub(r"[^\d]", "", m_m.group(1) or "0")
-        dec = ""
-        if m_m.lastindex and m_m.lastindex >= 2 and m_m.group(2):
-            dec = "." + re.sub(r"[^\d]", "", m_m.group(2))
-        try:
-            monto = float(entero + dec)
-        except Exception:
-            monto = None
-    if monto is None or monto <= 0:
-        return None
-    cat = "Otros"
-    if re.search(r"\b(sueldo|haberes|salario|n[oó]mina|liquidaci[oó]n)\b", low) or "havas" in low:
-        cat = "Sueldo"
-    elif "sube" in low or "uber" in low or "transporte" in low:
-        cat = "Transporte"
-    elif "pedidos ya market" in low or "pedidosya market" in low:
-        cat = "Supermercado"
-    elif "pedidos" in low or "delivery" in low:
-        cat = "Delivery"
-    else:
-        hallada = None
-        for canon in CATEGORIAS_VALIDAS:
-            if str(canon).lower() in low:
-                hallada = canon
-                break
-        if hallada:
-            cat = hallada
-        else:
-            cat = "Otros"
-    desc = re.sub(r"\b(registr(a|á|ar|ame)|gasto|ingreso|un|una|pago|en|de|el|la|los|desc)\b", " ", low)
-    desc = re.sub(r"\d[\d./,-]*", " ", desc)
-    desc = re.sub(r"\s+", " ", desc).strip()[:80] or cat
-    if "sube" in low and "sube" not in desc.lower():
-        desc = f"SUBE {desc}".strip()
-    return {
-        "tipo": tipo,
-        "monto": monto,
-        "categoria": str(cat)[:50],
-        "descripcion": desc[:80],
-        "fecha": fecha,
-    }
 
 # ==================== MOTOR CUANTITATIVO DE FINANZAS PERSONALES (ARS) ====================
 def calcular_metricas_finanzas_completas(user_id: int, meses_lookback: int = 6):
@@ -4188,30 +4503,29 @@ async def procesar_respuesta_importacion(update: Update, user_id: int, user_text
 
     # Python primero (0 tokens). Gemini solo si no reconoce la categoría,
     # y únicamente con el texto que escribió el usuario.
-    if categoria_reconocida_por_python(user_text):
-        cat_final, desc_final = parsear_categoria_descripcion_usuario(user_text)
+    uso_gemini = False
+    if categoria_reconocida_por_python(user_text) or match_regla_comercio(user_text):
+        if match_regla_comercio(user_text):
+            cat_final, desc_final, _, _ = clasificar_categoria_python(user_text)
+        else:
+            cat_final, desc_final = parsear_categoria_descripcion_usuario(user_text)
     else:
         try:
             cat_final, desc_final = emprolijar_categoria_con_gemini(user_text)
+            uso_gemini = True
         except Exception:
             cat_final, desc_final = parsear_categoria_descripcion_usuario(user_text)
 
     guardar_movimiento(user_id, item["tipo"], item["monto"], cat_final, desc_final, item["fecha"])
     sesion["guardados"] += 1
 
-    # Solo preguntamos si recordar si es un COMERCIO O PERSONA REAL (no DEBIN genérico)
-    if clave and len(clave) >= 3 and clave not in PALABRAS_PROHIBIDAS_PATRON and clave != cat_sug:
-        sesion["esperando_recordar"] = True
-        sesion["patron_pendiente"] = clave
-        sesion["cat_pendiente"] = cat_final
-        sesion["desc_pendiente"] = desc_final
-
-        await update.message.reply_text(
-            f"✅ Guardado como {cat_final}: {desc_final}\n\n"
-            f"¿Querés que recuerde que '{clave}' es siempre '{cat_final}' para próximos extractos?\n"
-            f"• Respondé 'Si' para guardarlo en la memoria.\n"
-            f"• O 'No' si solo fue esta vez puntual."
-        )
+    clave_aprender = clave or extraer_clave_comercio(item.get("concepto") or user_text) or extraer_clave_nl(user_text)
+    if clave_aprender and len(clave_aprender) >= 3 and clave_aprender not in PALABRAS_PROHIBIDAS_PATRON:
+        aprender_patron_clasificacion(user_id, item.get("concepto") or user_text, cat_final, desc_final, clave_aprender)
+        tag = " · patrón de Gemini guardado" if uso_gemini else " · patrón guardado"
+        sesion["idx"] += 1
+        await update.message.reply_text(f"✅ Guardado como {cat_final}: {desc_final}{tag}")
+        await presentar_siguiente_movimiento(update, user_id)
         return True
 
     sesion["idx"] += 1
@@ -4492,9 +4806,11 @@ async def intentar_comando_local(update: Update, user_id: int, user_msg: str) ->
     if parsear_pedido_proyeccion(raw):
         await update.message.reply_text(texto_analisis_proyeccion(user_id, raw))
         return True
-    reg = parsear_registro_manual(raw)
-    if reg:
+    reg = parsear_registro_manual(raw, user_id=user_id, usar_gemini=False)
+    if reg and not reg.get("necesita_ia"):
         guardar_movimiento(user_id, reg["tipo"], reg["monto"], reg["categoria"], reg["descripcion"], reg.get("fecha"))
+        if reg.get("clave"):
+            aprender_patron_clasificacion(user_id, raw, reg["categoria"], reg["descripcion"], reg.get("clave"))
         ftxt = f" ({reg['fecha']})" if reg.get("fecha") else ""
         await update.message.reply_text(
             f"✅ {reg['tipo'].title()} {reg['categoria']}: ${reg['monto']:,.2f} ARS — {reg['descripcion']}{ftxt}"
@@ -4863,12 +5179,15 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Decime /gastos, /mes, /torta, /vs o /help.")
         return
 
-    reg_directo = parsear_registro_manual(user_msg)
-    if reg_directo:
+    reg_directo = parsear_registro_manual(user_msg, user_id=user_id, usar_gemini=True)
+    if reg_directo and not reg_directo.get("necesita_ia"):
         guardar_movimiento(user_id, reg_directo["tipo"], reg_directo["monto"], reg_directo["categoria"], reg_directo["descripcion"], reg_directo.get("fecha"))
+        if reg_directo.get("clave"):
+            aprender_patron_clasificacion(user_id, user_msg, reg_directo["categoria"], reg_directo["descripcion"], reg_directo.get("clave"))
         ftxt = f" ({reg_directo['fecha']})" if reg_directo.get("fecha") else ""
+        extra = " · patrón guardado" if reg_directo.get("origen") == "gemini" else ""
         await update.message.reply_text(
-            f"✅ {reg_directo['tipo'].title()} {reg_directo['categoria']}: ${reg_directo['monto']:,.2f} ARS — {reg_directo['descripcion']}{ftxt}"
+            f"✅ {reg_directo['tipo'].title()} {reg_directo['categoria']}: ${reg_directo['monto']:,.2f} ARS — {reg_directo['descripcion']}{ftxt}{extra}"
         )
         return
 
@@ -4878,9 +5197,11 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Si Gemini recortó REGISTRO_*, no muestres basura: Python reintenta.
         if re.search(r"regist", reply, re.I) and "REGISTRO_ARS:" not in reply and "REGISTRO_INV:" not in reply:
-            reg = parsear_registro_manual(user_msg)
-            if reg:
+            reg = parsear_registro_manual(user_msg, user_id=user_id, usar_gemini=True)
+            if reg and not reg.get("necesita_ia"):
                 guardar_movimiento(user_id, reg["tipo"], reg["monto"], reg["categoria"], reg["descripcion"], reg.get("fecha"))
+                if reg.get("clave"):
+                    aprender_patron_clasificacion(user_id, user_msg, reg["categoria"], reg["descripcion"], reg.get("clave"))
                 ftxt = f" ({reg['fecha']})" if reg.get("fecha") else ""
                 await update.message.reply_text(
                     f"✅ {reg['tipo'].title()} {reg['categoria']}: ${reg['monto']:,.2f} ARS — {reg['descripcion']}{ftxt}"
@@ -4951,12 +5272,15 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 descripcion = partes[3]
                 f_gasto = partes[4].split()[0] if len(partes) > 4 and partes[4] not in ["0", "", "None"] else None
                 guardar_movimiento(user_id, tipo, monto, categoria, descripcion, f_gasto)
+                aprender_patron_clasificacion(user_id, user_msg, categoria, descripcion)
                 fecha_str = f" — {f_gasto}" if f_gasto else ""
-                reply = f"{reply}\n\n✅ Guardado: {tipo} de ${monto:,.2f} ARS en {categoria}{fecha_str}".strip()
+                reply = f"{reply}\n\n✅ Guardado: {tipo} de ${monto:,.2f} ARS en {categoria} — {descripcion}{fecha_str}\n🧠 Patrón aprendido para la próxima.".strip()
             except Exception:
-                reg = parsear_registro_manual(user_msg)
-                if reg:
+                reg = parsear_registro_manual(user_msg, user_id=user_id, usar_gemini=True)
+                if reg and not reg.get("necesita_ia"):
                     guardar_movimiento(user_id, reg["tipo"], reg["monto"], reg["categoria"], reg["descripcion"], reg.get("fecha"))
+                    if reg.get("clave"):
+                        aprender_patron_clasificacion(user_id, user_msg, reg["categoria"], reg["descripcion"], reg.get("clave"))
                     reply = f"✅ {reg['tipo'].title()} {reg['categoria']}: ${reg['monto']:,.2f} ARS — {reg['descripcion']}"
                 else:
                     reply = "No pude registrar el movimiento. Escribí: registra gasto CATEGORIA desc MONTO el DD/MM/AAAA"
