@@ -1409,7 +1409,7 @@ def parsear_registro_manual(texto: str):
         return None
     if re.search(r"\b(vacaciones|viaje|presupuesto|activar|desactivar)\b", low):
         return None
-    tipo = "INGRESO" if re.search(r"\b(ingreso|cobre|cobré|me depositaron|sueldo)\b", low) else "GASTO"
+    tipo = "INGRESO" if re.search(r"\b(ingreso|cobre|cobré|me depositaron|sueldo|haberes|salario|n[oó]mina)\b", low) else "GASTO"
     fecha = None
     m_f = re.search(r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b", low)
     if m_f:
@@ -1443,15 +1443,17 @@ def parsear_registro_manual(texto: str):
     if monto is None or monto <= 0:
         return None
     cat = "Otros"
-    if "sube" in low or "uber" in low or "transporte" in low:
+    if re.search(r"\b(sueldo|haberes|salario|n[oó]mina|liquidaci[oó]n)\b", low) or "havas" in low:
+        cat = "Sueldo"
+    elif "sube" in low or "uber" in low or "transporte" in low:
         cat = "Transporte"
-    elif "pedidos ya market" in low:
+    elif "pedidos ya market" in low or "pedidosya market" in low:
         cat = "Supermercado"
     elif "pedidos" in low or "delivery" in low:
         cat = "Delivery"
     else:
         hallada = None
-        for canon in CATEGORIAS_VALIDAS if "CATEGORIAS_VALIDAS" in dir() else []:
+        for canon in CATEGORIAS_VALIDAS:
             if str(canon).lower() in low:
                 hallada = canon
                 break
