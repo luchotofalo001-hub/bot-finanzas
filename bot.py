@@ -1400,6 +1400,59 @@ def guardar_movimiento(user_id: int, tipo: str, monto: float, categoria: str, de
                 )
             conn.commit()
 
+def parsear_registro_manual(texto: str):
+    low = (texto or "").lower().strip()
+    if not re.search(r"\b(registr(a|ar|ame)|anot(a|ar|ame)|carg(a|ar)|gaste|gasté|pague|pagué|pagué|pago de)\b", low):
+        return None
+    if re.search(r"\b(vacaciones|viaje|presupuesto)\b", low):
+        return None
+    tipo = "INGRESO" if re.search(r"\b(ingreso|cobre|cobré|me depositaron|sueldo)\b", low) else "GASTO"
+    fecha = None
+    m_f = re.search(r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b", low)
+    if m_f:
+        d, mo = int(m_f.group(1)), int(m_f.group(2))
+        an = m_f.group(3)
+        if an:
+            an = int(an)
+            if an < 100:
+                an += 2000
+        else:
+            an = ahora_argentina().year
+        try:
+            fecha = datetime(an, mo, d).strftime("%Y-%m-%d")
+        except Exception:
+            fecha = None
+    monto = None
+    m_m = re.search(r"(?:de\s+|\$\s*)(\d[\d.]*)([,]\d{1,2})?", low)
+    if not m_m:
+        m_m = re.search(r"\b(\d[\d.]*)([,]\d{1,2})\b", low)
+    if m_m:
+        entero = m_m.group(1).replace(".", "")
+        dec = (m_m.group(2) or "").replace(",", ".")
+        try:
+            monto = float(entero + dec)
+        except Exception:
+            monto = None
+    if monto is None or monto <= 0:
+        return None
+    cat = "Otros"
+    desc = re.sub(r"\b(registr(a|ar|ame)|un|una|pago|en|de|el|la|los)\b", " ", low)
+    desc = re.sub(r"\d[\d./,-]*", " ", desc)
+    desc = re.sub(r"\s+", " ", desc).strip()[:80] or "Movimiento"
+    for alias, canon in ALIASES.items() if "ALIASES" in dir() else []:
+        pass
+    cat = normalizar_categoria(low)
+    if cat == "Otros" or cat == low:
+        if "sube" in low or "uber" in low or "transporte" in low:
+            cat = "Transporte"
+        elif "pedidos ya market" in low:
+            cat = "Supermercado"
+        elif "pedidos" in low or "delivery" in low:
+            cat = "Delivery"
+    if "sube" in low and "sube" not in desc.lower():
+        desc = f"SUBE {desc}".strip()
+    return {"tipo": tipo, "monto": monto, "categoria": cat, "descripcion": desc[:80], "fecha": fecha}
+
 # ==================== MOTOR CUANTITATIVO DE FINANZAS PERSONALES (ARS) ====================
 def calcular_metricas_finanzas_completas(user_id: int, meses_lookback: int = 6):
     with get_db_connection() as conn:
@@ -2404,7 +2457,10 @@ def generar_grafico_analisis_tecnico(ticker: str, timeframe: str = "diario", con
                 'Volume': 'sum'
             }).dropna()
 
-        df.index = pd.to_datetime(df.index).tz_localize(None)
+        idx = pd.to_datetime(df.index)
+        if getattr(idx, "tz", None) is not None:
+            idx = idx.tz_convert("UTC").tz_localize(None)
+        df.index = idx
         df['Close'] = df['Close'].ffill()
         df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
         df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
@@ -3282,7 +3338,7 @@ def llamar_gemini(prompt: str, system_instruction: str) -> str:
         contents=prompt[:800],
         config={
             "system_instruction": system_instruction,
-            "max_output_tokens": 120,
+            "max_output_tokens": 220,
             "temperature": 0,
         },
     )
@@ -3880,13 +3936,15 @@ async def tarea_alertas_periodicas(app):
         await asyncio.sleep(15 * 60)
 
 # ==================== SYSTEM INSTRUCTION PARA IA ====================
-SYSTEM_INSTRUCTION = """Router corto. NO calcules, NO inventes números, NO describas gráficos.
-Si pide un reporte o gráfico respondé UNA sola línea:
+SYSTEM_INSTRUCTION = """Sos un router. NO calcules. NO inventes montos. NO recortes las líneas especiales.
+Si pide un reporte, UNA línea exacta:
 COMANDO: /gastos
-Comandos: /gastos /vs /fijos /delivery /mes /resumen /riesgo /objetivos /mensual /spy /grafico /activos /analisis /precio /excel
-Si registra un movimiento: REGISTRO_ARS: TIPO|MONTO|CATEGORIA|DESCRIPCION|FECHA
-Si registra inversión: REGISTRO_INV: TICKER|MARGEN|PPC|CANTIDAD|FECHA|TIPO_POS|LEV|LIQ
-Si no entendés: pedí /help. Máximo 2 oraciones.
+Comandos válidos: /gastos /vs /fijos /delivery /mes /resumen /riesgo /objetivos /mensual /spy /grafico /activos /analisis /precio /excel /briefing /torta
+Si el usuario carga un gasto o ingreso, UNA línea completa (nunca "REGIST" solo):
+REGISTRO_ARS: GASTO|2125.4|Transporte|SUBE|2026-09-29
+Formato: REGISTRO_ARS: TIPO|MONTO|CATEGORIA|DESCRIPCION|YYYY-MM-DD
+Inversión: REGISTRO_INV: TICKER|MARGEN|PPC|CANTIDAD|FECHA|SPOT|1|
+Si no entendés: Pedí /help. Máximo 1 oración extra además de la línea especial.
 """
 
 # ==================== FLUJO INTERACTIVO DE IMPORTACIÓN Y CONCILIACIÓN ====================
@@ -4413,6 +4471,14 @@ async def intentar_comando_local(update: Update, user_id: int, user_msg: str) ->
     if parsear_pedido_proyeccion(raw):
         await update.message.reply_text(texto_analisis_proyeccion(user_id, raw))
         return True
+    reg = parsear_registro_manual(raw)
+    if reg:
+        guardar_movimiento(user_id, reg["tipo"], reg["monto"], reg["categoria"], reg["descripcion"], reg.get("fecha"))
+        ftxt = f" ({reg['fecha']})" if reg.get("fecha") else ""
+        await update.message.reply_text(
+            f"✅ {reg['tipo'].title()} {reg['categoria']}: ${reg['monto']:,.2f} ARS — {reg['descripcion']}{ftxt}"
+        )
+        return True
 
     aprendido = buscar_comando_por_frase(user_id, raw)
     if aprendido:
@@ -4445,6 +4511,20 @@ async def intentar_comando_local(update: Update, user_id: int, user_msg: str) ->
     if cmd in ("delivery", "pedidosya", "pedidos") or re.search(r"\b(como va(n)? delivery|gastos? de delivery)\b", low):
         await update.message.reply_text(texto_alerta_delivery(user_id))
         return True
+    m_tf = re.match(r"^([a-zA-Z0-9.-]{2,12})\s+(4h|4hs|diario|semanal|1w|1d)$", low)
+    if m_tf:
+        tk_at = m_tf.group(1).upper().replace("-USD", "")
+        if tk_at not in {"MES", "VS", "OK", "NO", "SI", "SÍ"}:
+            tf_at = "4h" if m_tf.group(2) in ("4h", "4hs") else ("semanal" if m_tf.group(2) in ("semanal", "1w") else "diario")
+            await update.message.reply_text(f"📈 Armando {tk_at} {tf_at}…")
+            buf_img, info_at = generar_grafico_analisis_tecnico(tk_at, tf_at, False, False)
+            if buf_img and info_at and not isinstance(info_at, str):
+                await update.message.reply_photo(photo=buf_img, caption=f"📈 {tk_at} ({tf_at}) POC + Pivots + RSI")
+                await update.message.reply_text(formatear_reporte_tecnico(info_at))
+            else:
+                await update.message.reply_text(f"No pude analizar {tk_at} en {tf_at}.")
+            return True
+
     if cmd in ("briefing", "premarket"):
         if not es_dia_habil_arg():
             await update.message.reply_text("El briefing automático es solo días hábiles. El lunes a las 08:30 ART.")
@@ -4764,8 +4844,20 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         prompt = f'Texto del usuario:\n"{user_msg[:240]}"'
-        reply = llamar_gemini(prompt, SYSTEM_INSTRUCTION)
-        
+        reply = llamar_gemini(prompt, SYSTEM_INSTRUCTION) or ""
+
+        # Si Gemini recortó REGISTRO_*, no muestres basura: Python reintenta.
+        if re.match(r"^regist", reply.strip(), re.I) and "REGISTRO_ARS:" not in reply and "REGISTRO_INV:" not in reply:
+            reg = parsear_registro_manual(user_msg)
+            if reg:
+                guardar_movimiento(user_id, reg["tipo"], reg["monto"], reg["categoria"], reg["descripcion"], reg.get("fecha"))
+                ftxt = f" ({reg['fecha']})" if reg.get("fecha") else ""
+                await update.message.reply_text(
+                    f"✅ {reg['tipo'].title()} {reg['categoria']}: ${reg['monto']:,.2f} ARS — {reg['descripcion']}{ftxt}"
+                )
+                return
+            reply = "No pude registrar eso. Probá: 'Registra gasto Transporte SUBE 2125,4 el 29/9/2026'"
+
         m_cmd = re.search(r"COMANDO:\s*(\S+)(?:[^\S\r\n]+([^\r\n]+))?", reply)
         cmd_para_ejecutar = None
         if m_cmd:
@@ -4820,15 +4912,24 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             linea_ars = match_ars.group(1).strip()
             reply = reply.replace(match_ars.group(0), "").strip()
             partes = [p.strip() for p in linea_ars.split("|")]
-            tipo = partes[0]
-            monto = float(partes[1])
-            categoria = normalizar_categoria(partes[2])
-            descripcion = partes[3]
-            f_gasto = partes[4].split()[0] if len(partes) > 4 and partes[4] not in ["0", "", "None"] else None
-            
-            guardar_movimiento(user_id, tipo, monto, categoria, descripcion, f_gasto)
-            fecha_str = f" — {f_gasto}" if f_gasto else ""
-            reply = f"{reply}\n\n✅ Guardado: {tipo} de ${monto:,.2f} ARS en {categoria}{fecha_str}".strip()
+            try:
+                if len(partes) < 4:
+                    raise ValueError("linea incompleta")
+                tipo = partes[0]
+                monto = float(partes[1].replace(",", "."))
+                categoria = normalizar_categoria(partes[2])
+                descripcion = partes[3]
+                f_gasto = partes[4].split()[0] if len(partes) > 4 and partes[4] not in ["0", "", "None"] else None
+                guardar_movimiento(user_id, tipo, monto, categoria, descripcion, f_gasto)
+                fecha_str = f" — {f_gasto}" if f_gasto else ""
+                reply = f"{reply}\n\n✅ Guardado: {tipo} de ${monto:,.2f} ARS en {categoria}{fecha_str}".strip()
+            except Exception:
+                reg = parsear_registro_manual(user_msg)
+                if reg:
+                    guardar_movimiento(user_id, reg["tipo"], reg["monto"], reg["categoria"], reg["descripcion"], reg.get("fecha"))
+                    reply = f"✅ {reg['tipo'].title()} {reg['categoria']}: ${reg['monto']:,.2f} ARS — {reg['descripcion']}"
+                else:
+                    reply = "No pude registrar el movimiento. Escribí: registra gasto CATEGORIA desc MONTO el DD/MM/AAAA"
 
         m_close_pos = re.search(r"ACCION: CERRAR_POSICION\|(\d+)(?:\|([^|\n\r]*))?(?:\|([^\n\r]*))?", reply)
         if m_close_pos:
@@ -4846,7 +4947,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply += f"\n\n⚠️ No se pudo cerrar: {msg_cierre}"
 
         texto_limpio = limpiar_estilo_telegram(reply)
-        if texto_limpio:
+        if texto_limpio and not re.match(r"^regist\b", texto_limpio.strip(), re.I):
             await update.message.reply_text(texto_limpio)
 
         if cmd_para_ejecutar:
