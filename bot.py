@@ -1382,8 +1382,8 @@ def resolver_fecha_inicio(periodo_str: str, fecha_compra_db: str = None):
 # ==================== OPERACIONES DE MOVIMIENTOS ARS ====================
 def guardar_movimiento(user_id: int, tipo: str, monto: float, categoria: str, descripcion: str, fecha_str: str = None):
     tipo = tipo.strip().upper()
-    categoria = normalizar_categoria(categoria)
-    descripcion = descripcion.strip()
+    categoria = str(normalizar_categoria(categoria))[:50]
+    descripcion = (descripcion or "").strip()[:240]
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
             if fecha_str:
@@ -1402,9 +1402,12 @@ def guardar_movimiento(user_id: int, tipo: str, monto: float, categoria: str, de
 
 def parsear_registro_manual(texto: str):
     low = (texto or "").lower().strip()
-    if not re.search(r"\b(registr(a|ar|ame)|anot(a|ar|ame)|carg(a|ar)|gaste|gasté|pague|pagué|pagué|pago de)\b", low):
+    if not re.search(
+        r"\b(registr(a|á|ar|ame)|anot(a|á|ar|ame)|carg(a|á|ar)|gaste|gasté|pague|pagué|pago|un pago)\b",
+        low,
+    ):
         return None
-    if re.search(r"\b(vacaciones|viaje|presupuesto)\b", low):
+    if re.search(r"\b(vacaciones|viaje|presupuesto|activar|desactivar)\b", low):
         return None
     tipo = "INGRESO" if re.search(r"\b(ingreso|cobre|cobré|me depositaron|sueldo)\b", low) else "GASTO"
     fecha = None
@@ -1423,12 +1426,16 @@ def parsear_registro_manual(texto: str):
         except Exception:
             fecha = None
     monto = None
-    m_m = re.search(r"(?:de\s+|\$\s*)(\d[\d.]*)([,]\d{1,2})?", low)
+    m_m = re.search(r"(?:de\s+|\$\s*)(\d[\d.]*)([,]\d+)?", low)
     if not m_m:
         m_m = re.search(r"\b(\d[\d.]*)([,]\d{1,2})\b", low)
+    if not m_m:
+        m_m = re.search(r"\b(\d{3,})(?:[,.](\d{1,2}))?\b", low)
     if m_m:
-        entero = m_m.group(1).replace(".", "")
-        dec = (m_m.group(2) or "").replace(",", ".")
+        entero = re.sub(r"[^\d]", "", m_m.group(1) or "0")
+        dec = ""
+        if m_m.lastindex and m_m.lastindex >= 2 and m_m.group(2):
+            dec = "." + re.sub(r"[^\d]", "", m_m.group(2))
         try:
             monto = float(entero + dec)
         except Exception:
@@ -1436,22 +1443,34 @@ def parsear_registro_manual(texto: str):
     if monto is None or monto <= 0:
         return None
     cat = "Otros"
-    desc = re.sub(r"\b(registr(a|ar|ame)|un|una|pago|en|de|el|la|los)\b", " ", low)
+    if "sube" in low or "uber" in low or "transporte" in low:
+        cat = "Transporte"
+    elif "pedidos ya market" in low:
+        cat = "Supermercado"
+    elif "pedidos" in low or "delivery" in low:
+        cat = "Delivery"
+    else:
+        hallada = None
+        for canon in CATEGORIAS_VALIDAS if "CATEGORIAS_VALIDAS" in dir() else []:
+            if str(canon).lower() in low:
+                hallada = canon
+                break
+        if hallada:
+            cat = hallada
+        else:
+            cat = "Otros"
+    desc = re.sub(r"\b(registr(a|á|ar|ame)|gasto|ingreso|un|una|pago|en|de|el|la|los|desc)\b", " ", low)
     desc = re.sub(r"\d[\d./,-]*", " ", desc)
-    desc = re.sub(r"\s+", " ", desc).strip()[:80] or "Movimiento"
-    for alias, canon in ALIASES.items() if "ALIASES" in dir() else []:
-        pass
-    cat = normalizar_categoria(low)
-    if cat == "Otros" or cat == low:
-        if "sube" in low or "uber" in low or "transporte" in low:
-            cat = "Transporte"
-        elif "pedidos ya market" in low:
-            cat = "Supermercado"
-        elif "pedidos" in low or "delivery" in low:
-            cat = "Delivery"
+    desc = re.sub(r"\s+", " ", desc).strip()[:80] or cat
     if "sube" in low and "sube" not in desc.lower():
         desc = f"SUBE {desc}".strip()
-    return {"tipo": tipo, "monto": monto, "categoria": cat, "descripcion": desc[:80], "fecha": fecha}
+    return {
+        "tipo": tipo,
+        "monto": monto,
+        "categoria": str(cat)[:50],
+        "descripcion": desc[:80],
+        "fecha": fecha,
+    }
 
 # ==================== MOTOR CUANTITATIVO DE FINANZAS PERSONALES (ARS) ====================
 def calcular_metricas_finanzas_completas(user_id: int, meses_lookback: int = 6):
@@ -4842,12 +4861,21 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Decime /gastos, /mes, /torta, /vs o /help.")
         return
 
+    reg_directo = parsear_registro_manual(user_msg)
+    if reg_directo:
+        guardar_movimiento(user_id, reg_directo["tipo"], reg_directo["monto"], reg_directo["categoria"], reg_directo["descripcion"], reg_directo.get("fecha"))
+        ftxt = f" ({reg_directo['fecha']})" if reg_directo.get("fecha") else ""
+        await update.message.reply_text(
+            f"✅ {reg_directo['tipo'].title()} {reg_directo['categoria']}: ${reg_directo['monto']:,.2f} ARS — {reg_directo['descripcion']}{ftxt}"
+        )
+        return
+
     try:
         prompt = f'Texto del usuario:\n"{user_msg[:240]}"'
         reply = llamar_gemini(prompt, SYSTEM_INSTRUCTION) or ""
 
         # Si Gemini recortó REGISTRO_*, no muestres basura: Python reintenta.
-        if re.match(r"^regist", reply.strip(), re.I) and "REGISTRO_ARS:" not in reply and "REGISTRO_INV:" not in reply:
+        if re.search(r"regist", reply, re.I) and "REGISTRO_ARS:" not in reply and "REGISTRO_INV:" not in reply:
             reg = parsear_registro_manual(user_msg)
             if reg:
                 guardar_movimiento(user_id, reg["tipo"], reg["monto"], reg["categoria"], reg["descripcion"], reg.get("fecha"))
