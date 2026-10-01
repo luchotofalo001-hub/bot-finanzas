@@ -1086,6 +1086,99 @@ def normalizar_frase(texto: str) -> str:
     t = re.sub(r"\s+", " ", t).strip()
     return t[:180]
 
+COMANDOS_FRASE = {
+    "gastos", "vs", "fijos", "delivery", "mes", "resumen", "riesgo", "objetivos",
+    "mensual", "spy", "grafico", "activos", "analisis", "precio", "excel",
+    "briefing", "torta", "silencio", "ayuda", "help", "pie",
+}
+_ALIAS_CMD = {
+    "análisis": "analisis", "gráfico": "grafico", "grafica": "grafico",
+    "técnico": "analisis", "tecnico": "analisis", "cotizacion": "precio",
+    "cotización": "precio", "cartera": "resumen", "balance": "resumen",
+}
+
+def sanitizar_comando_derivado(texto_cmd: str) -> str:
+    t = re.sub(r"\s+", " ", (texto_cmd or "").strip().lstrip("/")).strip()
+    if not t:
+        return ""
+    parts = t.split()
+    cmd = _ALIAS_CMD.get(parts[0].lower().strip(".,:;"), parts[0].lower().strip(".,:;"))
+    if cmd not in COMANDOS_FRASE:
+        return ""
+    args = parts[1:]
+    if cmd == "analisis":
+        tk = ""
+        tf = "diario"
+        for a in args:
+            al = a.lower().strip(".,")
+            if al in ("diario", "1d"):
+                tf = "diario"
+            elif al in ("semanal", "1w", "semana"):
+                tf = "semanal"
+            elif al in ("4h", "4hs"):
+                tf = "4h"
+            elif re.fullmatch(r"[A-Za-z]{1,6}\d{0,2}", a) and not tk:
+                tk = a.upper().replace("-USD", "")
+        return f"analisis {tk} {tf}".strip() if tk else "analisis"
+    if cmd == "precio" and args:
+        tk = args[0].upper().replace("-USD", "")
+        if re.fullmatch(r"[A-Z]{1,6}\d{0,2}", tk):
+            return f"precio {tk}"
+        return "precio"
+    if cmd == "torta" and args and re.search(r"cartera|invers|usd|activo", " ".join(args), re.I):
+        return "torta cartera"
+    if cmd == "spy":
+        per = " ".join(args[:2]).lower()
+        return f"spy {per}".strip()
+    return cmd
+
+def plantilla_de_frase(frase: str, comando: str) -> str:
+    parts = (comando or "").split()
+    if len(parts) < 2:
+        return ""
+    tk = parts[1].upper()
+    nueva = frase
+    nueva = re.sub(rf"\b{re.escape(tk.lower())}\b", "{TK}", nueva)
+    if "{TK}" not in nueva and tk == "GOOGL":
+        nueva = re.sub(r"\bgoogle\b", "{TK}", nueva)
+    if "{TK}" not in nueva:
+        return ""
+    return nueva
+
+def guardar_frase_comando(user_id: int, texto: str, comando: str):
+    frase = normalizar_frase(texto)
+    cmd = sanitizar_comando_derivado(comando)
+    if not frase or not cmd or frase == cmd or len(frase) < 3:
+        return
+    if frase.split()[0] == cmd.split()[0] and len(frase.split()) == 1:
+        return
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """INSERT INTO mapeo_frases (user_id, frase, comando, usos)
+                       VALUES (%s, %s, %s, 1)
+                       ON CONFLICT (user_id, frase)
+                       DO UPDATE SET comando = EXCLUDED.comando, usos = mapeo_frases.usos + 1;""",
+                    (user_id, frase, cmd),
+                )
+                tpl = plantilla_de_frase(frase, cmd)
+                if tpl and "{TK}" in tpl:
+                    cmd_tpl = cmd
+                    partes = cmd.split()
+                    if len(partes) >= 2:
+                        cmd_tpl = cmd.replace(partes[1], "{TK}")
+                    cursor.execute(
+                        """INSERT INTO mapeo_frases (user_id, frase, comando, usos)
+                           VALUES (%s, %s, %s, 1)
+                           ON CONFLICT (user_id, frase)
+                           DO UPDATE SET comando = EXCLUDED.comando, usos = mapeo_frases.usos + 1;""",
+                        (user_id, "tpl:" + tpl, cmd_tpl),
+                    )
+                conn.commit()
+    except Exception as e:
+        logger.warning(f"guardar_frase_comando: {e}")
+
 def buscar_comando_por_frase(user_id: int, texto: str) -> str:
     frase = normalizar_frase(texto)
     if not frase:
@@ -1104,31 +1197,45 @@ def buscar_comando_por_frase(user_id: int, texto: str) -> str:
                         (user_id, frase),
                     )
                     conn.commit()
-                    return str(row[0]).strip()
+                    return sanitizar_comando_derivado(str(row[0]))
+                cursor.execute(
+                    "SELECT frase, comando FROM mapeo_frases WHERE user_id = %s AND frase LIKE 'tpl:%%';",
+                    (user_id,),
+                )
+                for frase_tpl, comando in cursor.fetchall():
+                    tpl = str(frase_tpl)[4:]
+                    rx = "^" + re.escape(tpl).replace(r"\{TK\}", r"([a-z0-9]{1,10})") + "$"
+                    m = re.fullmatch(rx, frase)
+                    if not m:
+                        continue
+                    tk = m.group(1).upper()
+                    cmd = str(comando).replace("{TK}", tk)
+                    cursor.execute(
+                        "UPDATE mapeo_frases SET usos = COALESCE(usos,1)+1 WHERE user_id = %s AND frase = %s;",
+                        (user_id, frase_tpl),
+                    )
+                    conn.commit()
+                    return sanitizar_comando_derivado(cmd)
     except Exception as e:
         logger.warning(f"buscar_comando_por_frase: {e}")
     return ""
 
-def guardar_frase_comando(user_id: int, texto: str, comando: str):
-    frase = normalizar_frase(texto)
-    cmd = (comando or "").strip().lstrip("/")
-    if not frase or not cmd or frase == cmd or len(frase) < 3:
-        return
-    if frase.split()[0] == cmd.split()[0] and len(frase.split()) == 1:
-        return
-    try:
-        with get_db_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    """INSERT INTO mapeo_frases (user_id, frase, comando, usos)
-                       VALUES (%s, %s, %s, 1)
-                       ON CONFLICT (user_id, frase)
-                       DO UPDATE SET comando = EXCLUDED.comando, usos = mapeo_frases.usos + 1;""",
-                    (user_id, frase, cmd),
-                )
-                conn.commit()
-    except Exception as e:
-        logger.warning(f"guardar_frase_comando: {e}")
+def extraer_comando_de_respuesta(reply: str) -> str:
+    texto = reply or ""
+    m = re.search(r"COMANDO:\s*/?([^\n\r]+)", texto, re.I)
+    if m:
+        limpio = sanitizar_comando_derivado(m.group(1))
+        if limpio:
+            return limpio
+    m2 = re.search(
+        r"\b(analisis|análisis|precio|gastos|resumen|spy|torta|riesgo|mes|objetivos|mensual|excel|briefing|fijos|delivery|vs)\b(?:\s+([A-Za-z0-9]{1,8}))?(?:\s+(diario|semanal|4h|4hs))?",
+        texto,
+        re.I,
+    )
+    if m2:
+        blob = " ".join(p for p in m2.groups() if p)
+        return sanitizar_comando_derivado(blob)
+    return ""
 
 # Frases fijas (0 tokens). Las más específicas van primero.
 REGLAS_INTENTO = [
@@ -1164,6 +1271,32 @@ def resolver_intencion(texto: str) -> str:
         if re.search(pat, low):
             return cmd
     return ""
+
+_STOP_TICKER_NL = {
+    "EN", "DE", "DEL", "EL", "LA", "LOS", "LAS", "UN", "UNA", "ME", "MI", "AL",
+    "DIARIO", "SEMANAL", "SEMANA", "4H", "4HS", "1D", "1W", "FIBO", "FIBONACCI",
+    "TECNICO", "TECNICA", "ANALISIS", "ANALIZA", "ANALIZAME", "ANALIZAR", "AT",
+    "COMO", "VES", "VER", "HOY", "AYER", "POR", "FAVOR", "GRAFICO", "CHART",
+}
+
+def extraer_pedido_analisis(texto: str):
+    low = normalizar_frase(texto)
+    if not low:
+        return None
+    if not re.search(r"\b(analiz\w*|an[aá]lisis|c[oó]mo ves|como ves|fijate|f[ií]jate|mira|chart|t[eé]cnico de)\b", low):
+        return None
+    tf = "diario"
+    if re.search(r"\b(4h|4hs)\b", low):
+        tf = "4h"
+    elif re.search(r"\b(semanal|semana|1w|weekly)\b", low):
+        tf = "semanal"
+    for tok in re.findall(r"[a-z0-9.\-]{2,12}", low):
+        u = tok.upper().replace("-USD", "")
+        if u in _STOP_TICKER_NL or u.isdigit():
+            continue
+        if re.fullmatch(r"[A-Z]{1,6}\d{0,2}", u):
+            return u, tf
+    return None
 
 def registrar_rechazo_concepto(user_id: int, clave: str):
     if not clave or len(clave) < 3:
@@ -4272,15 +4405,21 @@ async def tarea_alertas_periodicas(app):
         await asyncio.sleep(15 * 60)
 
 # ==================== SYSTEM INSTRUCTION PARA IA ====================
-SYSTEM_INSTRUCTION = """Sos un router. NO calcules. NO inventes montos. NO recortes las líneas especiales.
-Si pide un reporte, UNA línea exacta:
-COMANDO: /gastos
+SYSTEM_INSTRUCTION = """Sos un router de comandos. Una sola línea, en español. Sin explicaciones. Sin inglés.
+Si es una orden o reporte, devolvé exactamente:
+COMANDO: /analisis GOOGL diario
+El ticker va en mayúsculas. La temporalidad solo puede ser diario, semanal o 4h.
+Ejemplos:
+- "analiza googl en diario" -> COMANDO: /analisis GOOGL diario
+- "fijate meli semanal" -> COMANDO: /analisis MELI semanal
+- "a cuanto esta btc" -> COMANDO: /precio BTC
+- "como vengo de gastos" -> COMANDO: /gastos
+- "torta de la cartera" -> COMANDO: /torta cartera
+- "vs el ciclo anterior" -> COMANDO: /vs
 Comandos válidos: /gastos /vs /fijos /delivery /mes /resumen /riesgo /objetivos /mensual /spy /grafico /activos /analisis /precio /excel /briefing /torta
-Si el usuario carga un gasto o ingreso, UNA línea completa (nunca "REGIST" solo):
+Si es un gasto o ingreso:
 REGISTRO_ARS: GASTO|2125.4|Transporte|SUBE|2026-09-29
-Formato: REGISTRO_ARS: TIPO|MONTO|CATEGORIA|DESCRIPCION|YYYY-MM-DD
-Inversión: REGISTRO_INV: TICKER|MARGEN|PPC|CANTIDAD|FECHA|SPOT|1|
-Si no entendés: Pedí /help. Máximo 1 oración extra además de la línea especial.
+Si no entendés: una sola oración pidiendo /help.
 """
 
 # ==================== FLUJO INTERACTIVO DE IMPORTACIÓN Y CONCILIACIÓN ====================
@@ -4822,6 +4961,25 @@ async def intentar_comando_local(update: Update, user_id: int, user_msg: str) ->
         raw = aprendido
         low = aprendido.lower()
 
+    pedido_at = extraer_pedido_analisis(raw)
+    if pedido_at:
+        tk_at, tf_at = pedido_at
+        await update.message.reply_text(f"📈 Armando {tk_at} {tf_at}…")
+        buf_img, info_at = generar_grafico_analisis_tecnico(tk_at, tf_at, "fibo" in low, "fibo" in low)
+        if buf_img and info_at and not isinstance(info_at, str):
+            await update.message.reply_photo(photo=buf_img, caption=f"📈 {tk_at} ({tf_at}) POC + Pivots + RSI")
+            await update.message.reply_text(formatear_reporte_tecnico(info_at))
+        else:
+            await update.message.reply_text(f"No pude analizar {tk_at} en {tf_at}.")
+        return True
+
+    m_px = re.search(r"\b(?:precio|coti|cotizaci[oó]n|a cu[aá]nto (?:esta|está|cotiza))\s+(?:de\s+|el\s+|la\s+)?([a-z0-9]{1,8})\b", low)
+    if m_px:
+        tk_px = m_px.group(1).upper()
+        if tk_px not in {"DE", "EL", "LA", "HOY", "MES"} and not tk_px.isdigit():
+            raw = f"precio {tk_px}"
+            low = raw.lower()
+
     partes = raw.split()
     cmd = partes[0].lower() if partes else ""
     args = " ".join(partes[1:]) if len(partes) > 1 else ""
@@ -5004,13 +5162,21 @@ async def intentar_comando_local(update: Update, user_id: int, user_msg: str) ->
             await update.message.reply_text(f"No pude analizar {tk}.")
         return True
 
-    m_an = re.match(r"^(?:(?:analiza(?:me)?|an[aá]lisis(?:\\s+t[eé]cnico)?|c[oó]mo\\s+ves|at)\s+)?([a-zA-Z0-9]{2,10})(?:\\s+(diario|semanal|4h))?$", low)
+    m_an = re.search(
+        r"\b(?:analiz\w*|an[aá]lisis|c[oó]mo ves)\s+([a-z0-9]{2,10})(?:\s+(?:en\s+)?)?(diario|semanal|4h|4hs)?\b",
+        low,
+    )
     if m_an:
         posible_tk = m_an.group(1).upper()
-        palabras_comunes = {"HOLA", "BUENAS", "GRACIAS", "OK", "RESET", "AYUDA", "MES", "GASTOS", "RESUMEN", "CARTERA", "OBJETIVOS", "RIESGO", "FINANZAS", "HORMIGA", "MENSUAL"}
+        palabras_comunes = {"HOLA", "BUENAS", "GRACIAS", "OK", "RESET", "AYUDA", "MES", "GASTOS", "RESUMEN", "CARTERA", "OBJETIVOS", "RIESGO", "FINANZAS", "HORMIGA", "MENSUAL", "EN", "DE"}
         if posible_tk not in palabras_comunes and not posible_tk.isdigit():
             tk = posible_tk
-            tf_at = m_an.group(2) or "diario"
+            tf_raw = (m_an.group(2) or "").lower()
+            tf_at = "4h" if tf_raw in ("4h", "4hs") else ("semanal" if tf_raw == "semanal" else "diario")
+            if "sem" in low:
+                tf_at = "semanal"
+            if "4h" in low:
+                tf_at = "4h"
             con_fibo = "fibo" in low
             buf_img, info_at = generar_grafico_analisis_tecnico(tk, tf_at, con_fibo, con_fibo)
             if buf_img and info_at and not isinstance(info_at, str):
@@ -5194,6 +5360,16 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         prompt = f'Texto del usuario:\n"{user_msg[:240]}"'
         reply = llamar_gemini(prompt, SYSTEM_INSTRUCTION) or ""
+        cmd_para_ejecutar = extraer_comando_de_respuesta(reply)
+        if cmd_para_ejecutar:
+            guardar_frase_comando(user_id, user_msg, cmd_para_ejecutar)
+            await intentar_comando_local(update, user_id, cmd_para_ejecutar)
+            return
+
+        pedido_at = extraer_pedido_analisis(user_msg)
+        if pedido_at:
+            await intentar_comando_local(update, user_id, user_msg)
+            return
 
         # Si Gemini recortó REGISTRO_*, no muestres basura: Python reintenta.
         if re.search(r"regist", reply, re.I) and "REGISTRO_ARS:" not in reply and "REGISTRO_INV:" not in reply:
@@ -5209,12 +5385,13 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             reply = "No pude registrar eso. Probá: 'Registra gasto Transporte SUBE 2125,4 el 29/9/2026'"
 
-        m_cmd = re.search(r"COMANDO:\s*(\S+)(?:[^\S\r\n]+([^\r\n]+))?", reply)
-        cmd_para_ejecutar = None
-        if m_cmd:
+        m_cmd = re.search(r"COMANDO:\s*/?(\S+)(?:[^\S\r\n]+([^\r\n]+))?", reply)
+        cmd_para_ejecutar = extraer_comando_de_respuesta(reply)
+        if m_cmd and not cmd_para_ejecutar:
             cmd_name = m_cmd.group(1).strip()
             cmd_args = m_cmd.group(2).strip() if m_cmd.group(2) else ""
-            cmd_para_ejecutar = f"{cmd_name} {cmd_args}".strip()
+            cmd_para_ejecutar = sanitizar_comando_derivado(f"{cmd_name} {cmd_args}")
+        if m_cmd:
             reply = reply.replace(m_cmd.group(0), "").strip()
 
         match_tc = re.search(r"REGISTRO_TRADE_CERRADO:\s*([^\n\r]+)", reply)
@@ -5301,7 +5478,8 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply += f"\n\n⚠️ No se pudo cerrar: {msg_cierre}"
 
         texto_limpio = limpiar_estilo_telegram(reply)
-        if texto_limpio and not re.match(r"^regist\b", texto_limpio.strip(), re.I):
+        charla = bool(re.search(r"let's check|vamos a ver si|checking if", texto_limpio or "", re.I))
+        if texto_limpio and not charla and not cmd_para_ejecutar and not re.match(r"^regist\b", texto_limpio.strip(), re.I):
             await update.message.reply_text(texto_limpio)
 
         if cmd_para_ejecutar:
