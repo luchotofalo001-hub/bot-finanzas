@@ -2604,22 +2604,66 @@ def calcular_pivots_y_niveles(df, ventana=4):
                 estructura_txt = f"Rango lateral / compresión entre ${last_low:,.2f} y ${last_high:,.2f}"
                 estructura_bias = "lateral"
 
+    fibo_info = None
     fibo_niveles = {}
-    if pivots_h and pivots_l:
-        last_ph_idx, last_ph = pivots_h[-1]
-        last_pl_idx, last_pl = pivots_l[-1]
-        diff = abs(last_ph - last_pl)
-        if diff > 0:
-            if last_ph_idx > last_pl_idx:
-                fibo_niveles["0.382"] = last_ph - 0.382 * diff
-                fibo_niveles["0.500"] = last_ph - 0.500 * diff
-                fibo_niveles["Golden Pocket 0.618"] = last_ph - 0.618 * diff
-                fibo_niveles["Ext 1.618"] = last_ph + 0.618 * diff
-            else:
-                fibo_niveles["0.382"] = last_pl + 0.382 * diff
-                fibo_niveles["0.500"] = last_pl + 0.500 * diff
-                fibo_niveles["Golden Pocket 0.618"] = last_pl + 0.618 * diff
-                fibo_niveles["Ext 1.618"] = last_pl - 0.618 * diff
+    eventos = [(ts, float(val), "H") for ts, val in pivots_h] + [(ts, float(val), "L") for ts, val in pivots_l]
+    eventos.sort(key=lambda x: x[0])
+    if len(eventos) >= 2:
+        fin = eventos[-1]
+        inicio = None
+        for ev in reversed(eventos[:-1]):
+            if ev[2] != fin[2]:
+                inicio = ev
+                break
+        if inicio is not None:
+            p0, p1 = float(inicio[1]), float(fin[1])
+            diff = p1 - p0
+            if abs(diff) > 0:
+                alcista = diff > 0
+                retro = {
+                    "0.382": p1 - 0.382 * diff,
+                    "0.500": p1 - 0.500 * diff,
+                    "0.618": p1 - 0.618 * diff,
+                    "0.786": p1 - 0.786 * diff,
+                }
+                ext = {
+                    "1.272": p0 + 1.272 * diff,
+                    "1.618": p0 + 1.618 * diff,
+                }
+                dentro = (min(p0, p1) <= precio_actual <= max(p0, p1))
+                roto_fin = precio_actual > max(p0, p1) if alcista else precio_actual < min(p0, p1)
+                invalidado = precio_actual < min(p0, p1) if alcista else precio_actual > max(p0, p1)
+                if invalidado:
+                    estado = "el tramo quedó invalidado: el precio volvió detrás del origen"
+                    uso = "ninguno"
+                elif roto_fin:
+                    estado = "el precio superó el extremo del tramo: usar extensiones"
+                    uso = "extension"
+                elif dentro:
+                    estado = "el precio está dentro del tramo: usar retrocesos"
+                    uso = "retroceso"
+                else:
+                    estado = "tramo vigente"
+                    uso = "retroceso"
+                fibo_info = {
+                    "direccion": "alcista" if alcista else "bajista",
+                    "desde": p0,
+                    "hasta": p1,
+                    "desde_fecha": pd.Timestamp(inicio[0]).strftime("%d/%m/%Y"),
+                    "hasta_fecha": pd.Timestamp(fin[0]).strftime("%d/%m/%Y"),
+                    "uso": uso,
+                    "estado": estado,
+                    "retrocesos": retro,
+                    "extensiones": ext,
+                }
+                fibo_niveles = {
+                    "Ret 0.382": retro["0.382"],
+                    "Ret 0.500": retro["0.500"],
+                    "Ret 0.618": retro["0.618"],
+                    "Ret 0.786": retro["0.786"],
+                    "Ext 1.272": ext["1.272"],
+                    "Ext 1.618": ext["1.618"],
+                }
 
     return {
         "res_inmediata": res_inmediata,
@@ -2628,8 +2672,59 @@ def calcular_pivots_y_niveles(df, ventana=4):
         "sop_segundo": sop_segundo,
         "estructura_txt": estructura_txt,
         "estructura_bias": estructura_bias,
-        "fibo_niveles": fibo_niveles
+        "fibo_niveles": fibo_niveles,
+        "fibo_info": fibo_info,
     }
+
+def calcular_tendencias(df, tf_label: str):
+    close = df["Close"].dropna()
+    px = float(close.iloc[-1])
+    if tf_label == "Semanal":
+        ventanas = [
+            ("muy corto plazo", 8, "~2 meses"),
+            ("mediano plazo", 26, "~6 meses"),
+            ("largo plazo", 104, "~2 años"),
+        ]
+    elif tf_label == "4 Horas":
+        ventanas = [
+            ("muy corto plazo", 12, "~1 semana"),
+            ("mediano plazo", 40, "~3-4 semanas"),
+            ("largo plazo", 80, "~2 meses"),
+        ]
+    else:
+        ventanas = [
+            ("muy corto plazo", 10, "~2 semanas"),
+            ("mediano plazo", 70, "~3-4 meses"),
+            ("largo plazo", 200, "~10-12 meses"),
+        ]
+    out = []
+    for nombre, barras, etiqueta in ventanas:
+        n = min(barras, len(close))
+        if n < 5:
+            continue
+        base = float(close.iloc[-n])
+        ret = (px / base - 1.0) * 100.0 if base else 0.0
+        media = float(close.iloc[-n:].mean())
+        umbral = 2.0 if barras <= 15 else (4.0 if barras <= 80 else 6.0)
+        if px > media and ret >= umbral:
+            sesgo = "alcista"
+        elif px < media and ret <= -umbral:
+            sesgo = "bajista"
+        elif abs(ret) < umbral:
+            sesgo = "lateral"
+        elif px >= media:
+            sesgo = "alcista débil"
+        else:
+            sesgo = "bajista débil"
+        out.append({
+            "nombre": nombre,
+            "barras": n,
+            "etiqueta": etiqueta,
+            "sesgo": sesgo,
+            "ret": ret,
+            "media": media,
+        })
+    return out
 
 def calcular_poc_volumen(df, barras_lookback=90, bins_count=40):
     if "Volume" not in df.columns or df["Volume"].sum() == 0:
@@ -2797,7 +2892,6 @@ def formatear_reporte_tecnico(info):
     e200 = info['ema200']
     rsi = info['rsi']
     diag_rsi = info['diagnostico_rsi']
-    fibo = info.get('fibo_niveles', {})
     poc = info.get('poc')
     hist_stat = info.get('hist_stat')
     
@@ -2826,6 +2920,15 @@ def formatear_reporte_tecnico(info):
         lineas.append(f"• POC (Mayor volumen): ${poc:,.2f} ({signo}{dist_poc:.1f}% → {lado_poc})")
 
     lineas.append("")
+    lineas.append("📐 Tendencia por plazo")
+    for t in info.get("tendencias") or []:
+        em = "🟢" if "alcista" in t["sesgo"] else ("🔴" if "bajista" in t["sesgo"] else "🟡")
+        signo = "+" if t["ret"] >= 0 else ""
+        lineas.append(
+            f"• {em} {t['nombre'].capitalize()} ({t['etiqueta']}): {t['sesgo']} · {signo}{t['ret']:.1f}% en {t['barras']} velas"
+        )
+
+    lineas.append("")
     lineas.append("🌊 Medias Móviles")
     if p > e20 and e20 > e50:
         lineas.append(f"• Sesgo dinámico: Alcista sólido (Precio > EMA20 ${e20:,.2f} > EMA50 ${e50:,.2f})")
@@ -2846,15 +2949,30 @@ def formatear_reporte_tecnico(info):
         cruce = "histograma verde (+)" if (macd_hist or 0) >= 0 else "histograma rojo (-)"
         lineas.append(f"• MACD: {cruce} (Hist: {macd_hist:+.4f})")
 
+    fibo = info.get("fibo_info") or {}
     if fibo:
         lineas.append("")
-        lineas.append("🎯 Fibonacci del Último Impulso")
-        if "Golden Pocket 0.618" in fibo and not np.isnan(fibo['Golden Pocket 0.618']):
-            lineas.append(f"• Golden Pocket 0.618: ${fibo['Golden Pocket 0.618']:,.2f}")
-        if "0.500" in fibo and not np.isnan(fibo['0.500']):
-            lineas.append(f"• 50% Retroceso: ${fibo['0.500']:,.2f}")
-        if "Ext 1.618" in fibo and not np.isnan(fibo['Ext 1.618']):
-            lineas.append(f"• Objetivo Extensión 1.618: ${fibo['Ext 1.618']:,.2f}")
+        dire = "de piso a techo" if fibo.get("direccion") == "alcista" else "de techo a piso"
+        lineas.append(f"🎯 Fibonacci — último tramo {dire}")
+        lineas.append(
+            f"• Tramo: ${fibo['desde']:,.2f} ({fibo['desde_fecha']}) → ${fibo['hasta']:,.2f} ({fibo['hasta_fecha']})"
+        )
+        lineas.append(f"• Lectura: {fibo.get('estado')}")
+        if fibo.get("uso") != "ninguno":
+            lineas.append("• Retrocesos de ese tramo (0 = extremo, 1 = origen):")
+            for k in ("0.382", "0.500", "0.618", "0.786"):
+                v = fibo["retrocesos"].get(k)
+                if v is not None and not np.isnan(v):
+                    lineas.append(f"   Ret {k}: ${v:,.2f}")
+            lineas.append("• Extensiones del mismo tramo (proyectadas más allá del extremo):")
+            for k in ("1.272", "1.618"):
+                v = fibo["extensiones"].get(k)
+                if v is not None and not np.isnan(v):
+                    lineas.append(f"   Ext {k}: ${v:,.2f}")
+            if fibo.get("uso") == "retroceso":
+                lineas.append("• Ahora importa el retroceso. La extensión es objetivo solo si el tramo se retoma.")
+            elif fibo.get("uso") == "extension":
+                lineas.append("• Ahora importa la extensión. Los retrocesos quedan atrás, como soporte/resistencia rota.")
 
     if hist_stat:
         lineas.append("")
@@ -2940,6 +3058,7 @@ def generar_grafico_analisis_tecnico(ticker: str, timeframe: str = "diario", con
         df['ATR'] = calcular_atr(df)
 
         niveles_dict = calcular_pivots_y_niveles(df, ventana=4)
+        tendencias = calcular_tendencias(df, tf_label)
         poc_price = calcular_poc_volumen(df, barras_lookback=90)
         
         hist_stat = None
@@ -2990,11 +3109,29 @@ def generar_grafico_analisis_tecnico(ticker: str, timeframe: str = "diario", con
             ax1.axhline(niveles_dict["res_inmediata"], color="#ff5252", linestyle=":", linewidth=1.2, label=f"Resistencia (${niveles_dict['res_inmediata']:,.2f})")
 
         fibo_niveles = niveles_dict["fibo_niveles"]
-        if (con_fibo or con_ext) and fibo_niveles:
-            colores_fibo = {"0.382": "#ab47bc", "0.500": "#26a69a", "Golden Pocket 0.618": "#ffca28", "Ext 1.618": "#ff7043"}
+        fibo_info = niveles_dict.get("fibo_info") or {}
+        if fibo_niveles:
+            colores_fibo = {
+                "Ret 0.382": "#ab47bc", "Ret 0.500": "#26a69a", "Ret 0.618": "#ffca28",
+                "Ret 0.786": "#8d6e63", "Ext 1.272": "#ff8a65", "Ext 1.618": "#ff7043",
+            }
+            relevantes = set(fibo_niveles)
+            if fibo_info.get("uso") == "retroceso":
+                relevantes = {k for k in relevantes if k.startswith("Ret")}
+            elif fibo_info.get("uso") == "extension":
+                relevantes = {k for k in relevantes if k.startswith("Ext")} | {"Ret 0.618"}
             for k, v in fibo_niveles.items():
-                if k in colores_fibo and not np.isnan(v):
+                if k in relevantes and k in colores_fibo and v is not None and not np.isnan(v):
                     ax1.axhline(v, color=colores_fibo[k], linestyle="--", linewidth=1.1, alpha=0.75, label=f"{k} (${v:,.2f})")
+            if fibo_info.get("desde") and fibo_info.get("hasta"):
+                try:
+                    ax1.scatter(
+                        [pd.to_datetime(fibo_info["desde_fecha"], dayfirst=True), pd.to_datetime(fibo_info["hasta_fecha"], dayfirst=True)],
+                        [fibo_info["desde"], fibo_info["hasta"]],
+                        color="#ffca28", s=28, zorder=5, label="Tramo Fibo",
+                    )
+                except Exception:
+                    pass
 
         ax1.set_facecolor("#131722")
         fig.patch.set_facecolor("#131722")
@@ -3053,6 +3190,8 @@ def generar_grafico_analisis_tecnico(ticker: str, timeframe: str = "diario", con
             "res_inmediata": niveles_dict["res_inmediata"],
             "res_segunda": niveles_dict["res_segunda"],
             "fibo_niveles": fibo_niveles,
+            "fibo_info": fibo_info,
+            "tendencias": tendencias,
             "poc": poc_price,
             "hist_stat": hist_stat,
             "macd": float(df['MACD'].dropna().iloc[-1]),
