@@ -2810,18 +2810,35 @@ def backtest_comportamiento_historico(df, condicion="rsi_similar", rsi_actual=No
     if not eventos_idx:
         return None
 
+    lows = df["Low"].to_numpy(dtype=float) if "Low" in df.columns else close
     desglose = []
     for nombre_h, barras in horizontes_por_timeframe(tf_label):
         rets = []
+        dds = []
         for idx in eventos_idx:
             j = idx + int(barras)
-            if j < n and close[idx] > 0 and np.isfinite(close[idx]) and np.isfinite(close[j]):
-                r = (close[j] / close[idx] - 1.0) * 100.0
-                if np.isfinite(r):
-                    rets.append(r)
+            if j >= n or close[idx] <= 0 or not np.isfinite(close[idx]) or not np.isfinite(close[j]):
+                continue
+            r = (close[j] / close[idx] - 1.0) * 100.0
+            if not np.isfinite(r):
+                continue
+            peak = close[idx]
+            worst = 0.0
+            for k in range(idx, j + 1):
+                px = close[k]
+                lo_k = lows[k] if np.isfinite(lows[k]) else px
+                if np.isfinite(px) and px > peak:
+                    peak = px
+                if peak > 0 and np.isfinite(lo_k):
+                    dd = (lo_k / peak - 1.0) * 100.0
+                    if dd < worst:
+                        worst = dd
+            rets.append(r)
+            dds.append(worst)
         if not rets:
             continue
         arr = np.asarray(rets, dtype=float)
+        dd = np.asarray(dds, dtype=float)
         desglose.append({
             "horizonte": nombre_h,
             "win_rate": float((arr > 0).mean() * 100.0),
@@ -2829,6 +2846,8 @@ def backtest_comportamiento_historico(df, condicion="rsi_similar", rsi_actual=No
             "mediana": float(np.median(arr)),
             "peor": float(arr.min()),
             "mejor": float(arr.max()),
+            "dd_med": float(np.median(dd)),
+            "dd_max": float(dd.min()),
             "muestras": int(arr.size),
         })
 
@@ -2985,45 +3004,29 @@ def formatear_reporte_tecnico(info):
         cruce = "histograma verde (+)" if (macd_hist or 0) >= 0 else "histograma rojo (-)"
         lineas.append(f"• MACD: {cruce} (Hist: {macd_hist:+.4f})")
 
-    fibo = info.get("fibo_info") or {}
-    if fibo:
-        lineas.append("")
-        dire = "de piso a techo" if fibo.get("direccion") == "alcista" else "de techo a piso"
-        lineas.append(f"🎯 Fibonacci — último tramo {dire}")
-        lineas.append(
-            f"• Tramo: ${fibo['desde']:,.2f} ({fibo['desde_fecha']}) → ${fibo['hasta']:,.2f} ({fibo['hasta_fecha']})"
-        )
-        lineas.append(f"• Lectura: {fibo.get('estado')}")
-        if fibo.get("uso") != "ninguno":
-            lineas.append("• Retrocesos de ese tramo (0 = extremo, 1 = origen):")
-            for k in ("0.382", "0.500", "0.618", "0.786"):
-                v = fibo["retrocesos"].get(k)
-                if v is not None and not np.isnan(v):
-                    lineas.append(f"   Ret {k}: ${v:,.2f}")
-            lineas.append("• Extensiones del mismo tramo (proyectadas más allá del extremo):")
-            for k in ("1.272", "1.618"):
-                v = fibo["extensiones"].get(k)
-                if v is not None and not np.isnan(v):
-                    lineas.append(f"   Ext {k}: ${v:,.2f}")
-            if fibo.get("uso") == "retroceso":
-                lineas.append("• Ahora importa el retroceso. La extensión es objetivo solo si el tramo se retoma.")
-            elif fibo.get("uso") == "extension":
-                lineas.append("• Ahora importa la extensión. Los retrocesos quedan atrás, como soporte/resistencia rota.")
-
     if hist_stat:
+        lo = hist_stat.get("rsi_actual", rsi) - hist_stat.get("banda", 0.5)
+        hi = hist_stat.get("rsi_actual", rsi) + hist_stat.get("banda", 0.5)
         lineas.append("")
-        lineas.append(f"🧠 Comportamiento Histórico ante: {hist_stat['condicion']}")
-        lineas.append(f"• Eventos detectados en su historia: {hist_stat['total_eventos']}")
-        lineas.append("• Desglose por horizonte temporal:")
-        lineas.append("• Evento = primera vela que entra en la banda. Sin semanas solapadas. Precios ajustados.")
+        lineas.append(f"🧠 RSI similar  {lo:.1f} – {hi:.1f}")
+        lineas.append(f"{hist_stat['total_eventos']} entradas en la historia de este ticker")
+        lineas.append("Primera vela que entra en la banda. Sin solapar.")
+        lineas.append("")
         for item in hist_stat['desglose']:
             em = "🟢" if item['win_rate'] >= 60 else ("🟡" if item['win_rate'] >= 45 else "🔴")
-            signo = "+" if item['avg_ret'] >= 0 else ""
-            med = item.get("mediana")
-            med_txt = f" | Med: {med:+.2f}%" if med is not None else ""
-            lineas.append(
-                f"   {em} {item['horizonte']:<8} → WR: {item['win_rate']:>5.1f}% | Prom: {signo}{item['avg_ret']:>6.2f}%{med_txt} ({item['muestras']} casos)"
-            )
+            dd_max = item.get("dd_max")
+            dd_med = item.get("dd_med")
+            dd_txt = ""
+            if dd_max is not None:
+                dd_txt = f"DD máx {dd_max:.1f}%"
+                if dd_med is not None:
+                    dd_txt += f"  ·  típico {dd_med:.1f}%"
+            lineas.append(f"{em} {item['horizonte']}  ·  {item['muestras']} casos")
+            lineas.append(f"WR {item['win_rate']:.0f}%")
+            lineas.append(f"Prom {item['avg_ret']:+.1f}%   Med {item['mediana']:+.1f}%")
+            if dd_txt:
+                lineas.append(dd_txt)
+            lineas.append("")
 
     lineas.append("")
     lineas.append("💡 Conclusión Operativa")
@@ -3152,31 +3155,6 @@ def generar_grafico_analisis_tecnico(ticker: str, timeframe: str = "diario", con
             
         if niveles_dict["res_inmediata"] and not np.isnan(niveles_dict["res_inmediata"]):
             ax1.axhline(niveles_dict["res_inmediata"], color="#ff5252", linestyle=":", linewidth=1.2, label=f"Resistencia (${niveles_dict['res_inmediata']:,.2f})")
-
-        fibo_niveles = niveles_dict["fibo_niveles"]
-        fibo_info = niveles_dict.get("fibo_info") or {}
-        if fibo_niveles:
-            colores_fibo = {
-                "Ret 0.382": "#ab47bc", "Ret 0.500": "#26a69a", "Ret 0.618": "#ffca28",
-                "Ret 0.786": "#8d6e63", "Ext 1.272": "#ff8a65", "Ext 1.618": "#ff7043",
-            }
-            relevantes = set(fibo_niveles)
-            if fibo_info.get("uso") == "retroceso":
-                relevantes = {k for k in relevantes if k.startswith("Ret")}
-            elif fibo_info.get("uso") == "extension":
-                relevantes = {k for k in relevantes if k.startswith("Ext")} | {"Ret 0.618"}
-            for k, v in fibo_niveles.items():
-                if k in relevantes and k in colores_fibo and v is not None and not np.isnan(v):
-                    ax1.axhline(v, color=colores_fibo[k], linestyle="--", linewidth=1.1, alpha=0.75, label=f"{k} (${v:,.2f})")
-            if fibo_info.get("desde") and fibo_info.get("hasta"):
-                try:
-                    ax1.scatter(
-                        [pd.to_datetime(fibo_info["desde_fecha"], dayfirst=True), pd.to_datetime(fibo_info["hasta_fecha"], dayfirst=True)],
-                        [fibo_info["desde"], fibo_info["hasta"]],
-                        color="#ffca28", s=28, zorder=5, label="Tramo Fibo",
-                    )
-                except Exception:
-                    pass
 
         ax1.set_facecolor("#131722")
         fig.patch.set_facecolor("#131722")
@@ -4259,6 +4237,8 @@ def generar_alertas_para_usuario(user_id: int) -> list:
                                     lineas_stat.append(f"3m: {h3m['win_rate']:.0f}% WR ({h3m['avg_ret']:+.1f}%)")
                                 if h1y:
                                     lineas_stat.append(f"1a: {h1y['win_rate']:.0f}% WR ({h1y['avg_ret']:+.1f}%)")
+                                    if h1y.get("dd_max") is not None:
+                                        lineas_stat.append(f"DD máx 1a {h1y['dd_max']:.0f}%")
                                 extra_stat = "\n📊 Histórico: " + " | ".join(lineas_stat)
 
                             alertas.append({
