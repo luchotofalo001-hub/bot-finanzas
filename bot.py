@@ -2754,74 +2754,83 @@ def calcular_poc_volumen(df, barras_lookback=90, bins_count=40):
     poc_price = (bins[poc_idx] + bins[poc_idx + 1]) / 2.0
     return float(poc_price)
 
-def backtest_comportamiento_historico(df, condicion="sobreventa_rsi"):
-    if len(df) < 250:
+def horizontes_por_timeframe(tf_label: str):
+    """Barras hacia adelante según el timeframe real de la serie.
+
+    El bug anterior usaba 11/21/63/126/252 también en semanal: ahí 126 velas
+    son ~2.4 años, no 6 meses, e inflaba el retorno promedio.
+    """
+    tf = (tf_label or "").lower()
+    if "sem" in tf or "1w" in tf:
+        return [("15 días", 2), ("1 mes", 4), ("3 meses", 13), ("6 meses", 26), ("1 año", 52)]
+    if "4" in tf:
+        return [("15 días", 30), ("1 mes", 44), ("3 meses", 130), ("6 meses", 260), ("1 año", 520)]
+    return [("15 días", 11), ("1 mes", 21), ("3 meses", 63), ("6 meses", 126), ("1 año", 252)]
+
+
+def backtest_comportamiento_historico(df, condicion="rsi_similar", rsi_actual=None, banda=0.5, tf_label="diario"):
+    if df is None or len(df) < 40 or "RSI" not in df.columns or "Close" not in df.columns:
         return None
-    
-    rsi = df['RSI'].values
-    close = df['Close'].values
+
+    rsi = df["RSI"].to_numpy(dtype=float)
+    close = df["Close"].to_numpy(dtype=float)
     n = len(close)
+    if not np.isfinite(rsi).any():
+        return None
+
+    if rsi_actual is None or not np.isfinite(rsi_actual):
+        valid = rsi[np.isfinite(rsi)]
+        rsi_actual = float(valid[-1]) if len(valid) else 50.0
 
     eventos_idx = []
-
-    if condicion == "sobreventa_rsi":
-        for i in range(15, n - 15):
-            if rsi[i] <= 40 and rsi[i - 1] > 40:
+    if condicion == "rsi_similar":
+        lo = float(rsi_actual) - float(banda)
+        hi = float(rsi_actual) + float(banda)
+        # Primera vela que entra en la banda. La última no es caso: todavía no tiene retorno.
+        for i in range(1, n - 1):
+            if not np.isfinite(rsi[i]) or not (lo <= rsi[i] <= hi):
+                continue
+            prev_in = np.isfinite(rsi[i - 1]) and lo <= rsi[i - 1] <= hi
+            if not prev_in:
+                eventos_idx.append(i)
+        label = f"RSI similar ({lo:.2f} a {hi:.2f}, ±{float(banda):.1f})"
+    elif condicion == "sobreventa_rsi":
+        for i in range(1, n - 1):
+            if np.isfinite(rsi[i]) and np.isfinite(rsi[i - 1]) and rsi[i] <= 40 and rsi[i - 1] > 40:
                 eventos_idx.append(i)
         label = "RSI en zona baja / sobreventa (<= 40)"
-
     elif condicion == "sobrecompra_rsi":
-        for i in range(15, n - 15):
-            if rsi[i] >= 60 and rsi[i - 1] < 60:
+        for i in range(1, n - 1):
+            if np.isfinite(rsi[i]) and np.isfinite(rsi[i - 1]) and rsi[i] >= 70 and rsi[i - 1] < 70:
                 eventos_idx.append(i)
-        label = "RSI en zona alta / sobrecompra (>= 60)"
-
-    elif condicion == "cruce_alcista_ema":
-        ema20 = df['EMA20'].values
-        ema50 = df['EMA50'].values
-        for i in range(15, n - 15):
-            if ema20[i] > ema50[i] and ema20[i - 1] <= ema50[i - 1]:
-                eventos_idx.append(i)
-        label = "Cruce alcista (EMA20 > EMA50)"
-
-    elif condicion == "cruce_bajista_ema":
-        ema20 = df['EMA20'].values
-        ema50 = df['EMA50'].values
-        for i in range(15, n - 15):
-            if ema20[i] < ema50[i] and ema20[i - 1] >= ema50[i - 1]:
-                eventos_idx.append(i)
-        label = "Presión bajista (EMA20 < EMA50)"
+        label = "RSI en sobrecompra clásica (>= 70)"
     else:
         return None
 
     if not eventos_idx:
         return None
 
-    horizontes = [
-        ("15 días", 11),
-        ("1 mes", 21),
-        ("3 meses", 63),
-        ("6 meses", 126),
-        ("1 año", 252)
-    ]
-
     desglose = []
-    for nombre_h, barras in horizontes:
+    for nombre_h, barras in horizontes_por_timeframe(tf_label):
         rets = []
         for idx in eventos_idx:
-            if idx + barras < n:
-                r = (close[idx + barras] / close[idx] - 1.0) * 100.0
+            j = idx + int(barras)
+            if j < n and close[idx] > 0 and np.isfinite(close[idx]) and np.isfinite(close[j]):
+                r = (close[j] / close[idx] - 1.0) * 100.0
                 if np.isfinite(r):
                     rets.append(r)
-        if rets:
-            wr = (len([r for r in rets if r > 0]) / len(rets)) * 100.0
-            avg = float(np.mean(rets))
-            desglose.append({
-                "horizonte": nombre_h,
-                "win_rate": wr,
-                "avg_ret": avg,
-                "muestras": len(rets)
-            })
+        if not rets:
+            continue
+        arr = np.asarray(rets, dtype=float)
+        desglose.append({
+            "horizonte": nombre_h,
+            "win_rate": float((arr > 0).mean() * 100.0),
+            "avg_ret": float(arr.mean()),
+            "mediana": float(np.median(arr)),
+            "peor": float(arr.min()),
+            "mejor": float(arr.max()),
+            "muestras": int(arr.size),
+        })
 
     if not desglose:
         return None
@@ -2829,8 +2838,35 @@ def backtest_comportamiento_historico(df, condicion="sobreventa_rsi"):
     return {
         "condicion": label,
         "total_eventos": len(eventos_idx),
-        "desglose": desglose
+        "rsi_actual": float(rsi_actual),
+        "banda": float(banda),
+        "tf_label": tf_label,
+        "desglose": desglose,
     }
+
+
+def historia_rsi_largo(simbolo: str, tf_label: str):
+    """Serie larga solo para los casos. El gráfico sigue usando su ventana corta."""
+    tf = (tf_label or "").lower()
+    try:
+        if "sem" in tf:
+            df = yf_history(simbolo, start="1999-01-01", interval="1wk")
+        elif "4" in tf:
+            df = yf_history(simbolo, period="730d", interval="1h")
+            if df is not None and not df.empty:
+                df = df.resample("4h").agg({
+                    "Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"
+                }).dropna()
+        else:
+            df = yf_history(simbolo, start="1999-01-01", interval="1d")
+        if df is None or df.empty:
+            return None
+        df = df.dropna(subset=["Close"]).copy()
+        df["RSI"] = calcular_rsi_serie(df["Close"], period=14)
+        return df
+    except Exception as e:
+        logger.warning(f"historia_rsi_largo {simbolo}: {e}")
+        return None
 
 def detectar_divergencia_rsi(df, window=25):
     if len(df) < window:
@@ -2979,20 +3015,28 @@ def formatear_reporte_tecnico(info):
         lineas.append(f"🧠 Comportamiento Histórico ante: {hist_stat['condicion']}")
         lineas.append(f"• Eventos detectados en su historia: {hist_stat['total_eventos']}")
         lineas.append("• Desglose por horizonte temporal:")
+        lineas.append("• Evento = primera vela que entra en la banda. Sin semanas solapadas. Precios ajustados.")
         for item in hist_stat['desglose']:
             em = "🟢" if item['win_rate'] >= 60 else ("🟡" if item['win_rate'] >= 45 else "🔴")
             signo = "+" if item['avg_ret'] >= 0 else ""
+            med = item.get("mediana")
+            med_txt = f" | Med: {med:+.2f}%" if med is not None else ""
             lineas.append(
-                f"   {em} {item['horizonte']:<8} → WR: {item['win_rate']:>5.1f}% | Retorno prom: {signo}{item['avg_ret']:>6.2f}% ({item['muestras']} casos)"
+                f"   {em} {item['horizonte']:<8} → WR: {item['win_rate']:>5.1f}% | Prom: {signo}{item['avg_ret']:>6.2f}%{med_txt} ({item['muestras']} casos)"
             )
 
     lineas.append("")
     lineas.append("💡 Conclusión Operativa")
     bias = info.get("estructura_bias") or "lateral"
-    if "DIVERGENCIA ALCISTA" in diag_rsi.upper() or rsi <= 32:
+    confirmada_alcista = "DIVERGENCIA ALCISTA CONFIRMADA" in diag_rsi.upper()
+    confirmada_bajista = "DIVERGENCIA BAJISTA CONFIRMADA" in diag_rsi.upper()
+    en_formacion = "SE ESTÁ FORMANDO" in diag_rsi.upper() or "EN FORMACIÓN" in diag_rsi.upper()
+    if confirmada_alcista or rsi <= 32:
         lineas.append("• Probabilidad alta de rebote técnico. Buscar confirmación sobre EMA20.")
-    elif "DIVERGENCIA BAJISTA" in diag_rsi.upper() or rsi >= 68:
+    elif confirmada_bajista or rsi >= 70:
         lineas.append("• Zona de agotamiento de compras. Riesgo alto de pullback a soporte o POC.")
+    elif en_formacion:
+        lineas.append("• Hay una divergencia en formación. Es aviso, no estadística: el histórico de arriba es el que manda.")
     elif "choch_alcista" in bias:
         lineas.append("• Se rompió un techo/máximo importante. Posible cambio a tendencia alcista; esperar retesteo.")
     elif "choch_bajista" in bias:
@@ -3063,15 +3107,16 @@ def generar_grafico_analisis_tecnico(ticker: str, timeframe: str = "diario", con
         
         hist_stat = None
         rsi_act = float(df['RSI'].dropna().iloc[-1]) if 'RSI' in df and not df['RSI'].dropna().empty else 50.0
-        
-        if rsi_act <= 40:
-            hist_stat = backtest_comportamiento_historico(df, "sobreventa_rsi")
-        elif rsi_act >= 60:
-            hist_stat = backtest_comportamiento_historico(df, "sobrecompra_rsi")
-        elif df['EMA20'].iloc[-1] > df['EMA50'].iloc[-1]:
-            hist_stat = backtest_comportamiento_historico(df, "cruce_alcista_ema")
-        else:
-            hist_stat = backtest_comportamiento_historico(df, "cruce_bajista_ema")
+        df_hist = historia_rsi_largo(simbolo, tf_label)
+        if df_hist is None or df_hist.empty:
+            df_hist = df
+        hist_stat = backtest_comportamiento_historico(
+            df_hist,
+            condicion="rsi_similar",
+            rsi_actual=rsi_act,
+            banda=0.5,
+            tf_label=tf_label,
+        )
 
         vol_txt = None
         if "Volume" in df.columns and df["Volume"].fillna(0).sum() > 0:
