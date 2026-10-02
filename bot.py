@@ -3212,8 +3212,6 @@ def generar_grafico_analisis_tecnico(ticker: str, timeframe: str = "diario", con
             "sop_segundo": niveles_dict["sop_segundo"],
             "res_inmediata": niveles_dict["res_inmediata"],
             "res_segunda": niveles_dict["res_segunda"],
-            "fibo_niveles": fibo_niveles,
-            "fibo_info": fibo_info,
             "tendencias": tendencias,
             "poc": poc_price,
             "hist_stat": hist_stat,
