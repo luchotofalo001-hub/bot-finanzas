@@ -38,23 +38,43 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header("Access-Control-Allow-Origin", "*")
-        if self.path.startswith("/api/grafico"):
-            from urllib.parse import urlparse, parse_qs
+        from urllib.parse import urlparse, parse_qs
+        path = urlparse(self.path).path
+        if path.startswith("/api/"):
             q = parse_qs(urlparse(self.path).query)
             tipo = q.get("tipo", ["spy"])[0]
+            if path.startswith("/api/panel"):
+                tipo = q.get("tipo", ["panel"])[0]
             periodo = q.get("periodo", ["ytd"])[0]
             ticker = q.get("ticker", [""])[0]
+            ciclo = q.get("ciclo", [""])[0]
             try:
-                body = api_grafico(LUCHO_TELEGRAM_ID, tipo, periodo, ticker)
+                body = api_grafico(LUCHO_TELEGRAM_ID, tipo, periodo, ticker, ciclo)
             except Exception as e:
                 body = '{"error":"%s"}' % str(e).replace('"', "'")
-            self.send_header("Content-type", "application/json")
+            self.send_header("Content-type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(body.encode())
             return
+        if path in ("/", "/app", "/index.html"):
+            html_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.html")
+            if os.path.exists(html_path):
+                self.send_header("Content-type", "text/html; charset=utf-8")
+                self.end_headers()
+                with open(html_path, "rb") as fh:
+                    self.wfile.write(fh.read())
+                return
         self.send_header("Content-type", "text/plain")
         self.end_headers()
         self.wfile.write(b"Bot activo")
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "*")
+        self.end_headers()
     def log_message(self, format, *args):
         pass
 
@@ -1876,9 +1896,13 @@ def obtener_precio_actual(ticker: str):
 # ==================== CÁLCULO DE FECHAS ====================
 def resolver_fecha_inicio(periodo_str: str, fecha_compra_db: str = None):
     p = periodo_str.strip().lower() if periodo_str else ""
+    p = {
+        "1d": "1 dia", "1s": "7 dias", "1w": "7 dias", "6m": "6 meses", "6mo": "6 meses",
+        "siempre": "todo", "maximo": "todo", "máximo": "todo",
+    }.get(p, p)
     hoy = datetime.now()
     
-    if p in ["todo", "max", "historico", "histórico", "desde el inicio", "desde siempre", "total"]:
+    if p in ["todo", "max", "historico", "histórico", "desde el inicio", "desde siempre", "total", "siempre"]:
         if fecha_compra_db:
             return fecha_compra_db, f"Histórico total (desde {fecha_compra_db})"
         return (hoy - timedelta(days=365 * 3)).strftime('%Y-%m-%d'), "Histórico"
@@ -2210,108 +2234,428 @@ def generar_excel_completo(user_id: int):
         return None
 
 
-def api_grafico(user_id, tipo, periodo, ticker=""):
-    import json
-    tipo = (tipo or "spy").lower()
-    if tipo == "torta":
-        with get_db_connection() as conn:
-            df = pd.read_sql("SELECT fecha, tipo, monto, categoria, descripcion FROM movimientos WHERE user_id = %s AND tipo = 'GASTO';", conn, params=(user_id,))
-        if df.empty:
-            return json.dumps({"labels": [], "values": []})
-        df["fecha"] = pd.to_datetime(df["fecha"]).dt.tz_localize(None)
-        blob = (df["categoria"].fillna("") + " " + df["descripcion"].fillna("")).str.lower()
-        df = df[~blob.apply(lambda x: any(k in x for k in TAGS_AHORRO))]
-        sueldos = obtener_fechas_sueldo(user_id)
-        df = asignar_ciclo_havas(df, sueldos)
-        actual = df["ciclo_id"].dropna().iloc[-1] if not df.empty else None
-        g = df[df["ciclo_id"] == actual] if actual else df
-        agg = g.groupby("categoria")["monto"].sum().sort_values(ascending=False)
-        return json.dumps({"labels": [str(i) for i in agg.index], "values": [round(float(v), 2) for v in agg.values]})
-    fecha_start, desc = resolver_fecha_inicio(periodo or "ytd")
-    fechas = pd.date_range(start=fecha_start, end=datetime.now().strftime("%Y-%m-%d"), freq="D")
+def _num(v, nd=2):
+    try:
+        x = float(v)
+    except Exception:
+        return None
+    if not np.isfinite(x):
+        return None
+    return round(x, nd)
+
+def _fechas_iso(idx):
+    return [pd.Timestamp(d).strftime("%Y-%m-%d") for d in idx]
+
+_API_JSON_CACHE = {}
+
+def serie_cartera_bot(user_id: int, periodo_solicitado: str = ""):
     with get_db_connection() as conn:
-        df_inv = pd.read_sql("SELECT fecha, ticker, cantidad, precio_compra, monto_total_usd, tipo_posicion, apalancamiento FROM portafolio_inversiones WHERE user_id = %s;", conn, params=(user_id,))
-        df_tc = pd.read_sql("SELECT fecha, fecha_apertura, ticker, pnl_usd, monto_invertido, descripcion FROM trades_cerrados WHERE user_id = %s;", conn, params=(user_id,))
+        df_inv = pd.read_sql(
+            "SELECT fecha, ticker, cantidad, precio_compra, monto_total_usd, tipo_posicion, apalancamiento FROM portafolio_inversiones WHERE user_id = %s ORDER BY fecha ASC;",
+            conn, params=(user_id,),
+        )
+        df_tc = pd.read_sql(
+            "SELECT fecha, fecha_apertura, ticker, tipo_posicion, pnl_usd, monto_invertido, descripcion FROM trades_cerrados WHERE user_id = %s ORDER BY fecha ASC;",
+            conn, params=(user_id,),
+        )
+    if df_inv.empty and df_tc.empty:
+        return None
+    fechas_candidatas = []
+    if not df_inv.empty:
+        fechas_candidatas.append(df_inv["fecha"].min())
+    if not df_tc.empty:
+        fechas_candidatas.append(df_tc["fecha"].min())
+        if "fecha_apertura" in df_tc.columns and df_tc["fecha_apertura"].notna().any():
+            fechas_candidatas.append(df_tc["fecha_apertura"].min())
+    primera = min(fechas_candidatas).strftime("%Y-%m-%d")
+    fecha_start, desc = resolver_fecha_inicio(periodo_solicitado, primera)
+    tickers = list(df_inv["ticker"].unique()) if not df_inv.empty else []
     precios = {}
-    tickers = sorted(set(df_inv["ticker"].dropna().astype(str).str.upper())) if not df_inv.empty else []
-    if ticker:
-        tickers = [ticker.upper()]
-    for tk in list(dict.fromkeys(tickers + ["SPY"])):
+    for tk in tickers:
         if tk in ["USDT", "USDC", "DAI", "USD"]:
             continue
         try:
-            h = yf_history(normalizar_ticker_yf(tk), start=fecha_start, auto_adjust=True)
+            h = yf_history(normalizar_ticker_yf(tk), start=fecha_start)
             if h is not None and not h.empty:
-                s = h["Close"].replace([np.inf, -np.inf], np.nan)
+                s = h["Close"].ffill().bfill()
                 s.index = pd.to_datetime(s.index).tz_localize(None)
-                precios[tk] = s.reindex(fechas).ffill().bfill()
+                precios[tk] = s
         except Exception:
             pass
-    if tipo == "activos":
-        series = {}
-        for tk, s in precios.items():
-            if tk == "SPY" or s.dropna().empty:
-                continue
-            base = float(s.dropna().iloc[0])
-            if base:
-                series[tk] = [round(float(v / base * 100), 2) if pd.notnull(v) else None for v in s]
-        spy = precios.get("SPY")
-        if spy is not None and spy.dropna().shape[0]:
-            b = float(spy.dropna().iloc[0])
-            series["SPY"] = [round(float(v / b * 100), 2) if pd.notnull(v) else None for v in spy]
-        return json.dumps({"titulo": desc, "fechas": [d.strftime("%Y-%m-%d") for d in fechas], "series": series})
-    # misma cuenta que el grafico vs SPY del bot
+    fechas = pd.date_range(start=fecha_start, end=datetime.now().strftime("%Y-%m-%d"), freq="D")
+    df_precios = pd.DataFrame(index=fechas)
+    for tk, s in precios.items():
+        df_precios[tk] = s
+    df_precios = df_precios.ffill().bfill()
     capital = pd.Series(0.0, index=fechas)
     valor = pd.Series(0.0, index=fechas)
+    cerrado = pd.Series(0.0, index=fechas)
+    if not df_tc.empty:
+        df_tc["fecha_d"] = pd.to_datetime(df_tc["fecha"]).dt.tz_localize(None).dt.floor("D")
+        f_a_list = []
+        for _, tr in df_tc.iterrows():
+            f_a = tr["fecha_apertura"] if "fecha_apertura" in tr and pd.notnull(tr["fecha_apertura"]) else None
+            if pd.isnull(f_a) and tr.get("descripcion"):
+                m_ap = re.search(r"Apertura\s+(\d{4}-\d{2}-\d{2})", str(tr["descripcion"]))
+                if m_ap:
+                    f_a = m_ap.group(1)
+            f_a = pd.to_datetime(f_a).tz_localize(None).floor("D") if pd.notnull(f_a) else tr["fecha_d"]
+            f_a_list.append(f_a)
+        df_tc["fecha_a"] = f_a_list
+        incr = pd.Series(0.0, index=fechas)
+        for _, tr in df_tc.iterrows():
+            pnl = float(tr["pnl_usd"] or 0)
+            f_c = tr["fecha_d"]
+            f_a = tr["fecha_a"]
+            if pd.isnull(f_a) or pd.isnull(f_c):
+                continue
+            if f_a > f_c:
+                f_a = f_c
+            mask = (fechas >= f_a) & (fechas <= f_c)
+            n = int(mask.sum())
+            if n <= 1:
+                if f_c in incr.index:
+                    incr.loc[f_c] += pnl
+            else:
+                incr.loc[mask] += pnl / n
+        cerrado = incr.cumsum()
     if not df_inv.empty:
         for _, pos in df_inv.iterrows():
             pos_fecha = pd.to_datetime(pos["fecha"]).tz_localize(None).floor("D")
-            tk = str(pos["ticker"]).upper()
+            tk = pos["ticker"]
             cant = float(pos["cantidad"] or 0)
-            ppc = float(pos["precio_compra"] or 1)
+            ppc = float(pos["precio_compra"]) if pos["precio_compra"] else 1.0
             margen = float(pos["monto_total_usd"] or 0)
-            tipo_pos = str(pos["tipo_posicion"] or "SPOT").upper()
-            lev = float(pos["apalancamiento"] or 1)
-            mask = fechas >= pos_fecha
-            capital[mask] += margen
-            if tk in ["USDT", "USDC", "DAI", "USD"] or tk not in precios:
-                valor[mask] += margen
+            tipo = str(pos["tipo_posicion"]).upper() if pos["tipo_posicion"] else "SPOT"
+            lev = float(pos["apalancamiento"]) if pos["apalancamiento"] else 1.0
+            mascara = fechas >= pos_fecha
+            capital[mascara] += margen
+            if tk in ["USDT", "USDC", "DAI", "USD"] or tk not in df_precios.columns:
+                valor[mascara] += margen
             else:
-                spot = precios[tk].loc[mask]
-                if tipo_pos == "SHORT":
-                    valor[mask] += np.maximum(0.0, margen + margen * ((ppc - spot) / ppc) * lev)
-                elif tipo_pos == "LONG":
-                    valor[mask] += np.maximum(0.0, margen + margen * ((spot - ppc) / ppc) * lev)
+                spot_t = df_precios[tk].loc[mascara]
+                if tipo == "SHORT":
+                    val_t = np.maximum(0.0, margen + margen * ((ppc - spot_t) / ppc) * lev)
+                elif tipo == "LONG":
+                    val_t = np.maximum(0.0, margen + margen * ((spot_t - ppc) / ppc) * lev)
                 else:
-                    valor[mask] += cant * spot
-    cerrado = pd.Series(0.0, index=fechas)
-    if not df_tc.empty:
-        for _, tr in df_tc.iterrows():
-            pnl = float(tr["pnl_usd"] or 0)
-            fc = pd.to_datetime(tr["fecha"]).tz_localize(None).floor("D")
-            fa = tr["fecha_apertura"] if "fecha_apertura" in tr and pd.notnull(tr["fecha_apertura"]) else None
-            if pd.isnull(fa) and tr.get("descripcion"):
-                m = re.search(r"Apertura\\s+(\\d{4}-\\d{2}-\\d{2})", str(tr["descripcion"]))
-                if m:
-                    fa = m.group(1)
-            fa = pd.to_datetime(fa).tz_localize(None).floor("D") if pd.notnull(fa) else fc
-            if fa > fc:
-                fa = fc
-            mask = (fechas >= fa) & (fechas <= fc)
-            n = int(mask.sum())
-            if n:
-                cerrado.loc[mask] += pnl / n
-        cerrado = cerrado.cumsum()
+                    val_t = cant * spot_t
+                valor[mascara] += val_t
     total = (valor - capital) + cerrado
-    pnl = total - float(total.iloc[0] if len(total) else 0)
-    cap = max(float(df_inv["monto_total_usd"].sum()) if not df_inv.empty else 0, float(df_tc["monto_invertido"].max()) if not df_tc.empty and df_tc["monto_invertido"].notna().any() else 0, 2500.0)
-    cartera = [round(float(v) / cap * 100, 2) for v in pnl]
-    spy = precios.get("SPY")
-    spy_s = []
-    if spy is not None and spy.dropna().shape[0] and float(spy.dropna().iloc[0]):
-        b = float(spy.dropna().iloc[0])
-        spy_s = [round((float(v) / b - 1) * 100, 2) if pd.notnull(v) else None for v in spy]
-    return json.dumps({"titulo": desc, "fechas": [d.strftime("%Y-%m-%d") for d in fechas], "cartera": cartera, "spy": spy_s, "ret": cartera[-1] if cartera else 0, "spy_ret": spy_s[-1] if spy_s else 0})
+    base0 = float(total.iloc[0]) if len(total) else 0.0
+    pnl = total - base0
+    cap_ab = float(df_inv["monto_total_usd"].sum()) if not df_inv.empty else 0.0
+    cap_tc = float(df_tc["monto_invertido"].max()) if not df_tc.empty and df_tc["monto_invertido"].notna().any() else 0.0
+    capital_ref = max(cap_ab, cap_tc, 2500.0)
+    pct = pnl / capital_ref * 100.0
+    spy = []
+    spy_ret = None
+    try:
+        hspy = yf_history("SPY", start=fecha_start, auto_adjust=True)
+        if hspy is not None and not hspy.empty:
+            sspy = hspy["Close"].replace([np.inf, -np.inf], np.nan)
+            sspy.index = pd.to_datetime(sspy.index).tz_localize(None)
+            sspy = sspy.reindex(fechas).ffill().bfill()
+            base = float(sspy.dropna().iloc[0]) if sspy.dropna().shape[0] else 0.0
+            if base:
+                spy = [_num((float(v) / base - 1.0) * 100.0, 2) if pd.notnull(v) else None for v in sspy]
+                spy_ret = spy[-1] if spy else None
+    except Exception:
+        spy = []
+    return {
+        "titulo": desc,
+        "fechas": _fechas_iso(fechas),
+        "pnl": [_num(v, 2) for v in pnl],
+        "cartera": [_num(v, 2) for v in pct],
+        "spy": spy,
+        "ret": _num(pct.iloc[-1] if len(pct) else 0, 2),
+        "pnl_ret": _num(pnl.iloc[-1] if len(pnl) else 0, 2),
+        "spy_ret": spy_ret,
+        "capital_ref": _num(capital_ref, 2),
+        "valor_actual": _num(valor.iloc[-1] if len(valor) else 0, 2),
+        "capital_abierto": _num(capital.iloc[-1] if len(capital) else 0, 2),
+    }
+
+def serie_activos_bot(user_id: int, periodo_solicitado: str = "", tickers_filtro=None):
+    with get_db_connection() as conn:
+        df = pd.read_sql(
+            "SELECT ticker, MIN(fecha) as primera_compra, MAX(tipo_posicion) as tipo_pos, MAX(apalancamiento) as lev FROM portafolio_inversiones WHERE user_id = %s GROUP BY ticker;",
+            conn, params=(user_id,),
+        )
+    if df.empty:
+        return {"titulo": "", "fechas": [], "series": []}
+    if tickers_filtro:
+        limpios = [t.strip().upper() for t in tickers_filtro if str(t).strip()]
+        df = df[df["ticker"].astype(str).str.upper().isin(limpios)]
+    if df.empty:
+        return {"titulo": "", "fechas": [], "series": []}
+    primera = df["primera_compra"].min().strftime("%Y-%m-%d")
+    fecha_start, desc = resolver_fecha_inicio(periodo_solicitado, primera)
+    fechas = pd.date_range(start=fecha_start, end=datetime.now().strftime("%Y-%m-%d"), freq="D")
+    series = []
+    for _, row in df.iterrows():
+        tk = str(row["ticker"]).upper()
+        if tk in ["USDT", "USDC", "DAI", "USD"]:
+            continue
+        f_compra = pd.to_datetime(row["primera_compra"]).tz_localize(None).floor("D")
+        tipo_pos = str(row["tipo_pos"]).upper() if row["tipo_pos"] else "SPOT"
+        lev = float(row["lev"]) if row["lev"] else 1.0
+        try:
+            h = yf_history(normalizar_ticker_yf(tk), start=fecha_start)
+            if h is None or h.empty:
+                continue
+            s = h["Close"].ffill().bfill()
+            s.index = pd.to_datetime(s.index).tz_localize(None)
+            s = s.reindex(fechas).ffill().bfill()
+            if f_compra > fechas[0]:
+                s[fechas < f_compra] = np.nan
+            valida = s.dropna()
+            if valida.empty:
+                continue
+            inicial = float(valida.iloc[0])
+            if not inicial:
+                continue
+            if tipo_pos == "SHORT":
+                rend = 100.0 + ((inicial - s) / inicial) * lev * 100.0
+            elif tipo_pos == "LONG":
+                rend = 100.0 + ((s - inicial) / inicial) * lev * 100.0
+            else:
+                rend = (s / inicial) * 100.0
+            ultimo = float(rend.dropna().iloc[-1])
+            series.append({
+                "ticker": tk,
+                "lev": lev,
+                "tipo": tipo_pos,
+                "ret": _num(ultimo - 100.0, 2),
+                "data": [_num(v, 2) if pd.notnull(v) else None for v in rend],
+            })
+        except Exception:
+            continue
+    return {"titulo": desc, "fechas": _fechas_iso(fechas), "series": series}
+
+def serie_torta_gastos(user_id: int, ciclo_id: str = ""):
+    with get_db_connection() as conn:
+        gastos = pd.read_sql(
+            "SELECT fecha, tipo, monto, categoria, descripcion FROM movimientos WHERE user_id = %s AND tipo = 'GASTO';",
+            conn, params=(user_id,),
+        )
+        ingresos = pd.read_sql(
+            "SELECT fecha, tipo, monto, categoria, descripcion FROM movimientos WHERE user_id = %s AND tipo = 'INGRESO';",
+            conn, params=(user_id,),
+        )
+    if gastos.empty:
+        return {"labels": [], "values": [], "titulo": ""}
+    gastos["fecha"] = pd.to_datetime(gastos["fecha"]).dt.tz_localize(None)
+    gastos["categoria"] = gastos["categoria"].apply(normalizar_categoria)
+    blob = (gastos["categoria"].astype(str) + " " + gastos["descripcion"].fillna("").astype(str)).str.lower()
+    gastos = gastos[~blob.apply(lambda x: any(t in x for t in TAGS_AHORRO))]
+    sueldos = obtener_fechas_sueldo(user_id)
+    gastos = asignar_ciclo_havas(gastos, sueldos)
+    if not ingresos.empty:
+        ingresos["fecha"] = pd.to_datetime(ingresos["fecha"]).dt.tz_localize(None)
+        ingresos["categoria"] = ingresos["categoria"].apply(normalizar_categoria)
+        ingresos = asignar_ciclo_havas(ingresos, sueldos)
+    actual = ciclo_id or (gastos["ciclo_id"].dropna().iloc[-1] if not gastos.empty else "")
+    g = gastos[gastos["ciclo_id"] == actual] if actual else gastos
+    ing = ingresos[ingresos["ciclo_id"] == actual] if actual and not ingresos.empty else ingresos
+    g = netear_devoluciones_en_consumo(g, ing)
+    if g is None or g.empty:
+        return {"labels": [], "values": [], "titulo": actual or ""}
+    por = g.groupby("categoria")["monto"].sum().sort_values(ascending=False)
+    if len(por) > 8:
+        top = por.head(7)
+        por = pd.concat([top, pd.Series({"Otros": float(por.iloc[7:].sum())})])
+    _, _, etq = resolver_ciclo_havas(user_id)
+    return {
+        "labels": [str(i) for i in por.index],
+        "values": [_num(v, 2) for v in por.values],
+        "titulo": etq if not ciclo_id else ciclo_id,
+        "ciclo": actual,
+    }
+
+def serie_mensual_bot(user_id: int, anio=None):
+    with get_db_connection() as conn:
+        df_tc = pd.read_sql(
+            "SELECT fecha, pnl_usd, monto_invertido FROM trades_cerrados WHERE user_id = %s ORDER BY fecha ASC;",
+            conn, params=(user_id,),
+        )
+        df_inv = pd.read_sql("SELECT monto_total_usd FROM portafolio_inversiones WHERE user_id = %s;", conn, params=(user_id,))
+    if df_tc.empty:
+        return {"capital_ref": 2500, "meses": []}
+    cap_ab = float(df_inv["monto_total_usd"].sum()) if not df_inv.empty else 0.0
+    cap_tc = float(df_tc["monto_invertido"].max()) if df_tc["monto_invertido"].notna().any() else 2000.0
+    capital_ref = max(cap_ab, cap_tc, 2500.0)
+    df_tc["fecha"] = pd.to_datetime(df_tc["fecha"])
+    if anio:
+        df_tc = df_tc[df_tc["fecha"].dt.year == int(anio)]
+    if df_tc.empty:
+        return {"capital_ref": capital_ref, "meses": []}
+    df_tc["periodo"] = df_tc["fecha"].dt.to_period("M")
+    agrupado = df_tc.groupby("periodo").agg(pnl=("pnl_usd", "sum"), n=("pnl_usd", "count"), wins=("pnl_usd", lambda s: int((s > 0).sum()))).reset_index()
+    fecha_min = df_tc["fecha"].min().strftime("%Y-%m-%d")
+    spy_hist = None
+    try:
+        hspy = yf_history("SPY", start=fecha_min, auto_adjust=True)
+        if hspy is not None and not hspy.empty:
+            spy_hist = hspy["Close"].dropna()
+            spy_hist.index = pd.to_datetime(spy_hist.index).tz_localize(None)
+    except Exception:
+        spy_hist = None
+    nombres = {1:"Ene",2:"Feb",3:"Mar",4:"Abr",5:"May",6:"Jun",7:"Jul",8:"Ago",9:"Sep",10:"Oct",11:"Nov",12:"Dic"}
+    meses = []
+    for _, row in agrupado.iterrows():
+        per = row["periodo"]
+        pnl = float(row["pnl"])
+        ret = pnl / capital_ref * 100.0
+        spy_ret = None
+        if spy_hist is not None and not spy_hist.empty:
+            ini = per.to_timestamp()
+            fin = (per + 1).to_timestamp()
+            trozo = spy_hist[(spy_hist.index >= ini) & (spy_hist.index < fin)]
+            if len(trozo) >= 2 and float(trozo.iloc[0]):
+                spy_ret = _num((float(trozo.iloc[-1]) / float(trozo.iloc[0]) - 1) * 100.0, 2)
+        meses.append({
+            "label": f"{nombres.get(per.month, per.month)} {per.year}",
+            "pnl": _num(pnl, 2),
+            "ret": _num(ret, 2),
+            "n": int(row["n"]),
+            "wr": _num(row["wins"] / row["n"] * 100.0, 1) if row["n"] else 0,
+            "spy": spy_ret,
+        })
+    return {"capital_ref": _num(capital_ref, 2), "meses": meses}
+
+def serie_tecnica_bot(ticker: str, timeframe: str = "diario"):
+    ticker = (ticker or "SPY").strip().upper()
+    simbolo = normalizar_ticker_yf(ticker)
+    tf = (timeframe or "diario").lower()
+    if "4h" in tf:
+        periodo, intervalo, label = "60d", "1h", "4 Horas"
+    elif "sem" in tf:
+        periodo, intervalo, label = "5y", "1wk", "Semanal"
+    else:
+        periodo, intervalo, label = "3y", "1d", "Diario"
+    df = yf_history(simbolo, period=periodo, interval=intervalo)
+    if (df is None or df.empty) and not simbolo.endswith("-USD"):
+        simbolo = f"{simbolo}-USD"
+        df = yf_history(simbolo, period=periodo, interval=intervalo)
+    if df is None or df.empty:
+        return {"error": f"Sin datos para {ticker}"}
+    df = df.dropna(subset=["Close", "High", "Low"])
+    if "4h" in tf:
+        df = df.resample("4h").agg({"Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"}).dropna()
+    idx = pd.to_datetime(df.index)
+    if getattr(idx, "tz", None) is not None:
+        idx = idx.tz_convert("UTC").tz_localize(None)
+    df.index = idx
+    df["Close"] = df["Close"].ffill()
+    df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
+    df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
+    df["EMA200"] = df["Close"].ewm(span=200, adjust=False).mean()
+    df["RSI"] = calcular_rsi_serie(df["Close"], period=14)
+    niveles = calcular_pivots_y_niveles(df, ventana=4)
+    poc = calcular_poc_volumen(df, barras_lookback=90)
+    tendencias = calcular_tendencias(df, label)
+    sub = df.tail(180)
+    reporte = (
+        f"{ticker} ({label})\n"
+        f"Precio ${float(df['Close'].iloc[-1]):,.2f}\n"
+        f"EMA20 ${float(df['EMA20'].iloc[-1]):,.2f} · EMA50 ${float(df['EMA50'].iloc[-1]):,.2f} · EMA200 ${float(df['EMA200'].iloc[-1]):,.2f}\n"
+        f"RSI {float(df['RSI'].dropna().iloc[-1]):.1f}\n"
+        f"POC ${poc if poc is not None else 0:,.2f}\n"
+        f"Soporte ${niveles.get('sop_inmediato') or 0:,.2f} · Resistencia ${niveles.get('res_inmediata') or 0:,.2f}\n"
+        f"Estructura: {niveles.get('estructura_txt') or ''}"
+    )
+    return {
+        "ticker": ticker,
+        "timeframe": label,
+        "fechas": [pd.Timestamp(d).strftime("%Y-%m-%d %H:%M") for d in sub.index],
+        "close": [_num(v, 4) for v in sub["Close"]],
+        "ema20": [_num(v, 4) for v in sub["EMA20"]],
+        "ema50": [_num(v, 4) for v in sub["EMA50"]],
+        "ema200": [_num(v, 4) for v in sub["EMA200"]],
+        "rsi": [_num(v, 2) for v in sub["RSI"]],
+        "poc": _num(poc, 4) if poc is not None else None,
+        "soporte": _num(niveles.get("sop_inmediato"), 4),
+        "resistencia": _num(niveles.get("res_inmediata"), 4),
+        "tendencias": tendencias,
+        "reporte": reporte,
+    }
+
+def api_grafico(user_id, tipo, periodo, ticker="", ciclo=""):
+    import json
+    tipo = (tipo or "spy").lower()
+    key = (int(user_id), tipo, str(periodo or ""), str(ticker or ""), str(ciclo or ""))
+    hit = _API_JSON_CACHE.get(key)
+    if hit and time.time() - hit[0] < 120:
+        return hit[1]
+    if tipo == "torta":
+        payload = serie_torta_gastos(user_id, ciclo)
+    elif tipo in ("torta_cartera", "cartera_pie"):
+        resumen = obtener_resumen_portafolio(user_id)
+        if not resumen:
+            payload = {"labels": [], "values": []}
+        else:
+            acc = {}
+            for p in resumen["posiciones"]:
+                acc[p["ticker"]] = acc.get(p["ticker"], 0) + float(p.get("valor_actual") or 0)
+            payload = {"labels": list(acc.keys()), "values": [_num(v, 2) for v in acc.values()]}
+    elif tipo == "activos":
+        filtro = [t for t in str(ticker or "").replace(",", " ").split() if t]
+        payload = serie_activos_bot(user_id, periodo, filtro or None)
+    elif tipo == "usd":
+        serie = serie_cartera_bot(user_id, periodo) or {}
+        payload = {"titulo": serie.get("titulo"), "fechas": serie.get("fechas") or [], "cartera": serie.get("pnl") or [], "ret": serie.get("pnl_ret"), "modo": "usd"}
+    elif tipo == "mensual":
+        anio = None
+        if str(periodo).isdigit() and len(str(periodo)) == 4:
+            anio = int(periodo)
+        payload = serie_mensual_bot(user_id, anio)
+    elif tipo == "tecnico":
+        payload = serie_tecnica_bot(ticker or "SPY", periodo or "diario")
+    elif tipo == "resumen":
+        resumen = obtener_resumen_portafolio(user_id) or {}
+        with get_db_connection() as conn:
+            df_tc = pd.read_sql("SELECT COALESCE(SUM(pnl_usd),0) pnl, COUNT(*) n FROM trades_cerrados WHERE user_id = %s;", conn, params=(user_id,))
+        pnl_r = float(df_tc["pnl"].iloc[0]) if not df_tc.empty else 0.0
+        pos = []
+        for p in resumen.get("posiciones") or []:
+            pos.append({k: (_num(p[k], 4) if isinstance(p[k], float) else p[k]) for k in p})
+        payload = {
+            "capital": _num(resumen.get("total_invertido") or 0, 2),
+            "valor": _num(resumen.get("total_actual") or 0, 2),
+            "pnl_flot": _num(resumen.get("pnl_total_usd") or 0, 2),
+            "pnl_real": _num(pnl_r, 2),
+            "trades": int(df_tc["n"].iloc[0]) if not df_tc.empty else 0,
+            "posiciones": pos,
+        }
+    elif tipo in ("panel", "textos"):
+        payload = {
+            "gastos": calcular_metricas_finanzas_completas(user_id),
+            "vs": texto_comparar_ciclos(user_id),
+            "fijos": texto_gastos_fijos(user_id),
+            "delivery": texto_alerta_delivery(user_id),
+            "mes": (obtener_progreso_presupuestos(user_id)[0] or obtener_progreso_presupuestos(user_id)[1] or ""),
+            "riesgo": calcular_metricas_riesgo_completas(user_id).get("texto", ""),
+            "objetivos": obtener_progreso_objetivos(user_id),
+        }
+    else:
+        serie = serie_cartera_bot(user_id, periodo) or {}
+        payload = {
+            "titulo": serie.get("titulo"),
+            "fechas": serie.get("fechas") or [],
+            "cartera": serie.get("cartera") or [],
+            "spy": serie.get("spy") or [],
+            "ret": serie.get("ret"),
+            "spy_ret": serie.get("spy_ret"),
+            "capital_ref": serie.get("capital_ref"),
+            "modo": "pct",
+        }
+    body = json.dumps(payload, default=str)
+    _API_JSON_CACHE[key] = (time.time(), body)
+    if len(_API_JSON_CACHE) > 40:
+        viejo = min(_API_JSON_CACHE.items(), key=lambda kv: kv[1][0])[0]
+        _API_JSON_CACHE.pop(viejo, None)
+    return body
 
 # ==================== GRÁFICO CONSOLIDADO: EVOLUCIÓN CARTERA ====================
 def generar_grafico_evolucion_cartera_consolidada(user_id: int, periodo_solicitado: str = "", modo: str = "usd"):
