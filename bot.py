@@ -58,6 +58,18 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body.encode())
             return
+        if path.startswith("/api/fundamental"):
+            q = parse_qs(urlparse(self.path).query)
+            import json
+            try:
+                body = json.dumps(fundamental_bot(q.get("ticker", ["MELI"])[0]), ensure_ascii=False)
+            except Exception as e:
+                body = '{"error":"%s"}' % str(e).replace('"', "'")
+            self.send_header("Content-type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body.encode())
+            return
         if path.startswith("/api/"):
             q = parse_qs(urlparse(self.path).query)
             tipo = q.get("tipo", ["spy"])[0]
@@ -2599,6 +2611,27 @@ def serie_tecnica_bot(ticker: str, timeframe: str = "diario"):
         "reporte": reporte,
     }
 
+
+
+def fundamental_bot(ticker):
+    import yfinance as yf
+    info = yf.Ticker(ticker).info or {}
+    def n(v):
+        try:
+            return round(float(v), 4)
+        except Exception:
+            return None
+    return {
+        "ticker": ticker,
+        "nombre": info.get("shortName") or ticker,
+        "precio": n(info.get("currentPrice") or info.get("regularMarketPrice")),
+        "per": n(info.get("trailingPE")),
+        "per_futuro": n(info.get("forwardPE")),
+        "ingresos": n(info.get("totalRevenue")),
+        "margen": n(info.get("profitMargins")),
+        "capitalizacion": n(info.get("marketCap")),
+        "sector": info.get("sector") or "",
+    }
 
 def editar_movimiento(mov_id, monto, fecha, categoria, descripcion):
     mov_id = int(mov_id)
