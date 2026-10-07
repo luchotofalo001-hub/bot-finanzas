@@ -40,6 +40,24 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         from urllib.parse import urlparse, parse_qs
         path = urlparse(self.path).path
+        if path.startswith("/api/editar"):
+            q = parse_qs(urlparse(self.path).query)
+            try:
+                n = editar_movimiento(
+                    q.get("id", [""])[0],
+                    q.get("monto", [""])[0],
+                    q.get("fecha", [""])[0],
+                    q.get("categoria", [""])[0],
+                    q.get("descripcion", [""])[0],
+                )
+                body = '{"ok":true,"n":%s}' % n
+            except Exception as e:
+                body = '{"ok":false,"error":"%s"}' % str(e).replace('"', "'")
+            self.send_header("Content-type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body.encode())
+            return
         if path.startswith("/api/"):
             q = parse_qs(urlparse(self.path).query)
             tipo = q.get("tipo", ["spy"])[0]
@@ -2580,6 +2598,25 @@ def serie_tecnica_bot(ticker: str, timeframe: str = "diario"):
         "tendencias": tendencias,
         "reporte": reporte,
     }
+
+
+def editar_movimiento(mov_id, monto, fecha, categoria, descripcion):
+    mov_id = int(mov_id)
+    monto = float(str(monto).replace(",", "."))
+    categoria = (categoria or "Varios")[:50]
+    descripcion = descripcion or ""
+    with get_db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """UPDATE movimientos
+               SET monto = %s, fecha = %s, categoria = %s, descripcion = %s
+               WHERE id = %s AND (user_id = %s OR user_id IS NULL)""",
+            (monto, fecha, categoria, descripcion, mov_id, LUCHO_TELEGRAM_ID),
+        )
+        n = cur.rowcount
+        conn.commit()
+        cur.close()
+    return n
 
 def api_grafico(user_id, tipo, periodo, ticker="", ciclo=""):
     import json
