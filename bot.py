@@ -6000,6 +6000,7 @@ async def cmd_resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if not resumen and cant_c == 0:
         await update.message.reply_text("📉 No tienes activos ni trades cargados todavía.")
+        await enviar_opciones_registro(context, user_id)
         return
 
     total_inv = resumen['total_invertido'] if resumen else 0.0
@@ -6033,11 +6034,13 @@ async def cmd_resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"   PnL {em} {pnl_s}${pos['pnl_usd']:,.2f} ({pnl_s}{pos['pnl_pct']:.1f}%){dist}"
             )
     await update.message.reply_text(msg)
+    await enviar_opciones_registro(context, user_id)
 
 async def cmd_riesgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     metricas = calcular_metricas_riesgo_completas(user_id)
     await update.message.reply_text(metricas["texto"])
+    await enviar_opciones_registro(context, user_id)
 
 async def cmd_mes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -6092,6 +6095,7 @@ async def cmd_objetivos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     texto = obtener_progreso_objetivos(user_id)
     await update.message.reply_text(texto)
+    await enviar_opciones_registro(context, user_id)
 
 async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
