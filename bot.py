@@ -184,29 +184,55 @@ async def manejar_callback_registro(update: Update, context: ContextTypes.DEFAUL
     )
 
 def parsear_datos_registro(texto: str, tipo: str):
-    """Parsea categoría, monto y concepto del texto libre."""
+    """Parsea categoría, monto, concepto y (si es inversión) precio de compra."""
     raw = (texto or "").strip()
     if not raw:
         return None
+
+    # Precio de compra explícito: "a 1870", "a $1.870", "ppc 1870", etc.
+    precio_compra = None
+    m_precio = re.search(
+        r"(?:a|@|ppc|precio|a\s+)\s*\$?\s*(\d[\d\.,]*)",
+        raw, re.I
+    )
+    if m_precio:
+        try:
+            p = m_precio.group(1).replace(".", "").replace(",", ".")
+            precio_compra = float(p)
+        except Exception:
+            precio_compra = None
+
     monto = extraer_monto_ars(raw) or None
-    # intentar extraer monto en USD también
+    # monto en USD
     m_usd = re.search(r"(\d[\d\.,]*)\s*(usd|u\$d|dólar|dolar|usdt)?", raw, re.I)
     if tipo == "INVERSION" and m_usd:
         try:
-            monto = float(m_usd.group(1).replace(".", "").replace(",", "."))
+            cand = float(m_usd.group(1).replace(".", "").replace(",", "."))
+            # si el candidato es el precio que ya sacamos, no lo uses como monto
+            if precio_compra is None or abs(cand - precio_compra) > 0.01:
+                monto = cand
         except Exception:
             pass
+
     if monto is None or monto <= 0:
         return None
-    # resto es categoría + concepto
+
+    # limpiar números para sacar ticker / categoría
     limpio = re.sub(r"\$?\d[\d\.,]*\s*(k|mil|usd|usdt|ars|pesos)?", " ", raw, flags=re.I)
+    limpio = re.sub(r"\b(a|ppc|precio)\b", " ", limpio, flags=re.I)
     limpio = re.sub(r"\s+", " ", limpio).strip()
     partes = limpio.split(None, 1)
     cat = partes[0] if partes else "Varios"
     desc = partes[1] if len(partes) > 1 else cat
     cat = normalizar_categoria(cat)
     desc = _emprolijar_texto(desc)[:80]
-    return {"categoria": cat, "monto": float(monto), "descripcion": desc}
+
+    return {
+        "categoria": cat,
+        "monto": float(monto),
+        "descripcion": desc,
+        "precio_compra": precio_compra,
+    }
 
 
 _DB_POOL = None
@@ -3941,19 +3967,59 @@ def registrar_operacion_inversion(user_id: int, ticker: str, monto_usd: float, p
 
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
-            if fecha_limpia:
+            # Buscar posición abierta existente del mismo ticker + tipo
+            cursor.execute(
+                """SELECT id, cantidad, precio_compra, monto_total_usd
+                   FROM portafolio_inversiones
+                   WHERE user_id = %s AND UPPER(ticker) = %s AND UPPER(tipo_posicion) = %s
+                   ORDER BY id DESC LIMIT 1;""",
+                (user_id, ticker, tipo_pos)
+            )
+            existente = cursor.fetchone()
+
+            if existente and tipo_pos == "SPOT":
+                # Sumar a la posición existente y recalcular PPC
+                old_id, old_cant, old_ppc, old_monto = existente
+                old_cant = float(old_cant or 0)
+                old_ppc = float(old_ppc or 0)
+                old_monto = float(old_monto or 0)
+                new_cant = float(cantidad or 0)
+                new_ppc = float(precio_compra or 0)
+                new_monto = float(monto_usd or 0)
+
+                total_cant = old_cant + new_cant
+                if total_cant > 0:
+                    # PPC promedio ponderado
+                    total_costo = (old_cant * old_ppc) + (new_cant * new_ppc)
+                    ppc_final = total_costo / total_cant
+                else:
+                    ppc_final = new_ppc
+
+                monto_final = old_monto + new_monto
+
                 cursor.execute(
-                    """INSERT INTO portafolio_inversiones (user_id, fecha, ticker, cantidad, precio_compra, monto_total_usd, tipo_posicion, apalancamiento, precio_liquidacion)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s);""",
-                    (user_id, fecha_limpia, ticker, float(cantidad), float(precio_compra), float(monto_usd), tipo_pos, float(lev), float(precio_liq) if precio_liq else None)
+                    """UPDATE portafolio_inversiones
+                       SET cantidad = %s, precio_compra = %s, monto_total_usd = %s
+                       WHERE id = %s AND user_id = %s;""",
+                    (total_cant, ppc_final, monto_final, old_id, user_id)
                 )
+                conn.commit()
+                return ticker, total_cant, ppc_final, monto_final, fecha_limpia, tipo_pos, lev, precio_liq
             else:
-                cursor.execute(
-                    """INSERT INTO portafolio_inversiones (user_id, fecha, ticker, cantidad, precio_compra, monto_total_usd, tipo_posicion, apalancamiento, precio_liquidacion)
-                       VALUES (%s, NOW(), %s, %s, %s, %s, %s, %s, %s);""",
-                    (user_id, ticker, float(cantidad), float(precio_compra), float(monto_usd), tipo_pos, float(lev), float(precio_liq) if precio_liq else None)
-                )
-            conn.commit()
+                # Crear nueva posición
+                if fecha_limpia:
+                    cursor.execute(
+                        """INSERT INTO portafolio_inversiones (user_id, fecha, ticker, cantidad, precio_compra, monto_total_usd, tipo_posicion, apalancamiento, precio_liquidacion)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s);""",
+                        (user_id, fecha_limpia, ticker, float(cantidad), float(precio_compra), float(monto_usd), tipo_pos, float(lev), float(precio_liq) if precio_liq else None)
+                    )
+                else:
+                    cursor.execute(
+                        """INSERT INTO portafolio_inversiones (user_id, fecha, ticker, cantidad, precio_compra, monto_total_usd, tipo_posicion, apalancamiento, precio_liquidacion)
+                           VALUES (%s, NOW(), %s, %s, %s, %s, %s, %s, %s);""",
+                        (user_id, ticker, float(cantidad), float(precio_compra), float(monto_usd), tipo_pos, float(lev), float(precio_liq) if precio_liq else None)
+                    )
+                conn.commit()
     return ticker, cantidad, precio_compra, monto_usd, fecha_limpia, tipo_pos, lev, precio_liq
 
 def registrar_trade_cerrado(user_id: int, ticker: str, pnl_usd: float, tipo_posicion: str = "SPOT", roi_pct: float = None, monto_invertido: float = None, descripcion: str = "", fecha_str: str = None, fecha_apertura: str = None):
@@ -6121,12 +6187,17 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ticker = "USDT" if "usdt" in user_msg.lower() else datos["categoria"].upper()[:20]
             if ticker in ("VARIOS", "INVERSIONES", "COMPRA"):
                 ticker = "USDT"
+            ppc = datos.get("precio_compra")
+            if ticker == "USDT" and (ppc is None or ppc <= 0):
+                ppc = 1.0
             registrar_operacion_inversion(
-                user_id, ticker, datos["monto"], precio_compra=1.0 if ticker == "USDT" else None,
+                user_id, ticker, datos["monto"],
+                precio_compra=ppc,
                 cantidad=datos["monto"] if ticker == "USDT" else None
             )
+            ppc_txt = f" a PPC ${ppc:,.2f}" if ppc else ""
             await update.message.reply_text(
-                f"💼 Inversión registrada: {ticker} ${datos['monto']:,.2f} USD"
+                f"💼 Inversión registrada: {ticker} ${datos['monto']:,.2f} USD{ppc_txt}"
             )
         del estado_registro[user_id]
         await enviar_opciones_registro(context, user_id)
