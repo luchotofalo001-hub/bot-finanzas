@@ -227,11 +227,14 @@ def parsear_datos_registro(texto: str, tipo: str):
     cat = normalizar_categoria(cat)
     desc = _emprolijar_texto(desc)[:80]
 
+    fecha = extraer_fecha_movimiento(raw)
+
     return {
         "categoria": cat,
         "monto": float(monto),
         "descripcion": desc,
         "precio_compra": precio_compra,
+        "fecha": fecha,
     }
 
 
@@ -6177,7 +6180,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         if tipo in ("GASTO", "INGRESO"):
-            guardar_movimiento(user_id, tipo, datos["monto"], datos["categoria"], datos["descripcion"])
+            guardar_movimiento(user_id, tipo, datos["monto"], datos["categoria"], datos["descripcion"], datos.get("fecha"))
             aprender_patron_clasificacion(user_id, user_msg, datos["categoria"], datos["descripcion"])
             await update.message.reply_text(
                 f"✅ {tipo.title()} registrado: {datos['categoria']} ${datos['monto']:,.0f} — {datos['descripcion']}"
@@ -6190,14 +6193,17 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ppc = datos.get("precio_compra")
             if ticker == "USDT" and (ppc is None or ppc <= 0):
                 ppc = 1.0
+            fecha = datos.get("fecha")
             registrar_operacion_inversion(
                 user_id, ticker, datos["monto"],
                 precio_compra=ppc,
-                cantidad=datos["monto"] if ticker == "USDT" else None
+                cantidad=datos["monto"] if ticker == "USDT" else None,
+                fecha_compra=fecha
             )
             ppc_txt = f" a PPC ${ppc:,.2f}" if ppc else ""
+            fecha_txt = f" ({fecha})" if fecha else ""
             await update.message.reply_text(
-                f"💼 Inversión registrada: {ticker} ${datos['monto']:,.2f} USD{ppc_txt}"
+                f"💼 Inversión registrada: {ticker} ${datos['monto']:,.2f} USD{ppc_txt}{fecha_txt}"
             )
         del estado_registro[user_id]
         await enviar_opciones_registro(context, user_id)
