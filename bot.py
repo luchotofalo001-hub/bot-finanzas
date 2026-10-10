@@ -8,8 +8,8 @@ import threading
 import hashlib
 from datetime import datetime, timedelta, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler
 from google import genai
 import psycopg2
 from psycopg2.pool import SimpleConnectionPool
@@ -136,6 +136,78 @@ ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
 # Estado en memoria para importaciones interactivas
 importaciones_activas = {}
+
+# ==================== ESTADO PARA REGISTRO POR BOTONES ====================
+estado_registro = {}  # user_id -> {"paso": "datos", "tipo": "GASTO"|"INGRESO"|"INVERSION"}
+
+async def enviar_opciones_registro(context_or_update, chat_id: int):
+    """Manda el mensaje con los 3 botones. Siempre debe ser el último mensaje del bot."""
+    keyboard = [
+        [
+            InlineKeyboardButton("📥 Ingreso", callback_data="reg_tipo|INGRESO"),
+            InlineKeyboardButton("📤 Gasto", callback_data="reg_tipo|GASTO"),
+            InlineKeyboardButton("💼 Inversión", callback_data="reg_tipo|INVERSION"),
+        ]
+    ]
+    markup = InlineKeyboardMarkup(keyboard)
+    text = "¿Qué querés registrar?"
+    try:
+        if hasattr(context_or_update, "bot"):
+            await context_or_update.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
+        else:
+            # update.message or context
+            await context_or_update.message.reply_text(text, reply_markup=markup)
+    except Exception as e:
+        logger.warning(f"enviar_opciones_registro: {e}")
+
+async def manejar_callback_registro(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    data = query.data or ""
+    if not data.startswith("reg_tipo|"):
+        return
+    tipo = data.split("|", 1)[1].upper()
+    if tipo not in ("INGRESO", "GASTO", "INVERSION"):
+        return
+    estado_registro[user_id] = {"paso": "datos", "tipo": tipo}
+    await query.edit_message_text(
+        f"Perfecto, vamos a registrar un {tipo}.\n\n"
+        "Mandame en un solo mensaje:\n"
+        "• Categoría\n"
+        "• Monto\n"
+        "• Concepto / descripción\n\n"
+        "Ejemplos:\n"
+        "• Comida 15000 panadería\n"
+        "• USDT 1000 compra de usdt\n"
+        "• Sueldo 850000 haberes octubre"
+    )
+
+def parsear_datos_registro(texto: str, tipo: str):
+    """Parsea categoría, monto y concepto del texto libre."""
+    raw = (texto or "").strip()
+    if not raw:
+        return None
+    monto = extraer_monto_ars(raw) or None
+    # intentar extraer monto en USD también
+    m_usd = re.search(r"(\d[\d\.,]*)\s*(usd|u\$d|dólar|dolar|usdt)?", raw, re.I)
+    if tipo == "INVERSION" and m_usd:
+        try:
+            monto = float(m_usd.group(1).replace(".", "").replace(",", "."))
+        except Exception:
+            pass
+    if monto is None or monto <= 0:
+        return None
+    # resto es categoría + concepto
+    limpio = re.sub(r"\$?\d[\d\.,]*\s*(k|mil|usd|usdt|ars|pesos)?", " ", raw, flags=re.I)
+    limpio = re.sub(r"\s+", " ", limpio).strip()
+    partes = limpio.split(None, 1)
+    cat = partes[0] if partes else "Varios"
+    desc = partes[1] if len(partes) > 1 else cat
+    cat = normalizar_categoria(cat)
+    desc = _emprolijar_texto(desc)[:80]
+    return {"categoria": cat, "monto": float(monto), "descripcion": desc}
+
 
 _DB_POOL = None
 _YF_CACHE = {}
@@ -6023,10 +6095,42 @@ async def cmd_objetivos(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    user_msg = update.message.text
+    user_msg = update.message.text or ""
+
+    # 1. Si estamos esperando datos de registro por botón
+    if user_id in estado_registro and estado_registro[user_id].get("paso") == "datos":
+        tipo = estado_registro[user_id]["tipo"]
+        datos = parsear_datos_registro(user_msg, tipo)
+        if not datos:
+            await update.message.reply_text(
+                "No entendí el monto. Mandame algo como:\nComida 15000 panadería\no USDT 1000 compra"
+            )
+            return
+        if tipo in ("GASTO", "INGRESO"):
+            guardar_movimiento(user_id, tipo, datos["monto"], datos["categoria"], datos["descripcion"])
+            aprender_patron_clasificacion(user_id, user_msg, datos["categoria"], datos["descripcion"])
+            await update.message.reply_text(
+                f"✅ {tipo.title()} registrado: {datos['categoria']} ${datos['monto']:,.0f} — {datos['descripcion']}"
+            )
+        else:  # INVERSION
+            # Para USDT u otros, registramos en portafolio
+            ticker = "USDT" if "usdt" in user_msg.lower() else datos["categoria"].upper()[:20]
+            if ticker in ("VARIOS", "INVERSIONES", "COMPRA"):
+                ticker = "USDT"
+            registrar_operacion_inversion(
+                user_id, ticker, datos["monto"], precio_compra=1.0 if ticker == "USDT" else None,
+                cantidad=datos["monto"] if ticker == "USDT" else None
+            )
+            await update.message.reply_text(
+                f"💼 Inversión registrada: {ticker} ${datos['monto']:,.2f} USD"
+            )
+        del estado_registro[user_id]
+        await enviar_opciones_registro(context, user_id)
+        return
 
     if user_id in importaciones_activas:
         if await procesar_respuesta_importacion(update, user_id, user_msg):
+            await enviar_opciones_registro(context, user_id)
             return
 
     try:
@@ -6185,6 +6289,10 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Error: {e}", exc_info=True)
         await update.message.reply_text(f"Hubo un error: {e}")
 
+    # Siempre dejar el mensaje de opciones como último
+    if user_id not in estado_registro:
+        await enviar_opciones_registro(context, user_id)
+
 async def cmd_ytd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     per = extraer_periodo(update.message.text or "ytd") or "ytd"
@@ -6197,30 +6305,37 @@ async def cmd_cagr(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_mensual_alias(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await intentar_comando_local(update, update.effective_user.id, update.message.text or "/mensual")
+    await enviar_opciones_registro(context, update.effective_user.id)
 
 async def cmd_spy_alias(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await intentar_comando_local(update, update.effective_user.id, update.message.text or "/spy")
+    await enviar_opciones_registro(context, update.effective_user.id)
 
 async def cmd_grafico_alias(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await intentar_comando_local(update, update.effective_user.id, update.message.text or "/grafico")
+    await enviar_opciones_registro(context, update.effective_user.id)
 
 async def cmd_activos_alias(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await intentar_comando_local(update, update.effective_user.id, update.message.text or "/activos")
+    await enviar_opciones_registro(context, update.effective_user.id)
 
 async def cmd_precio_alias(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await intentar_comando_local(update, update.effective_user.id, update.message.text or "/precio")
+    await enviar_opciones_registro(context, update.effective_user.id)
 
 async def cmd_excel_alias(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await intentar_comando_local(update, update.effective_user.id, "/excel")
 
 async def cmd_analisis_alias(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await intentar_comando_local(update, update.effective_user.id, update.message.text or "/analisis")
+    await enviar_opciones_registro(context, update.effective_user.id)
 
 async def cmd_gastos_alias(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await intentar_comando_local(update, update.effective_user.id, "/gastos")
 
 async def cmd_vs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(texto_comparar_ciclos(update.effective_user.id))
+    await enviar_opciones_registro(context, update.effective_user.id)
 
 async def cmd_fijos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(texto_gastos_fijos(update.effective_user.id))
@@ -6268,6 +6383,7 @@ async def main():
     app.add_handler(CommandHandler("analisis", cmd_analisis_alias))
     
     app.add_handler(MessageHandler(filters.Document.ALL, manejar_documento_extracto))
+    app.add_handler(CallbackQueryHandler(manejar_callback_registro, pattern=r"^reg_tipo\|"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, responder))
     
     await app.initialize()
